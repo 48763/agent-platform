@@ -196,8 +196,15 @@ POST {agent_url}/task
 // 完成
 {"status": "done", "message": "台北目前 25°C，多雲..."}
 
-// 需要追問
+// 需要追問（純文字）
 {"status": "need_input", "message": "你想查哪個城市的天氣？"}
+
+// 需要追問（帶選項，TG Bot 會用 Inline Keyboard 顯示按鈕）
+{
+    "status": "need_input",
+    "message": "Gemini 問你要用哪個模型？",
+    "options": ["gemini-2.5-pro", "gemini-2.5-flash"]
+}
 
 // 錯誤
 {"status": "error", "message": "天氣服務暫時無法使用"}
