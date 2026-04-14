@@ -5,3 +5,6 @@ hub:
 
 llm:
   model: "claude-sonnet-4-20250514"
+
+telegram:
+  token_env: "TELEGRAM_BOT_TOKEN"
