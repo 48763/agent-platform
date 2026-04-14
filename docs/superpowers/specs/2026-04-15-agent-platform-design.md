@@ -50,6 +50,7 @@ agent-platform/
 │   ├── server.py            # Hub HTTP server（接收 agent 註冊、健康檢查）
 │   ├── registry.py          # Agent registry（在線狀態管理）
 │   ├── router.py            # 任務路由（關鍵字 + Claude fallback）
+│   ├── task_manager.py      # 多輪互動任務狀態管理
 │   ├── bot.py               # Telegram Bot 整合
 │   └── cli.py               # CLI 測試介面（開發用，不經 TG）
 │
@@ -134,6 +135,15 @@ Claude API 封裝：
 - 接收訊息 → 交給 Router → 等待結果 → 回傳給使用者
 - 支援追問：agent 回傳 need_input 時，轉發問題給使用者，收到回答後繼續
 
+### TaskManager (`hub/task_manager.py`)
+
+管理多輪互動的任務狀態，讓同一個對話的追問和權限確認能接續：
+
+- 建立 Task：記錄 task_id、agent_name、chat_id、conversation_history
+- 狀態流轉：working → waiting_input / waiting_approval → working → ... → done
+- 使用者回應時，找到對應 Task，append 到 history，再發給 Agent 繼續
+- need_approval 超時未回應時，自動回傳「拒絕」給 Agent
+
 ### CLI (`hub/cli.py`)
 
 開發用的 CLI 介面，模擬 TG Bot 行為，直接在 terminal 輸入訊息測試。
@@ -206,9 +216,26 @@ POST {agent_url}/task
     "options": ["gemini-2.5-pro", "gemini-2.5-flash"]
 }
 
+// 權限確認（敏感操作需使用者授權，TG 用醒目提示 + 按鈕）
+{
+    "status": "need_approval",
+    "message": "Gemini 想要執行 rm -rf dist/，是否允許？",
+    "action": "run_command: rm -rf dist/",
+    "options": ["允許", "拒絕"]
+}
+
 // 錯誤
 {"status": "error", "message": "天氣服務暫時無法使用"}
 ```
+
+**Status 說明：**
+
+| status | 用途 | 拒絕/超時行為 | TG 呈現 |
+|--------|------|-------------|---------|
+| done | 任務完成 | — | 一般訊息 |
+| need_input | 補充資訊 | 等待 | 一般訊息或按鈕 |
+| need_approval | 授權敏感操作 | 預設拒絕，agent 跳過該操作繼續 | ⚠️ 醒目提示 + 按鈕 |
+| error | 執行失敗 | — | 錯誤訊息 |
 
 ### Heartbeat
 
