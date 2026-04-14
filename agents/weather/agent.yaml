@@ -1,0 +1,12 @@
+# agents/weather/agent.yaml
+name: weather-agent
+description: "查詢天氣資訊：目前天氣、未來預報"
+route_patterns:
+  - "天氣|weather|氣溫|溫度|下雨"
+sandbox:
+  allowed_dirs: []
+  writable: false
+  allowed_commands: []
+  network:
+    allow:
+      - "wttr.in"
