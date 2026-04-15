@@ -40,7 +40,9 @@ async def gemini_route(message: str, agents: list[AgentInfo]) -> str | None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode != 0:
+            logger.error(f"Gemini route failed (exit {proc.returncode}): {stderr.decode()}")
         result = stdout.decode().strip()
 
         if result == "NONE" or not result:
@@ -82,11 +84,11 @@ async def gemini_is_continuation(message: str, last_topic: str) -> bool:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
         result = stdout.decode().strip().upper()
         return "YES" in result
-    except Exception as e:
-        logger.error(f"Gemini continuation check error: {e}")
+    except Exception:
+        logger.exception("Gemini continuation check error")
         return False
 
 
@@ -104,10 +106,12 @@ async def gemini_default_reply(message: str) -> str | None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode != 0:
+            logger.error(f"Gemini default reply failed (exit {proc.returncode}): {stderr.decode()}")
         result = stdout.decode().strip()
         return result if result else None
 
-    except Exception as e:
-        logger.error(f"Gemini default reply error: {e}")
+    except Exception:
+        logger.exception("Gemini default reply error")
         return None

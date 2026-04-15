@@ -2,7 +2,7 @@ FROM python:3.12-alpine
 
 WORKDIR /app
 
-RUN apk add --no-cache gcc musl-dev npm nodejs git bash coreutils
+RUN apk add --no-cache gcc musl-dev npm nodejs git bash coreutils libsecret-dev
 RUN npm install -g @google/gemini-cli@0.36.0
 
 COPY requirements.txt .
