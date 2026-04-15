@@ -1,0 +1,46 @@
+services:
+  hub:
+    build:
+      context: .
+      dockerfile: hub/Dockerfile
+    ports:
+      - "9000:9000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    networks:
+      - agent-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9000/agents"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - HUB_URL=http://hub:9000
+    depends_on:
+      hub:
+        condition: service_healthy
+    networks:
+      - agent-network
+
+  weather-agent:
+    build:
+      context: .
+      dockerfile: agents/weather/Dockerfile
+    environment:
+      - HUB_URL=http://hub:9000
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    depends_on:
+      hub:
+        condition: service_healthy
+    networks:
+      - agent-network
+
+networks:
+  agent-network:
+    driver: bridge
