@@ -62,6 +62,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <h2>對話紀錄</h2>
         <div class="tabs">
             <div class="tab active" onclick="filterTasks('all', this)">全部</div>
+            <div class="tab" onclick="filterTasks('active', this)">進行中</div>
+            <div class="tab" onclick="filterTasks('done', this)">已完成</div>
         </div>
         <div id="tasks"></div>
     </div>
