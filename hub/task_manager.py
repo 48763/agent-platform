@@ -46,6 +46,22 @@ class TaskManager:
             CREATE INDEX IF NOT EXISTS idx_task_messages_lookup
             ON task_messages(chat_id, message_id)
         """)
+        self._migrate()
+        self._conn.commit()
+
+    def _migrate(self):
+        """Auto-migrate: add missing columns to existing tables."""
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(tasks)").fetchall()}
+
+        migrations = {
+            "source": "ALTER TABLE tasks ADD COLUMN source TEXT NOT NULL DEFAULT 'telegram'",
+            "last_message_id": "ALTER TABLE tasks ADD COLUMN last_message_id INTEGER",
+        }
+
+        for col, sql in migrations.items():
+            if col not in existing:
+                self._conn.execute(sql)
+
         self._conn.commit()
 
     def create_task(self, agent_name: str, chat_id: int, content: str, source: str = "telegram") -> dict:
