@@ -1,5 +1,6 @@
 # core/base_agent.py
 import asyncio
+import os
 from abc import ABC, abstractmethod
 from aiohttp import web, ClientSession
 from core.config import load_agent_config
@@ -13,6 +14,7 @@ class BaseAgent(ABC):
         self.name = self.config["name"]
         self.hub_url = hub_url
         self.port = port
+        self.host = os.environ.get("AGENT_HOST", "localhost")
         sandbox_config = self.config.get("sandbox", {"allowed_dirs": []})
         self.sandbox = Sandbox(sandbox_config)
 
@@ -39,7 +41,7 @@ class BaseAgent(ABC):
         info = AgentInfo(
             name=self.name,
             description=self.config.get("description", ""),
-            url=f"http://localhost:{actual_port}",
+            url=f"http://{self.host}:{actual_port}",
             route_patterns=self.config.get("route_patterns", []),
             capabilities=self.config.get("capabilities", []),
         )
