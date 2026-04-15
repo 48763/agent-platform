@@ -7,25 +7,29 @@
 ## Architecture
 
 ```
-Telegram
-   ↓
-┌──────────────────────────────┐
-│  Hub（主服務）                 │
-│  ├─ TG Bot    — 接收/回傳訊息 │
-│  ├─ Router    — 分配任務      │
-│  └─ Registry  — 管理 agent   │
-└──────────┬───────────────────┘
-           │ HTTP
-     ┌─────┼─────┐
-     ↓     ↓     ↓
-  Agent A  B     C
+Telegram ─┐
+Discord  ─┼──▶ Gateway（接收訊息 + 統一格式）──▶ Hub（路由 + 分配）──▶ Agents
+Line     ─┘         container                      container           containers
 ```
+
+### 服務分層
+
+- **Gateway**：訊息入口，負責接收各通訊軟體訊息、統一格式、轉發給 Hub、回傳結果給使用者
+- **Hub**：核心路由服務，負責 agent 註冊管理、任務路由分配、多輪對話狀態追蹤
+- **Agent**：各功能 agent，獨立 container，啟動時向 Hub 註冊
+
+### 部署方式
+
+- 每個服務為獨立 Docker container
+- 使用 docker-compose 編排
+- 服務間透過 Docker internal network 通訊（不需 expose port 到 host）
+- Base image: python:3.12-alpine
 
 ### 通訊方式
 
-- Hub ↔ Agent：HTTP API
+- Gateway → Hub：HTTP API（POST /dispatch）
+- Hub ↔ Agent：HTTP API（註冊、heartbeat、任務派發）
 - Agent 啟動時 POST 到 Hub 註冊，定期 heartbeat
-- Hub 透過 POST 發送任務給 Agent，Agent 同步回應結果
 
 ### 路由策略
 
@@ -37,31 +41,41 @@ Telegram
 
 ```
 agent-platform/
-├── core/
+├── core/                      # 共用模組（所有服務都引用）
 │   ├── __init__.py
-│   ├── base_agent.py       # BaseAgent 基底類別
-│   ├── sandbox.py           # 路徑/指令沙盒
-│   ├── llm.py               # Claude API 封裝 + agentic loop
-│   ├── tool_registry.py     # @tool 裝飾器 + 收集機制
-│   └── config.py            # YAML 設定載入
+│   ├── base_agent.py          # BaseAgent 基底類別
+│   ├── sandbox.py             # 路徑/指令沙盒
+│   ├── llm.py                 # Claude API 封裝 + agentic loop
+│   ├── tool_registry.py       # @tool 裝飾器 + 收集機制
+│   ├── models.py              # 共用資料模型
+│   └── config.py              # YAML 設定載入
 │
-├── hub/
+├── gateway/                   # Gateway 服務（訊息入口）
 │   ├── __init__.py
-│   ├── server.py            # Hub HTTP server（接收 agent 註冊、健康檢查）
-│   ├── registry.py          # Agent registry（在線狀態管理）
-│   ├── router.py            # 任務路由（關鍵字 + Claude fallback）
-│   ├── task_manager.py      # 多輪互動任務狀態管理
-│   ├── bot.py               # Telegram Bot 整合
-│   └── cli.py               # CLI 測試介面（開發用，不經 TG）
+│   ├── telegram_handler.py    # Telegram 訊息處理
+│   ├── server.py              # Gateway HTTP server + 通訊軟體整合
+│   └── Dockerfile
 │
-├── agents/
+├── hub/                       # Hub 服務（路由 + 分配）
+│   ├── __init__.py
+│   ├── server.py              # Hub HTTP server
+│   ├── registry.py            # Agent registry
+│   ├── router.py              # 任務路由
+│   ├── task_manager.py        # 多輪互動任務狀態管理
+│   ├── cli.py                 # CLI 測試介面
+│   └── Dockerfile
+│
+├── agents/                    # 各子 agent
 │   └── weather/
-│       ├── agent.yaml        # 設定：名稱、描述、路由規則、沙盒
-│       ├── tools.py          # 天氣查詢 tool（wttr.in）
-│       └── prompts.py        # system prompt
+│       ├── agent.yaml
+│       ├── tools.py
+│       ├── prompts.py
+│       ├── __main__.py
+│       └── Dockerfile
 │
-├── config.yaml               # 全域設定（Hub port、Claude API key 位置等）
+├── config.yaml
 ├── requirements.txt
+├── docker-compose.yaml
 └── README.md
 ```
 
@@ -129,11 +143,22 @@ Claude API 封裝：
 4. 未命中 → 呼叫 Claude，提供所有在線 agent 的 description，讓 Claude 選擇
 5. Claude 也無法判斷 → 回覆使用者「無法處理」
 
-### Bot (`hub/bot.py`)
+## Gateway Service
+
+獨立服務，負責接收各通訊軟體訊息並轉發給 Hub。
+
+### Gateway Server (`gateway/server.py`)
+
+- 啟動各通訊軟體 handler
+- 統一訊息格式後 POST 到 Hub /dispatch
+- 接收 Hub 回應後轉發回對應通訊軟體
+
+### Telegram Handler (`gateway/telegram_handler.py`)
 
 - python-telegram-bot 套件
-- 接收訊息 → 交給 Router → 等待結果 → 回傳給使用者
-- 支援追問：agent 回傳 need_input 時，轉發問題給使用者，收到回答後繼續
+- 接收訊息 → 轉發給 Hub → 回傳結果
+- 支援 Inline Keyboard（options / need_approval）
+- 未來可新增 Discord、Line 等 handler，不需修改 Hub
 
 ### TaskManager (`hub/task_manager.py`)
 
