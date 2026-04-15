@@ -1,0 +1,8 @@
+name: claude-code-agent
+description: "使用 Claude Code 執行程式相關任務：寫程式、code review、修改檔案、執行指令"
+priority: 5
+route_patterns:
+  - "code|程式|review|修改|檔案|bug|fix|refactor|寫|改|建立"
+sandbox:
+  allowed_dirs: []
+  writable: false
