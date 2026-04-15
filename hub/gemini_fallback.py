@@ -8,6 +8,8 @@ from core.models import AgentInfo
 logger = logging.getLogger(__name__)
 
 PROMPTS_DIR = os.environ.get("PROMPTS_DIR", "/data/prompts")
+GEMINI_FAST_MODEL = os.environ.get("GEMINI_FAST_MODEL", "gemini-2.5-flash")
+GEMINI_DEFAULT_MODEL = os.environ.get("GEMINI_DEFAULT_MODEL", "gemini-2.5-pro")
 
 
 def _load_prompt(filename: str, default: str) -> str:
@@ -34,7 +36,7 @@ async def gemini_route(message: str, agents: list[AgentInfo]) -> str | None:
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "gemini", "-p", prompt,
+            "gemini", "-p", prompt, "-m", GEMINI_FAST_MODEL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -76,7 +78,7 @@ async def gemini_default_reply(message: str) -> str | None:
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "gemini", "-p", prompt,
+            "gemini", "-p", prompt, "-m", GEMINI_DEFAULT_MODEL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
