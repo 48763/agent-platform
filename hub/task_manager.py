@@ -33,7 +33,17 @@ class TaskManager:
             CREATE INDEX IF NOT EXISTS idx_tasks_chat_id ON tasks(chat_id)
         """)
         self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_tasks_message_id ON tasks(last_message_id)
+            CREATE TABLE IF NOT EXISTS task_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_task_messages_lookup
+            ON task_messages(chat_id, message_id)
         """)
         self._conn.commit()
 
@@ -52,9 +62,10 @@ class TaskManager:
         return self._get_task_dict(task_id)
 
     def get_task_by_message_id(self, chat_id: int, message_id: int) -> dict | None:
-        """Find task by the bot's reply message_id (for TG reply-based continuation)."""
+        """Find task by any bot reply message_id (for TG reply-based continuation)."""
         row = self._conn.execute(
-            "SELECT * FROM tasks WHERE chat_id = ? AND last_message_id = ?",
+            "SELECT t.* FROM tasks t JOIN task_messages tm ON t.task_id = tm.task_id "
+            "WHERE tm.chat_id = ? AND tm.message_id = ?",
             (chat_id, message_id),
         ).fetchone()
         if row:
@@ -97,10 +108,13 @@ class TaskManager:
         self._conn.commit()
 
     def set_message_id(self, task_id: str, message_id: int):
-        """Store the bot's reply message_id for reply-based lookup."""
+        """Store a bot reply message_id for reply-based lookup."""
+        task = self._get_task_dict(task_id)
+        if not task:
+            return
         self._conn.execute(
-            "UPDATE tasks SET last_message_id = ?, updated_at = ? WHERE task_id = ?",
-            (message_id, time.time(), task_id),
+            "INSERT INTO task_messages (task_id, chat_id, message_id, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, task["chat_id"], message_id, time.time()),
         )
         self._conn.commit()
 
