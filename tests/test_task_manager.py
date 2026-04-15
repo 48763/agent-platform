@@ -48,7 +48,33 @@ def test_complete_task(tmp_path):
     tm.complete_task(task["task_id"])
     updated = tm.get_task(task["task_id"])
     assert updated["status"] == "done"
+    # done tasks are still selectable (can be continued via reply)
+    active = tm.get_active_task_for_chat(123)
+    assert active is not None
+    assert active["status"] == "done"
+
+
+def test_archived_task_not_active(tmp_path):
+    tm = make_tm(tmp_path)
+    task = tm.create_task(agent_name="weather", chat_id=123, content="天氣")
+    tm.archive_task(task["task_id"])
     assert tm.get_active_task_for_chat(123) is None
+
+
+def test_closed_task_not_active(tmp_path):
+    tm = make_tm(tmp_path)
+    task = tm.create_task(agent_name="weather", chat_id=123, content="天氣")
+    tm.close_task(task["task_id"])
+    assert tm.get_active_task_for_chat(123) is None
+
+
+def test_reopen_task(tmp_path):
+    tm = make_tm(tmp_path)
+    task = tm.create_task(agent_name="weather", chat_id=123, content="天氣")
+    tm.close_task(task["task_id"])
+    tm.reopen_task(task["task_id"])
+    updated = tm.get_task(task["task_id"])
+    assert updated["status"] == "done"
 
 
 def test_close_task(tmp_path):

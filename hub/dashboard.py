@@ -62,8 +62,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <h2>對話紀錄</h2>
         <div class="tabs">
             <div class="tab active" onclick="filterTasks('all', this)">全部</div>
-            <div class="tab" onclick="filterTasks('active', this)">進行中</div>
+            <div class="tab" onclick="filterTasks('active', this)">處理中</div>
             <div class="tab" onclick="filterTasks('done', this)">已完成</div>
+            <div class="tab" onclick="filterTasks('archived', this)">已封存</div>
             <div class="tab" onclick="filterTasks('closed', this)">已關閉</div>
         </div>
         <div id="tasks"></div>
@@ -91,7 +92,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 'waiting_input': '等待回覆',
                 'waiting_approval': '等待授權',
                 'done': '已完成',
-                'closed': '已完成'
+                'archived': '已封存',
+                'closed': '已關閉'
             };
             return map[status] || status;
         }
@@ -100,6 +102,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             if (status === 'working') return 'badge-working';
             if (status.startsWith('waiting')) return 'badge-waiting';
             if (status === 'done') return 'badge-done';
+            if (status === 'archived') return 'badge-closed';
             if (status === 'closed') return 'badge-closed';
             return 'badge-online';
         }
@@ -135,14 +138,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const data = await res.json();
             allTasks = data.tasks;
             renderTasks();
-            return {active: data.tasks.filter(t => t.status !== 'done').length, total: data.tasks.length};
+            return {active: data.tasks.filter(t => ['working','waiting_input','waiting_approval'].includes(t.status)).length, total: data.tasks.length};
         }
 
         function renderTasks() {
             const el = document.getElementById('tasks');
             let tasks = allTasks;
-            if (currentFilter === 'active') tasks = tasks.filter(t => !['done','closed'].includes(t.status));
+            if (currentFilter === 'active') tasks = tasks.filter(t => ['working','waiting_input','waiting_approval'].includes(t.status));
             if (currentFilter === 'done') tasks = tasks.filter(t => t.status === 'done');
+            if (currentFilter === 'archived') tasks = tasks.filter(t => t.status === 'archived');
             if (currentFilter === 'closed') tasks = tasks.filter(t => t.status === 'closed');
 
             if (!tasks.length) {
@@ -158,10 +162,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     return `<div class="msg ${cls}"><span class="msg-label">${label}:</span> ${content}</div>`;
                 }).join('');
 
-                const isActive = !['done','closed'].includes(t.status);
-                const actions = isActive
-                    ? `<button class="btn-close" onclick="closeTask('${t.task_id}')">關閉</button>`
-                    : '';
+                const isActive = ['working','waiting_input','waiting_approval'].includes(t.status);
+                let actions = '';
+                if (isActive) {
+                    actions = `<button class="btn-close" onclick="closeTask('${t.task_id}')">關閉</button>`;
+                } else if (t.status === 'closed') {
+                    actions = `<button class="btn-close" onclick="reopenTask('${t.task_id}')">重新完成</button>`;
+                }
                 const deleteBtn = `<button class="btn-delete" onclick="deleteTask('${t.task_id}')">刪除</button>`;
 
                 return `
@@ -187,6 +194,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         async function closeTask(taskId) {
             await fetch('/dashboard/task/' + taskId + '/close', {method: 'POST'});
+            loadAll();
+        }
+
+        async function reopenTask(taskId) {
+            await fetch('/dashboard/task/' + taskId + '/reopen', {method: 'POST'});
             loadAll();
         }
 
@@ -236,6 +248,12 @@ async def handle_dashboard_tasks(request: web.Request) -> web.Response:
 async def handle_task_close(request: web.Request) -> web.Response:
     task_id = request.match_info["task_id"]
     request.app["task_manager"].close_task(task_id)
+    return web.json_response({"status": "ok"})
+
+
+async def handle_task_reopen(request: web.Request) -> web.Response:
+    task_id = request.match_info["task_id"]
+    request.app["task_manager"].reopen_task(task_id)
     return web.json_response({"status": "ok"})
 
 

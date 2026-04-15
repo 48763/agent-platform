@@ -93,7 +93,7 @@ class TaskManager:
         """Get the most recently updated non-closed task for a chat."""
         expiry = time.time() - (TASK_EXPIRY_DAYS * 86400)
         row = self._conn.execute(
-            "SELECT * FROM tasks WHERE chat_id = ? AND status NOT IN ('done', 'closed') AND updated_at > ? ORDER BY updated_at DESC LIMIT 1",
+            "SELECT * FROM tasks WHERE chat_id = ? AND status NOT IN ('archived', 'closed') AND updated_at > ? ORDER BY updated_at DESC LIMIT 1",
             (chat_id, expiry),
         ).fetchone()
         if row:
@@ -145,15 +145,44 @@ class TaskManager:
     def complete_task(self, task_id: str):
         self.update_status(task_id, "done")
 
+    def archive_task(self, task_id: str):
+        self.update_status(task_id, "archived")
+
     def close_task(self, task_id: str):
         self.update_status(task_id, "closed")
 
-    def close_expired_tasks(self):
-        expiry = time.time() - (TASK_EXPIRY_DAYS * 86400)
+    def reopen_task(self, task_id: str):
+        self.update_status(task_id, "done")
+
+    def run_lifecycle(self):
+        """Run task lifecycle transitions based on time."""
+        now = time.time()
+
+        # done 3 days → archived
+        done_expiry = now - (3 * 86400)
         self._conn.execute(
-            "UPDATE tasks SET status = 'done' WHERE status != 'done' AND updated_at < ?",
-            (expiry,),
+            "UPDATE tasks SET status = 'archived', updated_at = ? WHERE status = 'done' AND updated_at < ?",
+            (now, done_expiry),
         )
+
+        # archived 7 days → closed
+        archived_expiry = now - (7 * 86400)
+        self._conn.execute(
+            "UPDATE tasks SET status = 'closed', updated_at = ? WHERE status = 'archived' AND updated_at < ?",
+            (now, archived_expiry),
+        )
+
+        # closed 7 days → delete
+        closed_expiry = now - (7 * 86400)
+        self._conn.execute(
+            "DELETE FROM task_messages WHERE task_id IN (SELECT task_id FROM tasks WHERE status = 'closed' AND updated_at < ?)",
+            (closed_expiry,),
+        )
+        self._conn.execute(
+            "DELETE FROM tasks WHERE status = 'closed' AND updated_at < ?",
+            (closed_expiry,),
+        )
+
         self._conn.commit()
 
     def _get_task_dict(self, task_id: str) -> dict | None:

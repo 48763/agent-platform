@@ -7,7 +7,7 @@ from hub.task_manager import TaskManager
 from hub.router import Router
 from hub.cli import send_task_to_agent
 from hub.gemini_fallback import gemini_unified_route, GeminiChat
-from hub.dashboard import handle_dashboard, handle_dashboard_tasks, handle_task_close, handle_task_delete
+from hub.dashboard import handle_dashboard, handle_dashboard_tasks, handle_task_close, handle_task_reopen, handle_task_delete
 
 DB_PATH = os.environ.get("TASKS_DB_PATH", "/data/tasks.db")
 
@@ -37,6 +37,7 @@ def create_hub_app(
     app.router.add_get("/", handle_dashboard)
     app.router.add_get("/dashboard/tasks", handle_dashboard_tasks)
     app.router.add_post("/dashboard/task/{task_id}/close", handle_task_close)
+    app.router.add_post("/dashboard/task/{task_id}/reopen", handle_task_reopen)
     app.router.add_post("/dashboard/task/{task_id}/delete", handle_task_delete)
 
     return app
@@ -83,8 +84,8 @@ async def handle_dispatch(request: web.Request) -> web.Response:
     registry = request.app["registry"]
     chat: GeminiChat = request.app["chat"]
 
-    # Clean up expired tasks
-    task_manager.close_expired_tasks()
+    # Run lifecycle transitions
+    task_manager.run_lifecycle()
 
     # Handle /clear command
     if message.strip() == "/clear":
@@ -99,10 +100,11 @@ async def handle_dispatch(request: web.Request) -> web.Response:
         task = task_manager.get_task_by_message_id(chat_id, reply_to_message_id)
         if task:
             if task["status"] == "closed":
-                pass  # closed task cannot be reopened via reply
+                pass  # closed tasks cannot be reopened via reply
+            elif task["status"] in ("done", "archived"):
+                task_manager.update_status(task["task_id"], "working")
+                return await _continue_task(request, task, message)
             else:
-                if task["status"] == "done":
-                    task_manager.update_status(task["task_id"], "working")
                 return await _continue_task(request, task, message)
 
     # Priority 2: Active task waiting for input → direct continuation
@@ -157,7 +159,7 @@ def _get_all_active_tasks(task_manager: TaskManager, chat_id: int) -> list[dict]
     expiry_days = int(os.environ.get("TASK_EXPIRY_DAYS", "7"))
     expiry = time.time() - (expiry_days * 86400)
     rows = task_manager._conn.execute(
-        "SELECT * FROM tasks WHERE chat_id = ? AND status NOT IN ('done', 'closed') AND updated_at > ? ORDER BY updated_at DESC LIMIT 10",
+        "SELECT * FROM tasks WHERE chat_id = ? AND status NOT IN ('archived', 'closed') AND updated_at > ? ORDER BY updated_at DESC LIMIT 10",
         (chat_id, expiry),
     ).fetchall()
     return [task_manager._row_to_dict(r) for r in rows]
