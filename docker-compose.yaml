@@ -20,8 +20,18 @@ services:
       context: .
       dockerfile: gateway/Dockerfile
     environment:
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - GATEWAY_MODE=${GATEWAY_MODE:-userbot}
       - HUB_URL=http://hub:9000
+      # Bot mode
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      # Userbot mode
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_PHONE=${TELEGRAM_PHONE}
+      - ALLOWED_CHATS=${ALLOWED_CHATS}
+      - SESSION_PATH=/data/bot_session
+    volumes:
+      - ./data/gateway:/data
     depends_on:
       hub:
         condition: service_healthy
