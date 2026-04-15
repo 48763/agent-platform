@@ -1,0 +1,7 @@
+name: echo-agent
+description: "回傳收到的訊息"
+route_patterns:
+  - ".*"
+sandbox:
+  allowed_dirs: []
+  writable: false

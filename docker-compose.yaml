@@ -41,6 +41,18 @@ services:
     networks:
       - agent-network
 
+  echo-agent:
+    build:
+      context: .
+      dockerfile: agents/echo/Dockerfile
+    env_file:
+      - .env/echo-agent.env
+    depends_on:
+      hub:
+        condition: service_healthy
+    networks:
+      - agent-network
+
 networks:
   agent-network:
     driver: bridge
