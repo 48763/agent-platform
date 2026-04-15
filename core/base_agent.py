@@ -44,6 +44,7 @@ class BaseAgent(ABC):
             url=f"http://{self.host}:{actual_port}",
             route_patterns=self.config.get("route_patterns", []),
             capabilities=self.config.get("capabilities", []),
+            priority=self.config.get("priority", 0),
         )
         async with ClientSession() as session:
             await session.post(f"{self.hub_url}/register", json=info.to_dict())

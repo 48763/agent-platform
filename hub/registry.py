@@ -30,7 +30,8 @@ class AgentRegistry:
         return self._agents[name]
 
     def list_online(self) -> list[AgentInfo]:
-        return [info for name, info in self._agents.items() if self._is_alive(name)]
+        online = [info for name, info in self._agents.items() if self._is_alive(name)]
+        return sorted(online, key=lambda a: a.priority, reverse=True)
 
     def _is_alive(self, name: str) -> bool:
         last = self._last_heartbeat.get(name, 0)

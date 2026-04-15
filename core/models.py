@@ -65,6 +65,7 @@ class AgentInfo:
     url: str
     route_patterns: list[str] = field(default_factory=list)
     capabilities: list[str] = field(default_factory=list)
+    priority: int = 0  # higher = matched first
 
     def to_dict(self) -> dict:
         return {
@@ -73,6 +74,7 @@ class AgentInfo:
             "url": self.url,
             "route_patterns": self.route_patterns,
             "capabilities": self.capabilities,
+            "priority": self.priority,
         }
 
     @classmethod
@@ -83,4 +85,5 @@ class AgentInfo:
             url=data["url"],
             route_patterns=data.get("route_patterns", []),
             capabilities=data.get("capabilities", []),
+            priority=data.get("priority", 0),
         )
