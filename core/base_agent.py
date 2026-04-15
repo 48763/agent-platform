@@ -49,14 +49,17 @@ class BaseAgent(ABC):
         async with ClientSession() as session:
             await session.post(f"{self.hub_url}/register", json=info.to_dict())
 
-    async def _heartbeat_loop(self, interval: int = 10) -> None:
+    async def _heartbeat_loop(self, actual_port: int, interval: int = 10) -> None:
         async with ClientSession() as session:
             while True:
                 try:
-                    await session.post(
+                    async with session.post(
                         f"{self.hub_url}/heartbeat",
                         json={"name": self.name},
-                    )
+                    ) as resp:
+                        if resp.status == 404:
+                            # Hub doesn't know us — re-register
+                            await self.register(actual_port)
                 except Exception:
                     pass
                 await asyncio.sleep(interval)
@@ -72,4 +75,4 @@ class BaseAgent(ABC):
         print(f"Agent '{self.name}' running on port {actual_port}")
 
         await self.register(actual_port)
-        await self._heartbeat_loop()
+        await self._heartbeat_loop(actual_port)
