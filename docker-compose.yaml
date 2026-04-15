@@ -48,7 +48,8 @@ services:
     env_file:
       - .env/claude-code-agent.env
     volumes:
-      - ./data/claude-code:/workspace
+      - ~/.claude:/root/.claude
+      - ~/Desktop/workspaces:/workspace
     depends_on:
       hub:
         condition: service_healthy
