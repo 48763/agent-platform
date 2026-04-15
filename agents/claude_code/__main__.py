@@ -53,9 +53,6 @@ class ClaudeCodeAgent(BaseAgent):
             # Clean up session
             asyncio.create_task(self._cleanup_session(task_id))
             message = event.get("message", "任務完成")
-            cost = event.get("cost_usd")
-            if cost:
-                message += f"\n\n(費用: ${cost:.4f})"
             return AgentResult(status=TaskStatus.DONE, message=message)
 
         elif event_type == "need_approval":
