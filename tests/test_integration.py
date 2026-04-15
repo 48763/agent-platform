@@ -1,9 +1,8 @@
 # tests/test_integration.py
 import pytest
-import asyncio
-from aiohttp import web, ClientSession
+from aiohttp import ClientSession
 from aiohttp.test_utils import TestServer
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch, AsyncMock
 from hub.server import create_hub_app
 from core.base_agent import BaseAgent
 from core.models import AgentResult, TaskRequest, TaskStatus
@@ -18,7 +17,6 @@ class EchoAgent(BaseAgent):
 async def test_full_flow_hub_to_agent(tmp_path):
     """Test: Hub receives message -> routes to agent -> returns result"""
 
-    # 1. Create agent config
     agent_dir = tmp_path / "echo"
     agent_dir.mkdir()
     (agent_dir / "agent.yaml").write_text(
@@ -30,13 +28,12 @@ async def test_full_flow_hub_to_agent(tmp_path):
         "  allowed_dirs: []\n"
     )
 
-    # 2. Start hub
-    hub_app = create_hub_app()
+    db_path = str(tmp_path / "tasks.db")
+    hub_app = create_hub_app(db_path=db_path, use_gemini_fallback=False)
     hub_server = TestServer(hub_app)
     await hub_server.start_server()
     hub_url = f"http://localhost:{hub_server.port}"
 
-    # 3. Start echo agent
     agent = EchoAgent(agent_dir=str(agent_dir), hub_url=hub_url, port=0)
     agent_app = agent.create_app()
     agent_server = TestServer(agent_app)
@@ -44,7 +41,6 @@ async def test_full_flow_hub_to_agent(tmp_path):
     agent_url = f"http://localhost:{agent_server.port}"
 
     try:
-        # 4. Register agent with hub
         async with ClientSession() as session:
             await session.post(f"{hub_url}/register", json={
                 "name": "echo-agent",
@@ -53,7 +49,6 @@ async def test_full_flow_hub_to_agent(tmp_path):
                 "route_patterns": ["echo|測試"],
             })
 
-            # 5. Dispatch message through hub
             async with session.post(f"{hub_url}/dispatch", json={
                 "message": "echo hello",
                 "chat_id": 1,
@@ -100,7 +95,8 @@ async def test_multi_turn_flow(tmp_path):
         "  allowed_dirs: []\n"
     )
 
-    hub_app = create_hub_app()
+    db_path = str(tmp_path / "tasks.db")
+    hub_app = create_hub_app(db_path=db_path, use_gemini_fallback=False)
     hub_server = TestServer(hub_app)
     await hub_server.start_server()
     hub_url = f"http://localhost:{hub_server.port}"
@@ -113,7 +109,6 @@ async def test_multi_turn_flow(tmp_path):
 
     try:
         async with ClientSession() as session:
-            # Register
             await session.post(f"{hub_url}/register", json={
                 "name": "ask-agent",
                 "description": "Asks then answers",
@@ -129,7 +124,7 @@ async def test_multi_turn_flow(tmp_path):
             assert r1["status"] == "need_input"
             assert r1["message"] == "哪個城市？"
 
-            # User responds
+            # User responds — has active task with waiting_input status
             async with session.post(f"{hub_url}/dispatch", json={
                 "message": "台北", "chat_id": 42,
             }) as resp:

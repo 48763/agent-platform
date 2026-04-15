@@ -10,6 +10,7 @@ services:
     volumes:
       - ./data/hub/.gemini:/root/.gemini
       - ./data/hub/prompts:/data/prompts
+      - ./data/hub/data:/data
     networks:
       - agent-network
     healthcheck:

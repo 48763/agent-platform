@@ -68,6 +68,28 @@ async def gemini_route(message: str, agents: list[AgentInfo]) -> str | None:
         return None
 
 
+async def gemini_is_continuation(message: str, last_topic: str) -> bool:
+    """Use Gemini flash to determine if a message continues the previous topic."""
+    prompt = (
+        f"判斷以下新訊息是否在接續上一個話題。只回覆 YES 或 NO。\n\n"
+        f"上一個話題摘要: {last_topic}\n"
+        f"新訊息: {message}"
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "gemini", "-p", prompt, "-m", GEMINI_FAST_MODEL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        result = stdout.decode().strip().upper()
+        return "YES" in result
+    except Exception as e:
+        logger.error(f"Gemini continuation check error: {e}")
+        return False
+
+
 async def gemini_default_reply(message: str) -> str | None:
     """Use Gemini CLI to directly reply when no agent can handle the message."""
     template = _load_prompt("gemini_default_reply.txt", (

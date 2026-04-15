@@ -1,45 +1,146 @@
+# hub/task_manager.py
+import json
+import os
+import sqlite3
+import time
 import uuid
-from dataclasses import dataclass, field
 
-
-@dataclass
-class ManagedTask:
-    task_id: str
-    agent_name: str
-    chat_id: int
-    status: str  # working, waiting_input, waiting_approval, done
-    conversation_history: list[dict] = field(default_factory=list)
+TASK_EXPIRY_DAYS = int(os.environ.get("TASK_EXPIRY_DAYS", "7"))
+DB_PATH = os.environ.get("TASKS_DB_PATH", "/data/tasks.db")
 
 
 class TaskManager:
-    def __init__(self):
-        self._tasks: dict[str, ManagedTask] = {}
+    def __init__(self, db_path: str = DB_PATH):
+        self._db_path = db_path
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._create_tables()
 
-    def create_task(self, agent_name: str, chat_id: int, content: str) -> ManagedTask:
+    def _create_tables(self):
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id TEXT PRIMARY KEY,
+                agent_name TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'working',
+                conversation_history TEXT NOT NULL DEFAULT '[]',
+                last_message_id INTEGER,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_chat_id ON tasks(chat_id)
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_message_id ON tasks(last_message_id)
+        """)
+        self._conn.commit()
+
+    def create_task(self, agent_name: str, chat_id: int, content: str) -> dict:
         task_id = str(uuid.uuid4())
-        task = ManagedTask(
-            task_id=task_id,
-            agent_name=agent_name,
-            chat_id=chat_id,
-            status="working",
-            conversation_history=[{"role": "user", "content": content}],
+        now = time.time()
+        history = [{"role": "user", "content": content}]
+        self._conn.execute(
+            "INSERT INTO tasks (task_id, agent_name, chat_id, status, conversation_history, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (task_id, agent_name, chat_id, "working", json.dumps(history), now, now),
         )
-        self._tasks[task_id] = task
-        return task
+        self._conn.commit()
+        return self._get_task_dict(task_id)
 
-    def get_task(self, task_id: str) -> ManagedTask | None:
-        return self._tasks.get(task_id)
+    def get_task(self, task_id: str) -> dict | None:
+        return self._get_task_dict(task_id)
 
-    def get_active_task_for_chat(self, chat_id: int) -> ManagedTask | None:
-        for task in self._tasks.values():
-            if task.chat_id == chat_id and task.status not in ("done",):
-                return task
+    def get_task_by_message_id(self, chat_id: int, message_id: int) -> dict | None:
+        """Find task by the bot's reply message_id (for TG reply-based continuation)."""
+        row = self._conn.execute(
+            "SELECT * FROM tasks WHERE chat_id = ? AND last_message_id = ?",
+            (chat_id, message_id),
+        ).fetchone()
+        if row:
+            return self._row_to_dict(row)
         return None
 
-    def append_user_response(self, task_id: str, content: str) -> None:
-        task = self._tasks[task_id]
-        task.conversation_history.append({"role": "user", "content": content})
-        task.status = "working"
+    def get_active_task_for_chat(self, chat_id: int) -> dict | None:
+        """Get the most recently updated non-closed task for a chat."""
+        expiry = time.time() - (TASK_EXPIRY_DAYS * 86400)
+        row = self._conn.execute(
+            "SELECT * FROM tasks WHERE chat_id = ? AND status NOT IN ('closed', 'done') AND updated_at > ? ORDER BY updated_at DESC LIMIT 1",
+            (chat_id, expiry),
+        ).fetchone()
+        if row:
+            return self._row_to_dict(row)
+        return None
 
-    def complete_task(self, task_id: str) -> None:
-        self._tasks[task_id].status = "done"
+    def append_user_response(self, task_id: str, content: str):
+        task = self._get_task_dict(task_id)
+        if not task:
+            return
+        history = task["conversation_history"]
+        history.append({"role": "user", "content": content})
+        self._conn.execute(
+            "UPDATE tasks SET conversation_history = ?, status = 'working', updated_at = ? WHERE task_id = ?",
+            (json.dumps(history), time.time(), task_id),
+        )
+        self._conn.commit()
+
+    def append_assistant_response(self, task_id: str, content: str):
+        task = self._get_task_dict(task_id)
+        if not task:
+            return
+        history = task["conversation_history"]
+        history.append({"role": "assistant", "content": content})
+        self._conn.execute(
+            "UPDATE tasks SET conversation_history = ?, updated_at = ? WHERE task_id = ?",
+            (json.dumps(history), time.time(), task_id),
+        )
+        self._conn.commit()
+
+    def set_message_id(self, task_id: str, message_id: int):
+        """Store the bot's reply message_id for reply-based lookup."""
+        self._conn.execute(
+            "UPDATE tasks SET last_message_id = ?, updated_at = ? WHERE task_id = ?",
+            (message_id, time.time(), task_id),
+        )
+        self._conn.commit()
+
+    def update_status(self, task_id: str, status: str):
+        self._conn.execute(
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
+            (status, time.time(), task_id),
+        )
+        self._conn.commit()
+
+    def complete_task(self, task_id: str):
+        self.update_status(task_id, "done")
+
+    def close_task(self, task_id: str):
+        self.update_status(task_id, "closed")
+
+    def close_expired_tasks(self):
+        expiry = time.time() - (TASK_EXPIRY_DAYS * 86400)
+        self._conn.execute(
+            "UPDATE tasks SET status = 'closed' WHERE status NOT IN ('closed', 'done') AND updated_at < ?",
+            (expiry,),
+        )
+        self._conn.commit()
+
+    def _get_task_dict(self, task_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if row:
+            return self._row_to_dict(row)
+        return None
+
+    def _row_to_dict(self, row) -> dict:
+        return {
+            "task_id": row["task_id"],
+            "agent_name": row["agent_name"],
+            "chat_id": row["chat_id"],
+            "status": row["status"],
+            "conversation_history": json.loads(row["conversation_history"]),
+            "last_message_id": row["last_message_id"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
