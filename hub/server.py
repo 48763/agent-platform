@@ -10,10 +10,16 @@ from hub.cli import send_task_to_agent
 def create_hub_app(
     heartbeat_timeout: int = 30,
     llm_fallback=None,
+    use_gemini_fallback: bool = True,
 ) -> web.Application:
     app = web.Application()
     registry = AgentRegistry(heartbeat_timeout=heartbeat_timeout)
     task_manager = TaskManager()
+
+    if llm_fallback is None and use_gemini_fallback:
+        from hub.gemini_fallback import gemini_route
+        llm_fallback = gemini_route
+
     router = Router(registry=registry, llm_fallback=llm_fallback)
 
     app["registry"] = registry
