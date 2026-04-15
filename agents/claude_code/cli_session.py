@@ -10,19 +10,27 @@ logger = logging.getLogger(__name__)
 class CLISession:
     """Manages a long-running Claude Code CLI process with JSON streaming."""
 
-    def __init__(self, work_dir: str, cli_path: str = "claude"):
+    def __init__(self, work_dir: str, cli_path: str = "claude",
+                 system_prompt: str | None = None):
         self.work_dir = work_dir
         self.cli_path = cli_path
+        self.system_prompt = system_prompt
         self.process: asyncio.subprocess.Process | None = None
         self._buffer = ""
 
     async def start(self, prompt: str) -> dict:
         """Start a new CLI session with initial prompt, return first meaningful event."""
-        self.process = await asyncio.create_subprocess_exec(
+        cmd = [
             self.cli_path,
             "-p", prompt,
             "--output-format", "stream-json",
             "--verbose",
+        ]
+        if self.system_prompt:
+            cmd.extend(["--append-system-prompt", self.system_prompt])
+
+        self.process = await asyncio.create_subprocess_exec(
+            *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

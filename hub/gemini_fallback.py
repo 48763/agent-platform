@@ -1,10 +1,20 @@
 # hub/gemini_fallback.py
 import asyncio
-import json
 import logging
+import os
+from pathlib import Path
 from core.models import AgentInfo
 
 logger = logging.getLogger(__name__)
+
+PROMPTS_DIR = os.environ.get("PROMPTS_DIR", "/data/prompts")
+
+
+def _load_prompt(filename: str, default: str) -> str:
+    path = Path(PROMPTS_DIR) / filename
+    if path.exists():
+        return path.read_text().strip()
+    return default
 
 
 async def gemini_route(message: str, agents: list[AgentInfo]) -> str | None:
@@ -13,13 +23,14 @@ async def gemini_route(message: str, agents: list[AgentInfo]) -> str | None:
         f"- {a.name}: {a.description}" for a in agents
     )
 
-    prompt = (
-        f"根據以下使用者訊息，從可用的 agent 中選擇最適合處理的一個。\n"
-        f"只回覆 agent 的 name，不要其他文字。\n"
-        f"如果沒有適合的 agent，回覆 NONE。\n\n"
-        f"可用的 agent:\n{agent_descriptions}\n\n"
-        f"使用者訊息: {message}"
-    )
+    template = _load_prompt("gemini_router.txt", (
+        "根據以下使用者訊息，從可用的 agent 中選擇最適合處理的一個。\n"
+        "只回覆 agent 的 name，不要其他文字。\n"
+        "如果沒有適合的 agent，回覆 NONE。\n\n"
+        "可用的 agent:\n{agent_descriptions}\n\n"
+        "使用者訊息: {message}"
+    ))
+    prompt = template.format(agent_descriptions=agent_descriptions, message=message)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -33,12 +44,10 @@ async def gemini_route(message: str, agents: list[AgentInfo]) -> str | None:
         if result == "NONE" or not result:
             return None
 
-        # Verify the returned name is a valid agent
         valid_names = {a.name for a in agents}
         if result in valid_names:
             return result
 
-        # Try to find a partial match
         for name in valid_names:
             if name in result:
                 return name
@@ -54,4 +63,27 @@ async def gemini_route(message: str, agents: list[AgentInfo]) -> str | None:
         return None
     except Exception as e:
         logger.error(f"Gemini fallback error: {e}")
+        return None
+
+
+async def gemini_default_reply(message: str) -> str | None:
+    """Use Gemini CLI to directly reply when no agent can handle the message."""
+    template = _load_prompt("gemini_default_reply.txt", (
+        "你是一個通用助手。請用繁體中文簡潔回覆以下使用者訊息。\n\n"
+        "使用者訊息: {message}"
+    ))
+    prompt = template.format(message=message)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "gemini", "-p", prompt,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        result = stdout.decode().strip()
+        return result if result else None
+
+    except Exception as e:
+        logger.error(f"Gemini default reply error: {e}")
         return None

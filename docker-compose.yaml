@@ -9,6 +9,7 @@ services:
       - .env/hub.env
     volumes:
       - ./data/hub/.gemini:/root/.gemini
+      - ./data/hub/prompts:/data/prompts
     networks:
       - agent-network
     healthcheck:
@@ -53,6 +54,7 @@ services:
       - ~/Desktop/workspaces:/workspace
       - ./data/claude-code-agent/.claude:/root/.claude
       - ./data/claude-code-agent/.claude.json:/root/.claude.json
+      - ./data/claude-code-agent/prompts:/data/prompts
     depends_on:
       hub:
         condition: service_healthy

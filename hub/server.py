@@ -5,6 +5,7 @@ from hub.registry import AgentRegistry
 from hub.task_manager import TaskManager
 from hub.router import Router
 from hub.cli import send_task_to_agent
+from hub.gemini_fallback import gemini_default_reply
 
 
 def create_hub_app(
@@ -80,9 +81,13 @@ async def handle_dispatch(request: web.Request) -> web.Response:
         # New task — route it
         agent = await router.route(message)
         if agent is None:
+            # No agent matched — Hub replies directly via Gemini
+            reply = await gemini_default_reply(message)
+            if reply:
+                return web.json_response({"status": "done", "message": reply})
             return web.json_response({
                 "status": "error",
-                "message": "無法處理此訊息，沒有可用的 agent",
+                "message": "無法處理此訊息",
             })
 
         task = task_manager.create_task(

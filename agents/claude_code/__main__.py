@@ -19,8 +19,16 @@ class ClaudeCodeAgent(BaseAgent):
         super().__init__(agent_dir=agent_dir, hub_url=hub_url, port=port)
         self.work_dir = work_dir
         self.cli_path = os.environ.get("CLAUDE_CLI_PATH", "claude")
-        # Map task_id → active CLI session
+        self.system_prompt = self._load_system_prompt()
         self._sessions: dict[str, CLISession] = {}
+
+    def _load_system_prompt(self) -> str | None:
+        prompts_dir = os.environ.get("PROMPTS_DIR", "/data/prompts")
+        path = os.path.join(prompts_dir, "system.txt")
+        if os.path.exists(path):
+            with open(path) as f:
+                return f.read().strip()
+        return None
 
     async def handle_task(self, task: TaskRequest) -> AgentResult:
         task_id = task.task_id
@@ -35,7 +43,8 @@ class ClaudeCodeAgent(BaseAgent):
                 event = await session.send_input(user_input)
             else:
                 # New session
-                session = CLISession(work_dir=self.work_dir, cli_path=self.cli_path)
+                session = CLISession(work_dir=self.work_dir, cli_path=self.cli_path,
+                                     system_prompt=self.system_prompt)
                 self._sessions[task_id] = session
                 event = await session.start(task.content)
 
