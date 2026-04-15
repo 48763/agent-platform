@@ -7,6 +7,8 @@ services:
       - "9000:9000"
     env_file:
       - .env/hub.env
+    volumes:
+      - ./data/hub/.gemini:/root/.gemini
     networks:
       - agent-network
     healthcheck:
