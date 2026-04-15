@@ -125,7 +125,6 @@ async def handle_dispatch(request: web.Request) -> web.Response:
                 agent_name="_hub", chat_id=chat_id, content=message,
             )
             task_manager.append_assistant_response(task["task_id"], reply)
-            task_manager.complete_task(task["task_id"])
             return web.json_response({
                 "status": "done",
                 "message": reply,
