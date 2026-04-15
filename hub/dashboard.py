@@ -61,15 +61,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div id="agents"></div>
         <h2>對話紀錄</h2>
         <div class="tabs">
-            <div class="tab active" onclick="filterTasks('active', this)">進行中</div>
+            <div class="tab" onclick="filterTasks('active', this)">進行中</div>
             <div class="tab" onclick="filterTasks('done', this)">已完成</div>
-            <div class="tab" onclick="filterTasks('all', this)">全部</div>
+            <div class="tab active" onclick="filterTasks('all', this)">全部</div>
         </div>
         <div id="tasks"></div>
     </div>
     <script>
         let allTasks = [];
-        let currentFilter = 'active';
+        let currentFilter = 'all';
 
         function timeAgo(ts) {
             const s = Math.floor(Date.now()/1000 - ts);
@@ -90,7 +90,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 'waiting_input': '等待回覆',
                 'waiting_approval': '等待授權',
                 'done': '已完成',
-                'closed': '已關閉'
+                'closed': '已完成'
             };
             return map[status] || status;
         }
@@ -134,14 +134,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const data = await res.json();
             allTasks = data.tasks;
             renderTasks();
-            return {active: data.tasks.filter(t => !['done','closed'].includes(t.status)).length, total: data.tasks.length};
+            return {active: data.tasks.filter(t => t.status !== 'done').length, total: data.tasks.length};
         }
 
         function renderTasks() {
             const el = document.getElementById('tasks');
             let tasks = allTasks;
-            if (currentFilter === 'active') tasks = tasks.filter(t => !['done','closed'].includes(t.status));
-            if (currentFilter === 'done') tasks = tasks.filter(t => ['done','closed'].includes(t.status));
+            if (currentFilter === 'active') tasks = tasks.filter(t => t.status !== 'done');
+            if (currentFilter === 'done') tasks = tasks.filter(t => t.status === 'done');
 
             if (!tasks.length) {
                 el.innerHTML = '<div class="empty">沒有對話紀錄</div>';
@@ -156,7 +156,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     return `<div class="msg ${cls}"><span class="msg-label">${label}:</span> ${content}</div>`;
                 }).join('');
 
-                const isActive = !['done','closed'].includes(t.status);
+                const isActive = t.status !== 'done';
                 const actions = isActive
                     ? `<button class="btn-close" onclick="closeTask('${t.task_id}')">關閉</button>`
                     : '';

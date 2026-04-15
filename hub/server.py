@@ -90,7 +90,7 @@ async def handle_dispatch(request: web.Request) -> web.Response:
     if message.strip() == "/clear":
         active = task_manager.get_active_task_for_chat(chat_id)
         if active:
-            task_manager.close_task(active["task_id"])
+            task_manager.complete_task(active["task_id"])
             return web.json_response({"status": "done", "message": "對話已結束"})
         return web.json_response({"status": "done", "message": "沒有進行中的對話"})
 
@@ -98,7 +98,7 @@ async def handle_dispatch(request: web.Request) -> web.Response:
     if reply_to_message_id:
         task = task_manager.get_task_by_message_id(chat_id, reply_to_message_id)
         if task:
-            if task["status"] in ("closed", "done"):
+            if task["status"] == "done":
                 task_manager.update_status(task["task_id"], "working")
             return await _continue_task(request, task, message)
 
@@ -154,7 +154,7 @@ def _get_all_active_tasks(task_manager: TaskManager, chat_id: int) -> list[dict]
     expiry_days = int(os.environ.get("TASK_EXPIRY_DAYS", "7"))
     expiry = time.time() - (expiry_days * 86400)
     rows = task_manager._conn.execute(
-        "SELECT * FROM tasks WHERE chat_id = ? AND status NOT IN ('closed', 'done') AND updated_at > ? ORDER BY updated_at DESC LIMIT 10",
+        "SELECT * FROM tasks WHERE chat_id = ? AND status != 'done' AND updated_at > ? ORDER BY updated_at DESC LIMIT 10",
         (chat_id, expiry),
     ).fetchall()
     return [task_manager._row_to_dict(r) for r in rows]
@@ -184,6 +184,7 @@ async def _hub_chat_reply(request: web.Request, chat_id: int, message: str, sour
 
     if reply:
         task_manager.append_assistant_response(task["task_id"], reply)
+        task_manager.complete_task(task["task_id"])
         return web.json_response({
             "status": "done",
             "message": reply,
@@ -205,6 +206,7 @@ async def _continue_task(request: web.Request, task: dict, message: str) -> web.
         reply = await chat.reply_with_context(task["conversation_history"])
         if reply:
             task_manager.append_assistant_response(task["task_id"], reply)
+            task_manager.complete_task(task["task_id"])
             return web.json_response({
                 "status": "done",
                 "message": reply,

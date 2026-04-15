@@ -93,7 +93,7 @@ class TaskManager:
         """Get the most recently updated non-closed task for a chat."""
         expiry = time.time() - (TASK_EXPIRY_DAYS * 86400)
         row = self._conn.execute(
-            "SELECT * FROM tasks WHERE chat_id = ? AND status NOT IN ('closed', 'done') AND updated_at > ? ORDER BY updated_at DESC LIMIT 1",
+            "SELECT * FROM tasks WHERE chat_id = ? AND status != 'done' AND updated_at > ? ORDER BY updated_at DESC LIMIT 1",
             (chat_id, expiry),
         ).fetchone()
         if row:
@@ -146,12 +146,12 @@ class TaskManager:
         self.update_status(task_id, "done")
 
     def close_task(self, task_id: str):
-        self.update_status(task_id, "closed")
+        self.complete_task(task_id)
 
     def close_expired_tasks(self):
         expiry = time.time() - (TASK_EXPIRY_DAYS * 86400)
         self._conn.execute(
-            "UPDATE tasks SET status = 'closed' WHERE status NOT IN ('closed', 'done') AND updated_at < ?",
+            "UPDATE tasks SET status = 'done' WHERE status != 'done' AND updated_at < ?",
             (expiry,),
         )
         self._conn.commit()
