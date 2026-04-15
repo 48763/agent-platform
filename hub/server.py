@@ -98,9 +98,12 @@ async def handle_dispatch(request: web.Request) -> web.Response:
     if reply_to_message_id:
         task = task_manager.get_task_by_message_id(chat_id, reply_to_message_id)
         if task:
-            if task["status"] == "done":
-                task_manager.update_status(task["task_id"], "working")
-            return await _continue_task(request, task, message)
+            if task["status"] == "closed":
+                pass  # closed task cannot be reopened via reply
+            else:
+                if task["status"] == "done":
+                    task_manager.update_status(task["task_id"], "working")
+                return await _continue_task(request, task, message)
 
     # Priority 2: Active task waiting for input → direct continuation
     active_task = task_manager.get_active_task_for_chat(chat_id)
@@ -154,7 +157,7 @@ def _get_all_active_tasks(task_manager: TaskManager, chat_id: int) -> list[dict]
     expiry_days = int(os.environ.get("TASK_EXPIRY_DAYS", "7"))
     expiry = time.time() - (expiry_days * 86400)
     rows = task_manager._conn.execute(
-        "SELECT * FROM tasks WHERE chat_id = ? AND status != 'done' AND updated_at > ? ORDER BY updated_at DESC LIMIT 10",
+        "SELECT * FROM tasks WHERE chat_id = ? AND status NOT IN ('done', 'closed') AND updated_at > ? ORDER BY updated_at DESC LIMIT 10",
         (chat_id, expiry),
     ).fetchall()
     return [task_manager._row_to_dict(r) for r in rows]

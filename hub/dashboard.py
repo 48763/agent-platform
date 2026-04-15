@@ -64,6 +64,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="tab active" onclick="filterTasks('all', this)">全部</div>
             <div class="tab" onclick="filterTasks('active', this)">進行中</div>
             <div class="tab" onclick="filterTasks('done', this)">已完成</div>
+            <div class="tab" onclick="filterTasks('closed', this)">已關閉</div>
         </div>
         <div id="tasks"></div>
     </div>
@@ -140,8 +141,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function renderTasks() {
             const el = document.getElementById('tasks');
             let tasks = allTasks;
-            if (currentFilter === 'active') tasks = tasks.filter(t => t.status !== 'done');
+            if (currentFilter === 'active') tasks = tasks.filter(t => !['done','closed'].includes(t.status));
             if (currentFilter === 'done') tasks = tasks.filter(t => t.status === 'done');
+            if (currentFilter === 'closed') tasks = tasks.filter(t => t.status === 'closed');
 
             if (!tasks.length) {
                 el.innerHTML = '<div class="empty">沒有對話紀錄</div>';
@@ -156,7 +158,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     return `<div class="msg ${cls}"><span class="msg-label">${label}:</span> ${content}</div>`;
                 }).join('');
 
-                const isActive = t.status !== 'done';
+                const isActive = !['done','closed'].includes(t.status);
                 const actions = isActive
                     ? `<button class="btn-close" onclick="closeTask('${t.task_id}')">關閉</button>`
                     : '';
