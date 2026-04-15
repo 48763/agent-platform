@@ -34,10 +34,7 @@ async def test_dispatch_no_agent(aiohttp_client, tmp_db):
     app = create_hub_app(db_path=tmp_db, use_gemini_fallback=False)
     client = await aiohttp_client(app)
 
-    with patch("hub.server.gemini_default_reply", new_callable=AsyncMock) as mock_reply:
-        mock_reply.return_value = None
-        resp = await client.post("/dispatch", json={"message": "訂機票", "chat_id": 0})
-
+    resp = await client.post("/dispatch", json={"message": "訂機票", "chat_id": 0})
     assert resp.status == 200
     data = await resp.json()
     assert data["status"] == "error"

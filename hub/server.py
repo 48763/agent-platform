@@ -6,30 +6,27 @@ from hub.registry import AgentRegistry
 from hub.task_manager import TaskManager
 from hub.router import Router
 from hub.cli import send_task_to_agent
-from hub.gemini_fallback import gemini_default_reply, gemini_is_continuation
+from hub.gemini_fallback import gemini_unified_route, GeminiChat
 
 DB_PATH = os.environ.get("TASKS_DB_PATH", "/data/tasks.db")
 
 
 def create_hub_app(
     heartbeat_timeout: int = 30,
-    llm_fallback=None,
     use_gemini_fallback: bool = True,
     db_path: str = DB_PATH,
 ) -> web.Application:
     app = web.Application()
     registry = AgentRegistry(heartbeat_timeout=heartbeat_timeout)
     task_manager = TaskManager(db_path=db_path)
-
-    if llm_fallback is None and use_gemini_fallback:
-        from hub.gemini_fallback import gemini_route
-        llm_fallback = gemini_route
-
-    router = Router(registry=registry, llm_fallback=llm_fallback)
+    router = Router(registry=registry)
+    chat = GeminiChat()
 
     app["registry"] = registry
     app["task_manager"] = task_manager
     app["router"] = router
+    app["chat"] = chat
+    app["use_gemini_fallback"] = use_gemini_fallback
 
     app.router.add_post("/register", handle_register)
     app.router.add_post("/heartbeat", handle_heartbeat)
@@ -76,8 +73,9 @@ async def handle_dispatch(request: web.Request) -> web.Response:
     chat_id = data.get("chat_id", 0)
     reply_to_message_id = data.get("reply_to_message_id")
 
-    router = request.app["router"]
     task_manager = request.app["task_manager"]
+    registry = request.app["registry"]
+    chat: GeminiChat = request.app["chat"]
 
     # Clean up expired tasks
     task_manager.close_expired_tasks()
@@ -94,7 +92,6 @@ async def handle_dispatch(request: web.Request) -> web.Response:
     if reply_to_message_id:
         task = task_manager.get_task_by_message_id(chat_id, reply_to_message_id)
         if task:
-            # Reopen if closed/done
             if task["status"] in ("closed", "done"):
                 task_manager.update_status(task["task_id"], "working")
             return await _continue_task(request, task, message)
@@ -104,55 +101,102 @@ async def handle_dispatch(request: web.Request) -> web.Response:
     if active_task and active_task["status"] in ("waiting_input", "waiting_approval"):
         return await _continue_task(request, active_task, message)
 
-    # Priority 3: Active task exists (working) → flash check if continuation
-    if active_task:
-        history = active_task["conversation_history"]
-        last_topic = history[-1]["content"] if history else ""
+    # Priority 3: Keyword match (fast, no AI)
+    router: Router = request.app["router"]
+    keyword_match = router.match_by_keyword(message)
+    if keyword_match:
+        task = task_manager.create_task(
+            agent_name=keyword_match.name, chat_id=chat_id, content=message,
+        )
+        result = await _dispatch_to_agent(request, task, message)
+        return web.json_response(result)
 
-        is_continuation = await gemini_is_continuation(message, last_topic)
-        if is_continuation:
-            return await _continue_task(request, active_task, message)
-        else:
-            task_manager.close_task(active_task["task_id"])
+    # Priority 4: Unified Gemini flash routing (one call decides everything)
+    if request.app["use_gemini_fallback"]:
+        # Gather all active tasks for this chat
+        active_tasks = _get_all_active_tasks(task_manager, chat_id)
+        online_agents = [a for a in registry.list_online() if a.priority >= 0]
 
-    # Priority 3: Route to agent
-    agent = await router.route(message)
-    if agent is None:
-        # No agent — Hub replies via Gemini, store as hub task
-        reply = await gemini_default_reply(message)
+        decision = await gemini_unified_route(message, active_tasks, online_agents)
+        action = decision.get("action")
+
+        if action == "continue":
+            task = task_manager.get_task(decision["task_id"])
+            if task:
+                return await _continue_task(request, task, message)
+
+        elif action == "route":
+            agent_name = decision["agent_name"]
+            agent_info = registry.get(agent_name)
+            if agent_info:
+                task = task_manager.create_task(
+                    agent_name=agent_name, chat_id=chat_id, content=message,
+                )
+                result = await _dispatch_to_agent(request, task, message)
+                return web.json_response(result)
+
+        # action == "chat" or fallthrough
+        return await _hub_chat_reply(request, chat_id, message)
+
+    # No gemini fallback — error
+    return web.json_response({"status": "error", "message": "無法處理此訊息"})
+
+
+def _get_all_active_tasks(task_manager: TaskManager, chat_id: int) -> list[dict]:
+    """Get all non-closed tasks for a chat (for unified router context)."""
+    import time
+    expiry_days = int(os.environ.get("TASK_EXPIRY_DAYS", "7"))
+    expiry = time.time() - (expiry_days * 86400)
+    rows = task_manager._conn.execute(
+        "SELECT * FROM tasks WHERE chat_id = ? AND status NOT IN ('closed', 'done') AND updated_at > ? ORDER BY updated_at DESC LIMIT 10",
+        (chat_id, expiry),
+    ).fetchall()
+    return [task_manager._row_to_dict(r) for r in rows]
+
+
+async def _hub_chat_reply(request: web.Request, chat_id: int, message: str) -> web.Response:
+    """Hub replies directly via Gemini Chat."""
+    task_manager = request.app["task_manager"]
+    chat: GeminiChat = request.app["chat"]
+
+    # Check if there's an existing hub chat task
+    active = task_manager.get_active_task_for_chat(chat_id)
+    if active and active["agent_name"] == "_hub":
+        # Continue hub chat with context
+        task_manager.append_user_response(active["task_id"], message)
+        task = task_manager.get_task(active["task_id"])
+        reply = await chat.reply_with_context(task["conversation_history"])
+    else:
+        # New hub chat
+        reply = await chat.reply(message)
         if reply:
             task = task_manager.create_task(
                 agent_name="_hub", chat_id=chat_id, content=message,
             )
-            task_manager.append_assistant_response(task["task_id"], reply)
-            return web.json_response({
-                "status": "done",
-                "message": reply,
-                "task_id": task["task_id"],
-            })
-        return web.json_response({"status": "error", "message": "無法處理此訊息"})
+        else:
+            return web.json_response({"status": "error", "message": "無法處理此訊息"})
 
-    # Create new task and dispatch
-    task = task_manager.create_task(
-        agent_name=agent.name, chat_id=chat_id, content=message,
-    )
-    result = await _dispatch_to_agent(request, task, message)
-    return web.json_response(result)
+    if reply:
+        task_manager.append_assistant_response(task["task_id"], reply)
+        return web.json_response({
+            "status": "done",
+            "message": reply,
+            "task_id": task["task_id"],
+        })
+    return web.json_response({"status": "error", "message": "無法處理此訊息"})
 
 
 async def _continue_task(request: web.Request, task: dict, message: str) -> web.Response:
     """Continue an existing task with a new user message."""
     task_manager = request.app["task_manager"]
+    chat: GeminiChat = request.app["chat"]
     task_manager.append_user_response(task["task_id"], message)
 
     # Refresh task after update
     task = task_manager.get_task(task["task_id"])
 
     if task["agent_name"] == "_hub":
-        # Hub task — reply via Gemini with conversation context
-        history = task["conversation_history"]
-        context = "\n".join(f"{m['role']}: {m['content']}" for m in history[-6:])
-        reply = await gemini_default_reply(context)
+        reply = await chat.reply_with_context(task["conversation_history"])
         if reply:
             task_manager.append_assistant_response(task["task_id"], reply)
             return web.json_response({
@@ -174,7 +218,6 @@ async def _continue_task(request: web.Request, task: dict, message: str) -> web.
     )
     result = await send_task_to_agent(agent_info.url, task_request)
 
-    # Update status
     _update_task_status(task_manager, task["task_id"], result)
 
     if result.get("message"):
