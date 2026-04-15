@@ -25,6 +25,7 @@ class TaskManager:
                 status TEXT NOT NULL DEFAULT 'working',
                 conversation_history TEXT NOT NULL DEFAULT '[]',
                 last_message_id INTEGER,
+                source TEXT NOT NULL DEFAULT 'telegram',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             )
@@ -47,13 +48,13 @@ class TaskManager:
         """)
         self._conn.commit()
 
-    def create_task(self, agent_name: str, chat_id: int, content: str) -> dict:
+    def create_task(self, agent_name: str, chat_id: int, content: str, source: str = "telegram") -> dict:
         task_id = str(uuid.uuid4())
         now = time.time()
         history = [{"role": "user", "content": content}]
         self._conn.execute(
-            "INSERT INTO tasks (task_id, agent_name, chat_id, status, conversation_history, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (task_id, agent_name, chat_id, "working", json.dumps(history), now, now),
+            "INSERT INTO tasks (task_id, agent_name, chat_id, status, conversation_history, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, agent_name, chat_id, "working", json.dumps(history), source, now, now),
         )
         self._conn.commit()
         return self._get_task_dict(task_id)
@@ -155,6 +156,7 @@ class TaskManager:
             "status": row["status"],
             "conversation_history": json.loads(row["conversation_history"]),
             "last_message_id": row["last_message_id"],
+            "source": row["source"] if "source" in row.keys() else "telegram",
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }

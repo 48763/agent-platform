@@ -7,7 +7,7 @@ from hub.task_manager import TaskManager
 from hub.router import Router
 from hub.cli import send_task_to_agent
 from hub.gemini_fallback import gemini_unified_route, GeminiChat
-from hub.dashboard import handle_dashboard, handle_dashboard_tasks
+from hub.dashboard import handle_dashboard, handle_dashboard_tasks, handle_task_close, handle_task_delete
 
 DB_PATH = os.environ.get("TASKS_DB_PATH", "/data/tasks.db")
 
@@ -36,6 +36,8 @@ def create_hub_app(
     app.router.add_post("/set_message_id", handle_set_message_id)
     app.router.add_get("/", handle_dashboard)
     app.router.add_get("/dashboard/tasks", handle_dashboard_tasks)
+    app.router.add_post("/dashboard/task/{task_id}/close", handle_task_close)
+    app.router.add_post("/dashboard/task/{task_id}/delete", handle_task_delete)
 
     return app
 
@@ -75,6 +77,7 @@ async def handle_dispatch(request: web.Request) -> web.Response:
     message = data["message"]
     chat_id = data.get("chat_id", 0)
     reply_to_message_id = data.get("reply_to_message_id")
+    source = data.get("source", "telegram")
 
     task_manager = request.app["task_manager"]
     registry = request.app["registry"]
@@ -109,7 +112,7 @@ async def handle_dispatch(request: web.Request) -> web.Response:
     keyword_match = router.match_by_keyword(message)
     if keyword_match:
         task = task_manager.create_task(
-            agent_name=keyword_match.name, chat_id=chat_id, content=message,
+            agent_name=keyword_match.name, chat_id=chat_id, content=message, source=source,
         )
         result = await _dispatch_to_agent(request, task, message)
         return web.json_response(result)
@@ -133,7 +136,7 @@ async def handle_dispatch(request: web.Request) -> web.Response:
             agent_info = registry.get(agent_name)
             if agent_info:
                 task = task_manager.create_task(
-                    agent_name=agent_name, chat_id=chat_id, content=message,
+                    agent_name=agent_name, chat_id=chat_id, content=message, source=source,
                 )
                 result = await _dispatch_to_agent(request, task, message)
                 return web.json_response(result)
@@ -174,7 +177,7 @@ async def _hub_chat_reply(request: web.Request, chat_id: int, message: str) -> w
         reply = await chat.reply(message)
         if reply:
             task = task_manager.create_task(
-                agent_name="_hub", chat_id=chat_id, content=message,
+                agent_name="_hub", chat_id=chat_id, content=message, source=source,
             )
         else:
             return web.json_response({"status": "error", "message": "無法處理此訊息"})
