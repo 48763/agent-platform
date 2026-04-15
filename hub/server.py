@@ -142,7 +142,7 @@ async def handle_dispatch(request: web.Request) -> web.Response:
                 return web.json_response(result)
 
         # action == "chat" or fallthrough
-        return await _hub_chat_reply(request, chat_id, message)
+        return await _hub_chat_reply(request, chat_id, message, source)
 
     # No gemini fallback — error
     return web.json_response({"status": "error", "message": "無法處理此訊息"})
@@ -160,7 +160,7 @@ def _get_all_active_tasks(task_manager: TaskManager, chat_id: int) -> list[dict]
     return [task_manager._row_to_dict(r) for r in rows]
 
 
-async def _hub_chat_reply(request: web.Request, chat_id: int, message: str) -> web.Response:
+async def _hub_chat_reply(request: web.Request, chat_id: int, message: str, source: str = "telegram") -> web.Response:
     """Hub replies directly via Gemini Chat."""
     task_manager = request.app["task_manager"]
     chat: GeminiChat = request.app["chat"]
