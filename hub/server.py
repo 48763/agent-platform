@@ -7,6 +7,7 @@ from hub.task_manager import TaskManager
 from hub.router import Router
 from hub.cli import send_task_to_agent
 from hub.gemini_fallback import gemini_unified_route, GeminiChat
+from hub.dashboard import handle_dashboard, handle_dashboard_tasks
 
 DB_PATH = os.environ.get("TASKS_DB_PATH", "/data/tasks.db")
 
@@ -33,6 +34,8 @@ def create_hub_app(
     app.router.add_get("/agents", handle_list_agents)
     app.router.add_post("/dispatch", handle_dispatch)
     app.router.add_post("/set_message_id", handle_set_message_id)
+    app.router.add_get("/", handle_dashboard)
+    app.router.add_get("/dashboard/tasks", handle_dashboard_tasks)
 
     return app
 
