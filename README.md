@@ -103,13 +103,15 @@ pip install pytest pytest-asyncio pytest-aiohttp
 
 ### 3. 首次認證
 
+各服務需要在容器內完成認證，認證資料會保存在 `data/` 目錄下，container 重啟不需重新登入。
+
 **Gateway（Telegram Userbot）：**
 
 ```bash
 source .venv/bin/activate
 export $(grep -v '^#' .env/gateway.env | grep -v '^$' | xargs)
 SESSION_PATH=data/gateway/bot_session python -m gateway
-# 輸入驗證碼後 Ctrl+C
+# 輸入手機號碼 → 輸入 Telegram 驗證碼 → 看到 connected 後 Ctrl+C
 ```
 
 **Hub（Gemini CLI）：**
@@ -117,7 +119,10 @@ SESSION_PATH=data/gateway/bot_session python -m gateway
 ```bash
 docker compose build hub
 docker compose up hub -d
-docker exec -it agent-hub-1 gemini auth login
+docker exec -it agent-hub-1 sh
+# 進入容器後：
+gemini auth login
+# 複製認證網址到本機瀏覽器開啟 → 登入 → 貼回 passkey → exit
 ```
 
 **Claude Code Agent：**
@@ -125,7 +130,10 @@ docker exec -it agent-hub-1 gemini auth login
 ```bash
 docker compose build claude-code-agent
 docker compose up claude-code-agent -d
-docker exec -it agent-claude-code-agent-1 claude auth login
+docker exec -it agent-claude-code-agent-1 sh
+# 進入容器後：
+claude auth login
+# 複製認證網址到本機瀏覽器開啟 → 登入 → 貼回 code → exit
 ```
 
 ### 4. 啟動
