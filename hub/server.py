@@ -7,7 +7,11 @@ from hub.task_manager import TaskManager
 from hub.router import Router
 from hub.cli import send_task_to_agent
 from hub.gemini_fallback import gemini_unified_route, GeminiChat
-from hub.dashboard import handle_dashboard, handle_dashboard_tasks, handle_task_close, handle_task_reopen, handle_task_delete
+from hub.dashboard import (
+    handle_dashboard, handle_dashboard_tasks,
+    handle_task_close, handle_task_reopen, handle_task_delete,
+    handle_dashboard_agents, handle_agent_disable, handle_agent_enable,
+)
 
 DB_PATH = os.environ.get("TASKS_DB_PATH", "/data/tasks.db")
 
@@ -39,6 +43,9 @@ def create_hub_app(
     app.router.add_post("/dashboard/task/{task_id}/close", handle_task_close)
     app.router.add_post("/dashboard/task/{task_id}/reopen", handle_task_reopen)
     app.router.add_post("/dashboard/task/{task_id}/delete", handle_task_delete)
+    app.router.add_get("/dashboard/agents", handle_dashboard_agents)
+    app.router.add_post("/dashboard/agent/{name}/disable", handle_agent_disable)
+    app.router.add_post("/dashboard/agent/{name}/enable", handle_agent_enable)
 
     return app
 
@@ -242,15 +249,23 @@ async def _continue_task(request: web.Request, task: dict, message: str) -> web.
 
 async def _dispatch_to_agent(request: web.Request, task: dict, message: str) -> dict:
     """Dispatch a new task to an agent."""
+    import time as _time
     task_manager = request.app["task_manager"]
-    agent_info = request.app["registry"].get(task["agent_name"])
+    registry = request.app["registry"]
+    agent_info = registry.get(task["agent_name"])
 
     task_request = TaskRequest(
         task_id=task["task_id"],
         content=message,
         conversation_history=task["conversation_history"],
     )
+
+    start = _time.time()
     result = await send_task_to_agent(agent_info.url, task_request)
+    duration_ms = int((_time.time() - start) * 1000)
+
+    success = result.get("status") != "error"
+    registry.record_task_result(task["agent_name"], success, duration_ms)
 
     _update_task_status(task_manager, task["task_id"], result)
 

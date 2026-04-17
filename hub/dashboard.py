@@ -1,6 +1,4 @@
 # hub/dashboard.py
-import json
-import time
 from aiohttp import web
 
 
@@ -16,38 +14,57 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         h1 { color: #58a6ff; margin-bottom: 20px; font-size: 1.5em; }
         h2 { color: #8b949e; margin: 20px 0 10px; font-size: 1.1em; border-bottom: 1px solid #21262d; padding-bottom: 8px; }
         .container { max-width: 1000px; margin: 0 auto; }
-        .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin-bottom: 12px; position: relative; }
+
+        .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin-bottom: 12px; }
         .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-        .card-title { font-weight: 600; color: #f0f6fc; }
-        .badge { padding: 2px 8px; border-radius: 12px; font-size: 0.75em; font-weight: 600; }
+        .card-title { font-weight: 600; color: #f0f6fc; font-size: 1em; }
+        .card-desc { color: #8b949e; font-size: 0.85em; margin-bottom: 8px; }
+
+        .badge { padding: 2px 8px; border-radius: 12px; font-size: 0.75em; font-weight: 600; display: inline-block; }
         .badge-online { background: #238636; color: #fff; }
+        .badge-offline { background: #f85149; color: #fff; }
+        .badge-disabled { background: #d29922; color: #000; }
         .badge-working { background: #1f6feb; color: #fff; }
         .badge-waiting { background: #d29922; color: #000; }
         .badge-done { background: #8b949e; color: #fff; }
         .badge-closed { background: #484f58; color: #8b949e; }
+
         .meta { color: #8b949e; font-size: 0.85em; margin-top: 4px; display: flex; gap: 12px; flex-wrap: wrap; }
         .meta-item { display: flex; align-items: center; gap: 4px; }
-        .patterns { color: #7ee787; font-size: 0.85em; }
+
+        .agent-stats { display: flex; gap: 16px; margin-top: 8px; flex-wrap: wrap; }
+        .agent-stat { background: #0d1117; border-radius: 4px; padding: 6px 12px; font-size: 0.8em; }
+        .agent-stat-value { color: #58a6ff; font-weight: 600; }
+        .agent-stat-label { color: #8b949e; }
+        .agent-patterns { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+        .agent-pattern { background: #0d1117; color: #7ee787; padding: 2px 8px; border-radius: 4px; font-size: 0.8em; font-family: monospace; }
+
         .history { margin-top: 10px; padding: 10px; background: #0d1117; border-radius: 4px; max-height: 200px; overflow-y: auto; font-size: 0.85em; line-height: 1.6; }
         .history .msg { margin-bottom: 6px; }
         .history .msg-user { color: #58a6ff; }
         .history .msg-assistant { color: #7ee787; }
         .history .msg-label { font-weight: 600; }
+
         .stats { display: flex; gap: 20px; margin-bottom: 20px; }
         .stat { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; flex: 1; text-align: center; }
         .stat-value { font-size: 2em; font-weight: 700; color: #58a6ff; }
         .stat-label { color: #8b949e; font-size: 0.85em; margin-top: 4px; }
+
         .refresh { color: #8b949e; font-size: 0.8em; cursor: pointer; }
         .refresh:hover { color: #58a6ff; }
         .empty { color: #484f58; font-style: italic; padding: 20px; text-align: center; }
         .tabs { display: flex; gap: 4px; margin-bottom: 16px; }
         .tab { padding: 6px 16px; background: #21262d; border: 1px solid #30363d; border-radius: 6px; cursor: pointer; color: #8b949e; font-size: 0.9em; }
         .tab.active { background: #1f6feb; color: #fff; border-color: #1f6feb; }
-        .btn-delete { background: none; border: 1px solid #f85149; color: #f85149; padding: 2px 10px; border-radius: 4px; cursor: pointer; font-size: 0.8em; }
-        .btn-delete:hover { background: #f85149; color: #fff; }
-        .btn-close { background: none; border: 1px solid #d29922; color: #d29922; padding: 2px 10px; border-radius: 4px; cursor: pointer; font-size: 0.8em; }
-        .btn-close:hover { background: #d29922; color: #000; }
-        .actions { display: flex; gap: 6px; }
+
+        .btn { border: none; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 0.8em; font-weight: 500; }
+        .btn-danger { background: none; border: 1px solid #f85149; color: #f85149; }
+        .btn-danger:hover { background: #f85149; color: #fff; }
+        .btn-warn { background: none; border: 1px solid #d29922; color: #d29922; }
+        .btn-warn:hover { background: #d29922; color: #000; }
+        .btn-success { background: none; border: 1px solid #238636; color: #238636; }
+        .btn-success:hover { background: #238636; color: #fff; }
+        .actions { display: flex; gap: 6px; align-items: center; }
     </style>
 </head>
 <body>
@@ -74,11 +91,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         let currentFilter = 'all';
 
         function timeAgo(ts) {
+            if (!ts) return '-';
             const s = Math.floor(Date.now()/1000 - ts);
+            if (s < 0) return '剛剛';
             if (s < 60) return s + ' 秒前';
             if (s < 3600) return Math.floor(s/60) + ' 分鐘前';
             if (s < 86400) return Math.floor(s/3600) + ' 小時前';
             return Math.floor(s/86400) + ' 天前';
+        }
+
+        function duration(secs) {
+            if (secs < 60) return secs + ' 秒';
+            if (secs < 3600) return Math.floor(secs/60) + ' 分鐘';
+            if (secs < 86400) return Math.floor(secs/3600) + ' 小時';
+            return Math.floor(secs/86400) + ' 天';
         }
 
         function agentDisplayName(name) {
@@ -88,12 +114,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         function statusLabel(status) {
             const map = {
-                'working': '處理中',
-                'waiting_input': '等待回覆',
-                'waiting_approval': '等待授權',
-                'done': '已完成',
-                'archived': '已封存',
-                'closed': '已關閉'
+                'working': '處理中', 'waiting_input': '等待回覆', 'waiting_approval': '等待授權',
+                'done': '已完成', 'archived': '已封存', 'closed': '已關閉'
             };
             return map[status] || status;
         }
@@ -102,9 +124,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             if (status === 'working') return 'badge-working';
             if (status.startsWith('waiting')) return 'badge-waiting';
             if (status === 'done') return 'badge-done';
-            if (status === 'archived') return 'badge-closed';
-            if (status === 'closed') return 'badge-closed';
-            return 'badge-online';
+            if (status === 'online') return 'badge-online';
+            if (status === 'offline') return 'badge-offline';
+            if (status === 'disabled') return 'badge-disabled';
+            return 'badge-closed';
+        }
+
+        function agentStatusLabel(status) {
+            const map = { 'online': '在線', 'offline': '離線', 'disabled': '已停用' };
+            return map[status] || status;
         }
 
         function sourceLabel(source) {
@@ -113,24 +141,59 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         async function loadAgents() {
-            const res = await fetch('/agents');
+            const res = await fetch('/dashboard/agents');
             const data = await res.json();
             const el = document.getElementById('agents');
             if (!data.agents.length) {
-                el.innerHTML = '<div class="empty">沒有在線的 Agent</div>';
-                return data.agents.length;
+                el.innerHTML = '<div class="empty">沒有已註冊的 Agent</div>';
+                return 0;
             }
-            el.innerHTML = data.agents.map(a => `
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">${a.name}</span>
-                        <span class="badge badge-online">在線</span>
+            const onlineCount = data.agents.filter(a => a.status === 'online').length;
+            el.innerHTML = data.agents.map(a => {
+                const s = a.stats;
+                const successRate = s.total_tasks > 0 ? Math.round(s.success / s.total_tasks * 100) : '-';
+
+                const toggleBtn = a.status === 'disabled'
+                    ? `<button class="btn btn-success" onclick="enableAgent('${a.name}')">啟用</button>`
+                    : `<button class="btn btn-warn" onclick="disableAgent('${a.name}')">停用</button>`;
+
+                const patterns = a.route_patterns.map(p =>
+                    p.split('|').map(kw => `<span class="agent-pattern">${kw}</span>`).join('')
+                ).join('');
+
+                return `
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">${a.name}</span>
+                            <div class="actions">
+                                <span class="badge ${badgeClass(a.status)}">${agentStatusLabel(a.status)}</span>
+                                ${toggleBtn}
+                            </div>
+                        </div>
+                        <div class="card-desc">${a.description}</div>
+                        <div class="agent-stats">
+                            <div class="agent-stat"><span class="agent-stat-value">${a.priority}</span> <span class="agent-stat-label">優先級</span></div>
+                            <div class="agent-stat"><span class="agent-stat-value">${s.total_tasks}</span> <span class="agent-stat-label">處理任務</span></div>
+                            <div class="agent-stat"><span class="agent-stat-value">${successRate}%</span> <span class="agent-stat-label">成功率</span></div>
+                            <div class="agent-stat"><span class="agent-stat-value">${s.avg_response_ms}ms</span> <span class="agent-stat-label">平均回應</span></div>
+                            <div class="agent-stat"><span class="agent-stat-value">${duration(a.uptime_seconds)}</span> <span class="agent-stat-label">在線時長</span></div>
+                            <div class="agent-stat"><span class="agent-stat-value">${timeAgo(a.last_heartbeat)}</span> <span class="agent-stat-label">最後心跳</span></div>
+                        </div>
+                        <div class="agent-patterns">${patterns}</div>
                     </div>
-                    <div class="meta">${a.description}</div>
-                    <div class="patterns">優先級: ${a.priority} &nbsp; 關鍵字: ${a.route_patterns.join(', ')}</div>
-                </div>
-            `).join('');
-            return data.agents.length;
+                `;
+            }).join('');
+            return onlineCount;
+        }
+
+        async function disableAgent(name) {
+            await fetch('/dashboard/agent/' + name + '/disable', {method: 'POST'});
+            loadAll();
+        }
+
+        async function enableAgent(name) {
+            await fetch('/dashboard/agent/' + name + '/enable', {method: 'POST'});
+            loadAll();
         }
 
         async function loadTasks() {
@@ -165,11 +228,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 const isActive = ['working','waiting_input','waiting_approval'].includes(t.status);
                 let actions = '';
                 if (isActive) {
-                    actions = `<button class="btn-close" onclick="closeTask('${t.task_id}')">關閉</button>`;
+                    actions = `<button class="btn btn-warn" onclick="closeTask('${t.task_id}')">關閉</button>`;
                 } else if (t.status === 'closed') {
-                    actions = `<button class="btn-close" onclick="reopenTask('${t.task_id}')">重新完成</button>`;
+                    actions = `<button class="btn btn-success" onclick="reopenTask('${t.task_id}')">重新完成</button>`;
                 }
-                const deleteBtn = `<button class="btn-delete" onclick="deleteTask('${t.task_id}')">刪除</button>`;
+                const deleteBtn = `<button class="btn btn-danger" onclick="deleteTask('${t.task_id}')">刪除</button>`;
 
                 return `
                     <div class="card">
@@ -220,7 +283,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const taskInfo = await loadTasks();
             document.getElementById('stats').innerHTML = `
                 <div class="stat"><div class="stat-value">${agentCount}</div><div class="stat-label">在線 Agent</div></div>
-                <div class="stat"><div class="stat-value">${taskInfo.active}</div><div class="stat-label">進行中</div></div>
+                <div class="stat"><div class="stat-value">${taskInfo.active}</div><div class="stat-label">處理中</div></div>
                 <div class="stat"><div class="stat-value">${taskInfo.total}</div><div class="stat-label">全部對話</div></div>
             `;
         }
@@ -234,6 +297,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 async def handle_dashboard(request: web.Request) -> web.Response:
     return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+
+
+async def handle_dashboard_agents(request: web.Request) -> web.Response:
+    agents = request.app["registry"].list_all()
+    return web.json_response({"agents": agents})
+
+
+async def handle_agent_disable(request: web.Request) -> web.Response:
+    name = request.match_info["name"]
+    request.app["registry"].disable(name)
+    return web.json_response({"status": "ok"})
+
+
+async def handle_agent_enable(request: web.Request) -> web.Response:
+    name = request.match_info["name"]
+    request.app["registry"].enable(name)
+    return web.json_response({"status": "ok"})
 
 
 async def handle_dashboard_tasks(request: web.Request) -> web.Response:
