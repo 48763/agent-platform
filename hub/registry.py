@@ -43,7 +43,7 @@ class AgentRegistry:
             info for name, info in self._agents.items()
             if self._is_alive(name) and name not in self._disabled
         ]
-        return sorted(online, key=lambda a: a.priority, reverse=True)
+        return sorted(online, key=lambda a: a.priority, reverse=False)
 
     def list_all(self) -> list[dict]:
         """List all agents with rich status info."""
@@ -77,7 +77,7 @@ class AgentRegistry:
                     "avg_response_ms": avg_ms,
                 },
             })
-        return sorted(result, key=lambda a: a.get("priority", 0), reverse=True)
+        return sorted(result, key=lambda a: a.get("priority", 0), reverse=False)
 
     def record_task_result(self, name: str, success: bool, duration_ms: int = 0):
         if name not in self._stats:
