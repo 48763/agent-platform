@@ -52,6 +52,21 @@ services:
       - agent-network
 
 
+  tg-transfer-agent:
+    build:
+      context: .
+      dockerfile: agents/tg_transfer/Dockerfile
+    env_file:
+      - .env/tg-transfer-agent.env
+    volumes:
+      - ./data/tg_transfer:/data/tg_transfer
+    depends_on:
+      hub:
+        condition: service_healthy
+    networks:
+      - agent-network
+
+
 networks:
   agent-network:
     driver: bridge
