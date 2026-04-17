@@ -172,14 +172,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         </div>
                         <div class="card-desc">${a.description}</div>
                         <div class="agent-stats">
-                            <div class="agent-stat"><span class="agent-stat-value">${a.priority}</span> <span class="agent-stat-label">優先級</span></div>
-                            <div class="agent-stat"><span class="agent-stat-value">${s.total_tasks}</span> <span class="agent-stat-label">處理任務</span></div>
-                            <div class="agent-stat"><span class="agent-stat-value">${successRate}%</span> <span class="agent-stat-label">成功率</span></div>
-                            <div class="agent-stat"><span class="agent-stat-value">${s.avg_response_ms}ms</span> <span class="agent-stat-label">平均回應</span></div>
-                            <div class="agent-stat"><span class="agent-stat-value">${duration(a.uptime_seconds)}</span> <span class="agent-stat-label">在線時長</span></div>
-                            <div class="agent-stat"><span class="agent-stat-value">${timeAgo(a.last_heartbeat)}</span> <span class="agent-stat-label">最後心跳</span></div>
+                            <div class="agent-stat"><span class="agent-stat-label">優先級:</span> <span class="agent-stat-value">${a.priority}</span></div>
+                            <div class="agent-stat"><span class="agent-stat-label">處理任務:</span> <span class="agent-stat-value">${s.total_tasks}</span></div>
+                            <div class="agent-stat"><span class="agent-stat-label">成功率:</span> <span class="agent-stat-value">${successRate}%</span></div>
+                            <div class="agent-stat"><span class="agent-stat-label">平均回應:</span> <span class="agent-stat-value">${s.avg_response_ms}ms</span></div>
+                            <div class="agent-stat"><span class="agent-stat-label">在線時長:</span> <span class="agent-stat-value">${duration(a.uptime_seconds)}</span></div>
+                            <div class="agent-stat"><span class="agent-stat-label">最後心跳:</span> <span class="agent-stat-value">${timeAgo(a.last_heartbeat)}</span></div>
                         </div>
-                        <div class="agent-patterns">${patterns}</div>
+                        <div class="agent-patterns"><span class="agent-stat-label" style="font-size:0.8em;margin-right:4px">關鍵字:</span>${patterns}</div>
                     </div>
                 `;
             }).join('');
