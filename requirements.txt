@@ -3,3 +3,4 @@ anthropic>=0.40,<1
 python-telegram-bot>=21,<22
 telethon>=1.36,<2
 pyyaml>=6,<7
+aiosqlite>=0.20,<1
