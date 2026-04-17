@@ -76,6 +76,19 @@ closed（已關閉）── 不可被路由和 reply
 
 瀏覽器訪問 `http://localhost:9000`
 
+### 登入驗證
+
+在 `.env/hub.env` 設定帳號密碼：
+
+```env
+DASHBOARD_USER=admin
+DASHBOARD_PASS=your-password
+```
+
+- 設了密碼 → 訪問 Dashboard 需登入，session 保留 7 天
+- 密碼留空 → 不需登入（開發模式）
+- API 端點（register、heartbeat、dispatch）不受登入限制
+
 ### Agent 管理
 
 - **狀態顯示** — 在線 / 離線 / 已停用（顏色區分）
@@ -298,25 +311,36 @@ python -m pytest tests/ -v
 
 ## API
 
-### Hub 端點
+### Hub 端點（不需登入）
 
 | 端點 | 方法 | 說明 |
 |------|------|------|
-| `/` | GET | Dashboard 網頁介面 |
 | `/register` | POST | Agent 註冊 |
 | `/heartbeat` | POST | Agent 心跳（404 時自動重新註冊） |
 | `/agents` | GET | 列出在線 agent |
 | `/dispatch` | POST | 分配訊息（支援 `reply_to_message_id`、`source`） |
 | `/set_message_id` | POST | Gateway 回報 bot 回覆的 message_id |
 
-### Dashboard 端點
+### 認證端點
 
 | 端點 | 方法 | 說明 |
 |------|------|------|
+| `/auth/login` | GET | 登入頁面 |
+| `/auth/login` | POST | 登入驗證（JSON: `username`, `password`） |
+| `/auth/logout` | GET | 登出並清除 session |
+
+### Dashboard 端點（需登入）
+
+| 端點 | 方法 | 說明 |
+|------|------|------|
+| `/` | GET | Dashboard 網頁介面 |
 | `/dashboard/tasks` | GET | 取得最近 50 筆對話 |
 | `/dashboard/task/{id}/close` | POST | 關閉對話 |
 | `/dashboard/task/{id}/reopen` | POST | 重新開啟已關閉的對話（→ done） |
 | `/dashboard/task/{id}/delete` | POST | 永久刪除對話 |
+| `/dashboard/agents` | GET | 取得所有 agent 詳細資訊 |
+| `/dashboard/agent/{name}/disable` | POST | 停用 agent |
+| `/dashboard/agent/{name}/enable` | POST | 啟用 agent |
 
 ## 工具
 
