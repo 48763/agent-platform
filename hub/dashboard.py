@@ -65,6 +65,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .btn-success { background: none; border: 1px solid #238636; color: #238636; }
         .btn-success:hover { background: #238636; color: #fff; }
         .actions { display: flex; gap: 6px; align-items: center; }
+
+        .section { margin-bottom: 24px; }
+        .section-header { display: flex; justify-content: space-between; align-items: center; cursor: pointer; user-select: none; color: #8b949e; margin: 20px 0 10px; font-size: 1.1em; border-bottom: 1px solid #21262d; padding-bottom: 8px; }
+        .section-header:hover { color: #58a6ff; }
+        .section-toggle { font-size: 0.8em; color: #484f58; }
+        .section-body { transition: max-height 0.3s ease; overflow: hidden; }
+        .section-body.collapsed { max-height: 0 !important; }
+
+        .search-box { width: 100%; padding: 8px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; font-size: 0.9em; margin-bottom: 12px; outline: none; }
+        .search-box:focus { border-color: #58a6ff; }
+        .search-box::placeholder { color: #484f58; }
     </style>
 </head>
 <body>
@@ -74,17 +85,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <span class="refresh" onclick="loadAll()">&#x21bb; 重新整理</span>
         </div>
         <div class="stats" id="stats"></div>
-        <h2>Agents</h2>
-        <div id="agents"></div>
-        <h2>對話紀錄</h2>
-        <div class="tabs">
-            <div class="tab active" onclick="filterTasks('all', this)">全部</div>
-            <div class="tab" onclick="filterTasks('active', this)">處理中</div>
-            <div class="tab" onclick="filterTasks('done', this)">已完成</div>
-            <div class="tab" onclick="filterTasks('archived', this)">已封存</div>
-            <div class="tab" onclick="filterTasks('closed', this)">已關閉</div>
+
+        <div class="section">
+            <div class="section-header" onclick="toggleSection('agents')">
+                <span>Agents <span class="section-toggle" id="agents-toggle">&#x25BC;</span></span>
+                <span style="font-size:0.8em;font-weight:normal" id="agents-count"></span>
+            </div>
+            <div class="section-body" id="agents-body">
+                <input class="search-box" id="agents-search" placeholder="搜尋 agent 名稱、描述、關鍵字..." oninput="filterAgents()">
+                <div id="agents"></div>
+            </div>
         </div>
-        <div id="tasks"></div>
+
+        <div class="section">
+            <div class="section-header" onclick="toggleSection('tasks')">
+                <span>對話紀錄 <span class="section-toggle" id="tasks-toggle">&#x25BC;</span></span>
+                <span style="font-size:0.8em;font-weight:normal" id="tasks-count"></span>
+            </div>
+            <div class="section-body" id="tasks-body">
+                <input class="search-box" id="tasks-search" placeholder="搜尋對話內容、agent 名稱..." oninput="renderTasks()">
+                <div class="tabs">
+                    <div class="tab active" onclick="filterTasks('all', this)">全部</div>
+                    <div class="tab" onclick="filterTasks('active', this)">處理中</div>
+                    <div class="tab" onclick="filterTasks('done', this)">已完成</div>
+                    <div class="tab" onclick="filterTasks('archived', this)">已封存</div>
+                    <div class="tab" onclick="filterTasks('closed', this)">已關閉</div>
+                </div>
+                <div id="tasks"></div>
+            </div>
+        </div>
     </div>
     <script>
         let allTasks = [];
@@ -143,13 +172,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         async function loadAgents() {
             const res = await fetch('/dashboard/agents');
             const data = await res.json();
-            const el = document.getElementById('agents');
-            if (!data.agents.length) {
-                el.innerHTML = '<div class="empty">沒有已註冊的 Agent</div>';
-                return 0;
-            }
+            allAgents = data.agents;
             const onlineCount = data.agents.filter(a => a.status === 'online').length;
-            el.innerHTML = data.agents.map(a => {
+            document.getElementById('agents-count').textContent = `${onlineCount} 在線 / ${data.agents.length} 總計`;
+            filterAgents();
+            return onlineCount;
+        }
+
+        function renderAgents(agents) {
+            const el = document.getElementById('agents');
+            if (!agents.length) {
+                el.innerHTML = '<div class="empty">沒有匹配的 Agent</div>';
+                return;
+            }
+            el.innerHTML = agents.map(a => {
                 const s = a.stats;
                 const successRate = s.total_tasks > 0 ? Math.round(s.success / s.total_tasks * 100) : '-';
 
@@ -183,7 +219,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     </div>
                 `;
             }).join('');
-            return onlineCount;
         }
 
         async function disableAgent(name) {
@@ -200,8 +235,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const res = await fetch('/dashboard/tasks');
             const data = await res.json();
             allTasks = data.tasks;
+            const active = data.tasks.filter(t => ['working','waiting_input','waiting_approval'].includes(t.status)).length;
+            document.getElementById('tasks-count').textContent = `${active} 處理中 / ${data.tasks.length} 總計`;
             renderTasks();
-            return {active: data.tasks.filter(t => ['working','waiting_input','waiting_approval'].includes(t.status)).length, total: data.tasks.length};
+            return {active, total: data.tasks.length};
         }
 
         function renderTasks() {
@@ -211,6 +248,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             if (currentFilter === 'done') tasks = tasks.filter(t => t.status === 'done');
             if (currentFilter === 'archived') tasks = tasks.filter(t => t.status === 'archived');
             if (currentFilter === 'closed') tasks = tasks.filter(t => t.status === 'closed');
+
+            const q = document.getElementById('tasks-search')?.value?.toLowerCase();
+            if (q) {
+                tasks = tasks.filter(t =>
+                    t.agent_name.toLowerCase().includes(q) ||
+                    t.conversation_history.some(m => m.content.toLowerCase().includes(q))
+                );
+            }
 
             if (!tasks.length) {
                 el.innerHTML = '<div class="empty">沒有對話紀錄</div>';
@@ -286,6 +331,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <div class="stat"><div class="stat-value">${taskInfo.active}</div><div class="stat-label">處理中</div></div>
                 <div class="stat"><div class="stat-value">${taskInfo.total}</div><div class="stat-label">全部對話</div></div>
             `;
+        }
+
+        function toggleSection(name) {
+            const body = document.getElementById(name + '-body');
+            const toggle = document.getElementById(name + '-toggle');
+            body.classList.toggle('collapsed');
+            toggle.innerHTML = body.classList.contains('collapsed') ? '&#x25B6;' : '&#x25BC;';
+        }
+
+        let allAgents = [];
+
+        function filterAgents() {
+            const q = document.getElementById('agents-search').value.toLowerCase();
+            const el = document.getElementById('agents');
+            let agents = allAgents;
+            if (q) {
+                agents = agents.filter(a =>
+                    a.name.toLowerCase().includes(q) ||
+                    a.description.toLowerCase().includes(q) ||
+                    a.route_patterns.join(' ').toLowerCase().includes(q)
+                );
+            }
+            renderAgents(agents);
         }
 
         loadAll();
