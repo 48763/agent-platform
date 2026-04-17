@@ -82,7 +82,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="container">
         <div style="display:flex;justify-content:space-between;align-items:center">
             <h1>Agent Platform</h1>
-            <span class="refresh" onclick="loadAll()">&#x21bb; 重新整理</span>
+            <div style="display:flex;gap:16px;align-items:center">
+                <span class="refresh" onclick="loadAll()">&#x21bb; 重新整理</span>
+                <a href="/auth/logout" style="color:#8b949e;font-size:0.8em;text-decoration:none">登出</a>
+            </div>
         </div>
         <div class="stats" id="stats"></div>
 

@@ -12,6 +12,10 @@ from hub.dashboard import (
     handle_task_close, handle_task_reopen, handle_task_delete,
     handle_dashboard_agents, handle_agent_disable, handle_agent_enable,
 )
+from hub.auth import (
+    check_session, is_auth_enabled,
+    handle_login_page, handle_login, handle_logout,
+)
 
 DB_PATH = os.environ.get("TASKS_DB_PATH", "/data/tasks.db")
 
@@ -21,7 +25,21 @@ def create_hub_app(
     use_gemini_fallback: bool = True,
     db_path: str = DB_PATH,
 ) -> web.Application:
-    app = web.Application()
+    @web.middleware
+    async def auth_middleware(request, handler):
+        # Skip auth for API routes and auth routes
+        path = request.path
+        no_auth_prefixes = ("/register", "/heartbeat", "/agents", "/dispatch", "/set_message_id", "/auth/")
+        if any(path.startswith(p) for p in no_auth_prefixes):
+            return await handler(request)
+
+        # Dashboard routes require auth
+        if is_auth_enabled() and not check_session(request):
+            raise web.HTTPFound("/auth/login")
+
+        return await handler(request)
+
+    app = web.Application(middlewares=[auth_middleware])
     registry = AgentRegistry(heartbeat_timeout=heartbeat_timeout)
     task_manager = TaskManager(db_path=db_path)
     router = Router(registry=registry)
@@ -33,6 +51,12 @@ def create_hub_app(
     app["chat"] = chat
     app["use_gemini_fallback"] = use_gemini_fallback
 
+    # Auth routes (no auth required)
+    app.router.add_get("/auth/login", handle_login_page)
+    app.router.add_post("/auth/login", handle_login)
+    app.router.add_get("/auth/logout", handle_logout)
+
+    # API routes (no auth — used by agents and gateway)
     app.router.add_post("/register", handle_register)
     app.router.add_post("/heartbeat", handle_heartbeat)
     app.router.add_get("/agents", handle_list_agents)
