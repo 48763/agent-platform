@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from core.llm import parse_llm_config, LLMClient, ClaudeProvider, GeminiProvider
+from core.llm import parse_llm_config, LLMClient, ClaudeProvider, ClaudeCLIProvider, GeminiProvider
 
 
 class TestParseLLMConfig:
@@ -61,6 +61,28 @@ class TestClaudeProvider:
             tools_schema=[], tool_executor=None,
         )
         assert result == "done"
+
+
+class TestClaudeCLIProvider:
+    @pytest.mark.asyncio
+    async def test_prompt(self):
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            proc = AsyncMock()
+            proc.communicate = AsyncMock(return_value=(b"cli response", b""))
+            proc.returncode = 0
+            mock_exec.return_value = proc
+
+            provider = ClaudeCLIProvider(model="claude-sonnet-4-20250514")
+            result = await provider.prompt("say hi")
+            assert result == "cli response"
+
+    @pytest.mark.asyncio
+    async def test_run_raises_not_implemented(self):
+        provider = ClaudeCLIProvider(model="claude-sonnet-4-20250514")
+        with pytest.raises(NotImplementedError):
+            await provider.run(
+                system_prompt="test", messages=[], tools_schema=[], tool_executor=None,
+            )
 
 
 class TestGeminiProvider:

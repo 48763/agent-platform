@@ -90,6 +90,28 @@ class ClaudeProvider:
         return "Error: max iterations reached"
 
 
+class ClaudeCLIProvider:
+    """Claude provider via CLI (for claude auth login mode, no API key)."""
+    def __init__(self, model: str):
+        self.model = model
+
+    async def prompt(self, text: str) -> str:
+        """Single prompt -> response via Claude CLI."""
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "-p", text, "--model", self.model, "--output-format", "text",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode != 0:
+            logger.error(f"Claude CLI error: {stderr.decode()}")
+        return stdout.decode().strip()
+
+    async def run(self, system_prompt, messages, tools_schema, tool_executor, max_iterations=20):
+        """Not supported for Claude CLI mode."""
+        raise NotImplementedError("Claude CLI provider does not support agentic loop with tool calling")
+
+
 class GeminiProvider:
     def __init__(self, model: str):
         self.model = model
@@ -126,49 +148,44 @@ class LLMClient:
 
 async def check_llm_auth(settings: dict) -> tuple[bool, str]:
     """Check if LLM is authenticated. Returns (ok, error_message).
-    Checks API key env vars and CLI login status.
+    Checks API key env vars and CLI login status without consuming tokens.
     """
+    import os
+    import json as _json
+
     provider_name, model = parse_llm_config(settings)
     if provider_name is None:
         return True, ""  # No LLM configured, not an error
 
     if provider_name == "claude":
-        import os
-        # Check API key
+        # Method 1: API key
         if os.environ.get("ANTHROPIC_API_KEY"):
             return True, ""
-        # Check CLI login (claude auth status)
+        # Method 2: CLI login — `claude auth status` returns JSON with loggedIn field
         try:
             proc = await asyncio.create_subprocess_exec(
-                "claude", "--version",
+                "claude", "auth", "status",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            await proc.communicate()
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
             if proc.returncode == 0:
-                return True, ""
+                status = _json.loads(stdout.decode())
+                if status.get("loggedIn"):
+                    return True, ""
         except Exception:
             pass
         return False, "Claude 未認證：請設定 ANTHROPIC_API_KEY 或進入容器執行 claude auth login"
 
     if provider_name == "gemini":
-        import os
-        # Check API key
+        # Method 1: API key
         if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
             return True, ""
-        # Check CLI login
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "gemini", "-p", "ping", "-m", model,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-            if proc.returncode == 0:
-                return True, ""
-            return False, f"Gemini 未認證：請設定 GEMINI_API_KEY 或進入容器執行 gemini auth login"
-        except Exception:
-            return False, "Gemini CLI 不可用：找不到 gemini 指令或認證失敗"
+        # Method 2: CLI login — check credentials file exists
+        gemini_creds = os.path.expanduser("~/.gemini/gemini-credentials.json")
+        if os.path.exists(gemini_creds) and os.path.getsize(gemini_creds) > 0:
+            return True, ""
+        return False, "Gemini 未認證：請設定 GEMINI_API_KEY 或進入容器執行 gemini auth login"
 
     return False, f"Unknown provider: {provider_name}"
 
@@ -180,19 +197,33 @@ async def create_llm_client(settings: dict) -> LLMClient:
         raise LLMInitError("No LLM configured in agent.yaml settings")
 
     if provider_name == "claude":
-        try:
-            import anthropic
-            import os
-            if not os.environ.get("ANTHROPIC_API_KEY"):
-                raise LLMInitError("Claude API key 未設定：請設定 ANTHROPIC_API_KEY 環境變數")
-            client = anthropic.AsyncAnthropic()
-            return LLMClient(provider=ClaudeProvider(client=client, model=model))
-        except ImportError:
-            raise LLMInitError("anthropic SDK 未安裝")
-        except LLMInitError:
-            raise
-        except Exception as e:
-            raise LLMInitError(f"Claude 初始化失敗：{e}")
+        import os
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            # API key mode
+            try:
+                import anthropic
+                client = anthropic.AsyncAnthropic()
+                return LLMClient(provider=ClaudeProvider(client=client, model=model))
+            except ImportError:
+                raise LLMInitError("anthropic SDK 未安裝")
+            except Exception as e:
+                raise LLMInitError(f"Claude API 初始化失敗：{e}")
+        else:
+            # CLI login mode — use claude CLI as provider (same as Gemini pattern)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "which", "claude",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.communicate()
+                if proc.returncode != 0:
+                    raise LLMInitError("Claude CLI 未安裝")
+                return LLMClient(provider=ClaudeCLIProvider(model=model))
+            except LLMInitError:
+                raise
+            except Exception as e:
+                raise LLMInitError(f"Claude CLI 初始化失敗：{e}")
 
     if provider_name == "gemini":
         try:
@@ -204,14 +235,6 @@ async def create_llm_client(settings: dict) -> LLMClient:
             stdout, _ = await proc.communicate()
             if proc.returncode != 0:
                 raise LLMInitError("Gemini CLI 未安裝：找不到 gemini 指令")
-            proc = await asyncio.create_subprocess_exec(
-                "gemini", "-p", "ping", "-m", model,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-            if proc.returncode != 0:
-                raise LLMInitError(f"Gemini CLI 測試失敗：{stderr.decode().strip()}")
             return LLMClient(provider=GeminiProvider(model=model))
         except LLMInitError:
             raise
