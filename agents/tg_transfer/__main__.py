@@ -500,8 +500,7 @@ class TGTransferAgent(BaseAgent):
 
     def create_app(self) -> web.Application:
         app = super().create_app()
-        if self.media_db:
-            app.router.add_get("/dashboard", create_tg_dashboard_handler(self.media_db))
+        app.router.add_get("/dashboard", create_tg_dashboard_handler(self.media_db))
         return app
 
 

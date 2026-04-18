@@ -81,7 +81,8 @@ async def handle_register(request: web.Request) -> web.Response:
     info = AgentInfo.from_dict(data)
     auth_status = data.get("auth_status")
     auth_error = data.get("auth_error")
-    request.app["registry"].register(info, auth_status=auth_status, auth_error=auth_error)
+    has_dashboard = data.get("has_dashboard", False)
+    request.app["registry"].register(info, auth_status=auth_status, auth_error=auth_error, has_dashboard=has_dashboard)
     return web.json_response({"status": "registered", "name": info.name})
 
 
@@ -124,12 +125,12 @@ async def handle_agent_dashboard_proxy(request: web.Request) -> web.Response:
     agent = agents.get(name)
     if not agent or not agent.get("url"):
         return web.Response(text="Agent not found", status=404)
-    from aiohttp import ClientSession
+    from aiohttp import ClientSession as _ClientSession
     try:
-        async with ClientSession() as session:
+        async with _ClientSession() as session:
             async with session.get(f"{agent['url']}/dashboard") as resp:
                 body = await resp.text()
-                return web.Response(text=body, content_type="text/html")
+                return web.Response(text=body, content_type=resp.content_type or "text/html", status=resp.status)
     except Exception as e:
         return web.Response(text=f"Cannot reach agent dashboard: {e}", status=502)
 

@@ -2,9 +2,11 @@ from core.agent_dashboard import create_dashboard_handler
 from agents.tg_transfer.media_db import MediaDB
 
 
-def create_tg_dashboard_handler(media_db: MediaDB):
+def create_tg_dashboard_handler(media_db: MediaDB | None):
     """Create dashboard handler using shared framework."""
     async def get_stats():
+        if not media_db:
+            return {"title": "TG Transfer 統計", "counters": [("狀態", "未初始化")], "tables": []}
         stats = await media_db.get_stats()
         return {
             "title": "TG Transfer 統計",

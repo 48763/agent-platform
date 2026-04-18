@@ -59,6 +59,13 @@ class BaseAgent(ABC):
             priority=self.config.get("priority", 0),
         )
         data = info.to_dict()
+        # Check if this agent has a /dashboard route
+        if hasattr(self, '_app') and self._app:
+            data["has_dashboard"] = any(
+                r.resource.canonical == "/dashboard"
+                for r in self._app.router.routes()
+                if hasattr(r, 'resource') and r.resource
+            )
         if self._init_error:
             data["auth_status"] = "error"
             data["auth_error"] = self._init_error
@@ -119,6 +126,7 @@ class BaseAgent(ABC):
             print(f"WARNING: Service init failed: {e}", file=sys.stderr)
 
         app = self.create_app()
+        self._app = app
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", self.port)

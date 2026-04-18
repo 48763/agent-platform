@@ -11,9 +11,10 @@ class AgentRegistry:
         self._stats: dict[str, dict] = {}  # name → {tasks, success, errors, total_ms}
         self._errors: dict[str, str] = {}  # name → error message
         self._unauthenticated: dict[str, str] = {}  # name → auth error message
+        self._has_dashboard: dict[str, bool] = {}  # name → has /dashboard
         self._heartbeat_timeout = heartbeat_timeout
 
-    def register(self, info: AgentInfo, auth_status: str = None, auth_error: str = None) -> None:
+    def register(self, info: AgentInfo, auth_status: str = None, auth_error: str = None, has_dashboard: bool = False) -> None:
         self._agents[info.name] = info
         self._last_heartbeat[info.name] = time.time()
         self._errors.pop(info.name, None)  # Clear any previous /register_error
@@ -24,6 +25,7 @@ class AgentRegistry:
             self._unauthenticated[info.name] = auth_error or "LLM 未認證"
         else:
             self._unauthenticated.pop(info.name, None)
+        self._has_dashboard[info.name] = has_dashboard
         if info.name not in self._registered_at:
             self._registered_at[info.name] = time.time()
         if info.name not in self._stats:
@@ -84,6 +86,7 @@ class AgentRegistry:
                 **info.to_dict(),
                 "status": status,
                 "error": self._errors.get(name) or self._unauthenticated.get(name),
+                "has_dashboard": self._has_dashboard.get(name, False),
                 "last_heartbeat": last_hb,
                 "registered_at": reg_at,
                 "uptime_seconds": round(now - reg_at) if reg_at else 0,
