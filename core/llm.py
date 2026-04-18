@@ -124,6 +124,55 @@ class LLMClient:
         )
 
 
+async def check_llm_auth(settings: dict) -> tuple[bool, str]:
+    """Check if LLM is authenticated. Returns (ok, error_message).
+    Checks API key env vars and CLI login status.
+    """
+    provider_name, model = parse_llm_config(settings)
+    if provider_name is None:
+        return True, ""  # No LLM configured, not an error
+
+    if provider_name == "claude":
+        import os
+        # Check API key
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            return True, ""
+        # Check CLI login (claude auth status)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            if proc.returncode == 0:
+                return True, ""
+        except Exception:
+            pass
+        return False, "Claude 未認證：請設定 ANTHROPIC_API_KEY 或進入容器執行 claude auth login"
+
+    if provider_name == "gemini":
+        import os
+        # Check API key
+        if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+            return True, ""
+        # Check CLI login
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "gemini", "-p", "ping", "-m", model,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+            if proc.returncode == 0:
+                return True, ""
+            return False, f"Gemini 未認證：請設定 GEMINI_API_KEY 或進入容器執行 gemini auth login"
+        except Exception:
+            return False, "Gemini CLI 不可用：找不到 gemini 指令或認證失敗"
+
+    return False, f"Unknown provider: {provider_name}"
+
+
 async def create_llm_client(settings: dict) -> LLMClient:
     """Factory: create LLMClient from agent.yaml settings. Raises LLMInitError on failure."""
     provider_name, model = parse_llm_config(settings)

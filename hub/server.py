@@ -78,7 +78,9 @@ def create_hub_app(
 async def handle_register(request: web.Request) -> web.Response:
     data = await request.json()
     info = AgentInfo.from_dict(data)
-    request.app["registry"].register(info)
+    auth_status = data.get("auth_status")
+    auth_error = data.get("auth_error")
+    request.app["registry"].register(info, auth_status=auth_status, auth_error=auth_error)
     return web.json_response({"status": "registered", "name": info.name})
 
 

@@ -7,7 +7,7 @@ from aiohttp import web, ClientSession
 from core.config import load_agent_config
 from core.models import AgentInfo, AgentResult, TaskRequest, TaskStatus
 from core.sandbox import Sandbox
-from core.llm import create_llm_client, LLMInitError, LLMClient
+from core.llm import create_llm_client, check_llm_auth, LLMInitError, LLMClient
 
 
 class BaseAgent(ABC):
@@ -20,6 +20,8 @@ class BaseAgent(ABC):
         sandbox_config = self.config.get("sandbox", {"allowed_dirs": []})
         self.sandbox = Sandbox(sandbox_config)
         self.llm: LLMClient | None = None
+        self._llm_authenticated: bool = True
+        self._llm_error: str = ""
 
     @abstractmethod
     async def handle_task(self, task: TaskRequest) -> AgentResult:
@@ -49,8 +51,12 @@ class BaseAgent(ABC):
             capabilities=self.config.get("capabilities", []),
             priority=self.config.get("priority", 0),
         )
+        data = info.to_dict()
+        if not self._llm_authenticated:
+            data["auth_status"] = "unauthenticated"
+            data["auth_error"] = self._llm_error
         async with ClientSession() as session:
-            await session.post(f"{self.hub_url}/register", json=info.to_dict())
+            await session.post(f"{self.hub_url}/register", json=data)
 
     async def _heartbeat_loop(self, actual_port: int, interval: int = 10) -> None:
         async with ClientSession() as session:
@@ -79,15 +85,21 @@ class BaseAgent(ABC):
             pass  # Hub might not be running
 
     async def run(self) -> None:
-        # Validate LLM if configured
+        # Check LLM auth if configured
         settings = self.config.get("settings", {})
         if settings.get("llm"):
-            try:
-                self.llm = await create_llm_client(settings)
-            except LLMInitError as e:
-                await self._register_error(str(e))
-                print(f"ERROR: LLM init failed: {e}", file=sys.stderr)
-                sys.exit(1)
+            auth_ok, auth_error = await check_llm_auth(settings)
+            if auth_ok:
+                try:
+                    self.llm = await create_llm_client(settings)
+                except LLMInitError as e:
+                    self._llm_authenticated = False
+                    self._llm_error = str(e)
+                    print(f"WARNING: LLM init failed: {e}", file=sys.stderr)
+            else:
+                self._llm_authenticated = False
+                self._llm_error = auth_error
+                print(f"WARNING: LLM not authenticated: {auth_error}", file=sys.stderr)
 
         app = self.create_app()
         runner = web.AppRunner(app)

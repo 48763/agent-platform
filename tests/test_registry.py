@@ -75,3 +75,32 @@ def test_error_agent_not_in_online_list():
     online = reg.list_online()
     names = [a.name for a in online]
     assert "err-agent" not in names
+
+
+def test_unauthenticated_agent_not_routable():
+    reg = AgentRegistry(heartbeat_timeout=30)
+    info = AgentInfo(name="unauth-agent", description="test", url="http://localhost:8000")
+    reg.register(info, auth_status="unauthenticated", auth_error="Claude 未認證")
+    assert reg.get("unauth-agent") is None
+    online = reg.list_online()
+    assert len(online) == 0
+
+
+def test_unauthenticated_shows_in_list_all():
+    reg = AgentRegistry(heartbeat_timeout=30)
+    info = AgentInfo(name="unauth-agent", description="test", url="http://localhost:8000")
+    reg.register(info, auth_status="unauthenticated", auth_error="Gemini 未認證")
+    agents = reg.list_all()
+    agent = [a for a in agents if a["name"] == "unauth-agent"][0]
+    assert agent["status"] == "unauthenticated"
+    assert agent["error"] == "Gemini 未認證"
+
+
+def test_reregister_authenticated_clears_unauth():
+    reg = AgentRegistry(heartbeat_timeout=30)
+    info = AgentInfo(name="recover", description="test", url="http://localhost:8000")
+    reg.register(info, auth_status="unauthenticated", auth_error="not logged in")
+    assert reg.get("recover") is None
+    # Re-register without auth issue
+    reg.register(info)
+    assert reg.get("recover") is not None

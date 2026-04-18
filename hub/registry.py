@@ -10,12 +10,17 @@ class AgentRegistry:
         self._disabled: set[str] = set()
         self._stats: dict[str, dict] = {}  # name → {tasks, success, errors, total_ms}
         self._errors: dict[str, str] = {}  # name → error message
+        self._unauthenticated: dict[str, str] = {}  # name → auth error message
         self._heartbeat_timeout = heartbeat_timeout
 
-    def register(self, info: AgentInfo) -> None:
+    def register(self, info: AgentInfo, auth_status: str = None, auth_error: str = None) -> None:
         self._agents[info.name] = info
         self._last_heartbeat[info.name] = time.time()
         self._errors.pop(info.name, None)  # Clear any previous error
+        if auth_status == "unauthenticated":
+            self._unauthenticated[info.name] = auth_error or "LLM 未認證"
+        else:
+            self._unauthenticated.pop(info.name, None)
         if info.name not in self._registered_at:
             self._registered_at[info.name] = time.time()
         if info.name not in self._stats:
@@ -38,12 +43,14 @@ class AgentRegistry:
             return None
         if name in self._disabled:
             return None
+        if name in self._unauthenticated:
+            return None
         return self._agents[name]
 
     def list_online(self) -> list[AgentInfo]:
         online = [
             info for name, info in self._agents.items()
-            if self._is_alive(name) and name not in self._disabled
+            if self._is_alive(name) and name not in self._disabled and name not in self._unauthenticated
         ]
         return sorted(online, key=lambda a: a.priority, reverse=False)
 
@@ -61,6 +68,8 @@ class AgentRegistry:
 
             if name in self._errors:
                 status = "error"
+            elif name in self._unauthenticated:
+                status = "unauthenticated"
             elif disabled:
                 status = "disabled"
             elif alive:
@@ -71,7 +80,7 @@ class AgentRegistry:
             result.append({
                 **info.to_dict(),
                 "status": status,
-                "error": self._errors.get(name),
+                "error": self._errors.get(name) or self._unauthenticated.get(name),
                 "last_heartbeat": last_hb,
                 "registered_at": reg_at,
                 "uptime_seconds": round(now - reg_at) if reg_at else 0,
