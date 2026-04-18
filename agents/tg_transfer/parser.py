@@ -8,6 +8,9 @@ _PUBLIC_MSG_RE = re.compile(r"https?://t\.me/([A-Za-z_]\w+)/(\d+)")
 _PRIVATE_MSG_RE = re.compile(r"https?://t\.me/c/(\d+)/(\d+)")
 # Config keywords
 _CONFIG_RE = re.compile(r"(預設目標|設定目標|default.?target)", re.IGNORECASE)
+_SEARCH_RE = re.compile(r"(搜尋|查詢|search|找)", re.IGNORECASE)
+_STATS_RE = re.compile(r"(統計|stats)", re.IGNORECASE)
+_PAGE_RE = re.compile(r"(下一頁|上一頁|next|prev)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -39,10 +42,16 @@ def detect_forward(content: str, metadata: dict) -> Optional[ParsedLink]:
 
 def classify_intent(text: str) -> str:
     """Classify user message intent.
-    Returns: 'single_transfer', 'config', or 'batch'.
+    Returns: 'single_transfer', 'config', 'search', 'stats', 'page', or 'batch'.
     """
     if parse_tg_link(text) is not None:
         return "single_transfer"
     if _CONFIG_RE.search(text):
         return "config"
+    if _STATS_RE.search(text):
+        return "stats"
+    if _PAGE_RE.search(text):
+        return "page"
+    if _SEARCH_RE.search(text):
+        return "search"
     return "batch"

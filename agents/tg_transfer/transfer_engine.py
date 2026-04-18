@@ -5,6 +5,9 @@ import asyncio
 from typing import Callable, Optional, Any
 from telethon import TelegramClient
 from agents.tg_transfer.db import TransferDB
+from agents.tg_transfer.hasher import compute_sha256, compute_phash, compute_phash_video, hamming_distance
+from agents.tg_transfer.media_db import MediaDB
+from agents.tg_transfer.tag_extractor import extract_tags
 
 logger = logging.getLogger(__name__)
 
@@ -17,12 +20,16 @@ class TransferEngine:
         tmp_dir: str = "/tmp/tg_transfer",
         retry_limit: int = 3,
         progress_interval: int = 20,
+        media_db: MediaDB = None,
+        phash_threshold: int = 10,
     ):
         self.client = client
         self.db = db
         self.tmp_dir = tmp_dir
         self.retry_limit = retry_limit
         self.progress_interval = progress_interval
+        self.media_db = media_db
+        self.phash_threshold = phash_threshold
 
     def should_skip(self, message) -> bool:
         """Check if message type should be skipped (sticker, poll, voice)."""
@@ -34,16 +41,21 @@ class TransferEngine:
             return True
         return False
 
-    async def transfer_single(self, source_entity, target_entity, message) -> bool:
-        """Transfer a single message (text or media) to target chat."""
+    async def transfer_single(self, source_entity, target_entity, message,
+                               target_chat: str = "", source_chat: str = "",
+                               job_id: str = None) -> dict:
+        """Transfer a single message. Returns {"ok": bool, "dedup": bool, "similar": list | None}."""
         if message.media and not self.should_skip(message):
-            return await self._transfer_media(target_entity, message)
+            return await self._transfer_media(
+                target_entity, message, target_chat=target_chat,
+                source_chat=source_chat, job_id=job_id,
+            )
         elif message.text and not message.media:
             await self.client.send_message(target_entity, message.text)
-            return True
+            return {"ok": True, "dedup": False, "similar": None}
         elif self.should_skip(message):
-            return False  # caller marks as skipped
-        return True
+            return {"ok": False, "dedup": False, "similar": None}
+        return {"ok": True, "dedup": False, "similar": None}
 
     async def transfer_album(self, target_entity, messages: list) -> bool:
         """Transfer a media group (album) as a single album."""
@@ -70,22 +82,89 @@ class TransferEngine:
             if os.path.exists(job_dir):
                 shutil.rmtree(job_dir)
 
-    async def _transfer_media(self, target_entity, message) -> bool:
-        """Download and re-upload a single media message."""
+    async def _transfer_media(self, target_entity, message, target_chat: str = "",
+                               source_chat: str = "", job_id: str = None) -> dict:
+        """Download and re-upload a single media message.
+        Returns: {"ok": bool, "dedup": bool, "similar": list | None}
+        """
         job_dir = os.path.join(self.tmp_dir, str(message.id))
         os.makedirs(job_dir, exist_ok=True)
+        media_id = None
 
         try:
             path = await self.client.download_media(message, file=job_dir)
-            if path:
-                await self.client.send_file(
-                    target_entity, path, caption=message.text
+            if not path:
+                return {"ok": False, "dedup": False, "similar": None}
+
+            # Compute hashes
+            sha256 = compute_sha256(path)
+            file_type = self._detect_file_type(message)
+            phash = None
+            if file_type == "video":
+                phash = await compute_phash_video(path, job_dir)
+            elif file_type == "photo":
+                phash = compute_phash(path)
+
+            # Check dedup if media_db available
+            if self.media_db:
+                existing = await self.media_db.find_by_sha256(sha256, target_chat)
+                if existing:
+                    return {"ok": True, "dedup": True, "similar": None}
+
+                # Check pHash similarity
+                if phash:
+                    all_phashes = await self.media_db.get_all_phashes()
+                    similar = []
+                    for row in all_phashes:
+                        dist = hamming_distance(phash, row["phash"])
+                        if dist <= self.phash_threshold:
+                            similar.append({**row, "distance": dist})
+                    if similar:
+                        return {"ok": False, "dedup": False, "similar": similar}
+
+                # Insert pending media record
+                caption = message.text or ""
+                file_size = os.path.getsize(path) if os.path.exists(path) else None
+                media_id = await self.media_db.insert_media(
+                    sha256=sha256, phash=phash, file_type=file_type,
+                    file_size=file_size, caption=caption,
+                    source_chat=source_chat, source_msg_id=message.id,
+                    target_chat=target_chat, job_id=job_id,
                 )
-                return True
-            return False
+
+            # Upload
+            result = await self.client.send_file(
+                target_entity, path, caption=message.text
+            )
+
+            # Record success
+            if self.media_db and media_id and result:
+                target_msg_id = result.id if hasattr(result, "id") else None
+                if target_msg_id:
+                    await self.media_db.mark_uploaded(media_id, target_msg_id)
+                    tags = extract_tags(message.text)
+                    if tags:
+                        await self.media_db.add_tags(media_id, tags)
+
+            return {"ok": True, "dedup": False, "similar": None}
+        except Exception as e:
+            if self.media_db and media_id:
+                try:
+                    await self.media_db.delete_media(media_id)
+                except Exception:
+                    pass
+            raise
         finally:
             if os.path.exists(job_dir):
                 shutil.rmtree(job_dir)
+
+    @staticmethod
+    def _detect_file_type(message) -> str:
+        if message.photo:
+            return "photo"
+        if message.video:
+            return "video"
+        return "document"
 
     async def run_batch(
         self,
@@ -149,10 +228,22 @@ class TransferEngine:
                     if self.should_skip(msg):
                         await self.db.mark_message(job_id, message_id, "skipped")
                     else:
-                        ok = await self.transfer_single(source_entity, target_entity, msg)
-                        await self.db.mark_message(
-                            job_id, message_id, "success" if ok else "failed"
+                        job = await self.db.get_job(job_id)
+                        result = await self.transfer_single(
+                            source_entity, target_entity, msg,
+                            target_chat=job["target_chat"],
+                            source_chat=job["source_chat"],
+                            job_id=job_id,
                         )
+                        if result["dedup"]:
+                            await self.db.mark_message(job_id, message_id, "skipped")
+                        elif result["similar"]:
+                            # In batch mode, skip similar (no interactive prompt)
+                            await self.db.mark_message(job_id, message_id, "skipped")
+                        else:
+                            await self.db.mark_message(
+                                job_id, message_id, "success" if result["ok"] else "failed"
+                            )
                     processed += 1
 
             except Exception as e:

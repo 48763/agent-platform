@@ -54,7 +54,7 @@ async def test_single_transfer_via_link(db, mock_tg_client):
     source = MagicMock()
 
     result = await engine.transfer_single(source, target, msg)
-    assert result is True
+    assert result["ok"] is True
     mock_tg_client.send_message.assert_called_once_with(target, "photo caption")
 
 

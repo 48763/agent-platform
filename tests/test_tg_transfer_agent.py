@@ -16,10 +16,12 @@ class TestHandleTaskDispatch:
             agent.db.get_config = AsyncMock(return_value="@backup")
             agent.tg_client = AsyncMock()
             agent.engine = AsyncMock()
-            agent.engine.transfer_single = AsyncMock(return_value=True)
+            agent.engine.transfer_single = AsyncMock(return_value={"ok": True, "dedup": False, "similar": None})
             agent.engine.should_skip = MagicMock(return_value=False)
             agent.config = {"settings": {"retry_limit": 3, "progress_interval": 20}}
             agent._pending_jobs = {}
+            agent._search_state = {}
+            agent.media_db = AsyncMock()
 
             task = TaskRequest(task_id="t1", content="https://t.me/channel/123")
 
@@ -46,6 +48,8 @@ class TestHandleTaskDispatch:
             agent.engine = AsyncMock()
             agent.config = {"settings": {"retry_limit": 3, "progress_interval": 20}}
             agent._pending_jobs = {}
+            agent._search_state = {}
+            agent.media_db = AsyncMock()
 
             task = TaskRequest(task_id="t2", content="預設目標改成 @my_backup")
             result = await agent.handle_task(task)
@@ -63,10 +67,12 @@ class TestHandleTaskDispatch:
             agent.db.get_config = AsyncMock(return_value="@backup")
             agent.tg_client = AsyncMock()
             agent.engine = AsyncMock()
-            agent.engine.transfer_single = AsyncMock(return_value=True)
+            agent.engine.transfer_single = AsyncMock(return_value={"ok": True, "dedup": False, "similar": None})
             agent.engine.should_skip = MagicMock(return_value=False)
             agent.config = {"settings": {"retry_limit": 3, "progress_interval": 20}}
             agent._pending_jobs = {}
+            agent._search_state = {}
+            agent.media_db = AsyncMock()
 
             task = TaskRequest(
                 task_id="t3",

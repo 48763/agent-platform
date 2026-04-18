@@ -7,6 +7,7 @@ import logging
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from aiohttp import web
 from core.base_agent import BaseAgent
 from core.models import AgentResult, TaskRequest, TaskStatus
 from agents.tg_transfer.parser import parse_tg_link, detect_forward, classify_intent
@@ -14,6 +15,11 @@ from agents.tg_transfer.chat_resolver import resolve_chat
 from agents.tg_transfer.db import TransferDB
 from agents.tg_transfer.transfer_engine import TransferEngine
 from agents.tg_transfer.tg_client import create_client
+from agents.tg_transfer.media_db import MediaDB
+from agents.tg_transfer.search import format_search_results, format_similar_results
+from agents.tg_transfer.hasher import compute_phash, hamming_distance, PHASH_AVAILABLE
+from agents.tg_transfer.liveness_checker import run_liveness_loop
+from agents.tg_transfer.dashboard import dashboard_handler
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +31,11 @@ class TGTransferAgent(BaseAgent):
         agent_dir = os.path.dirname(os.path.abspath(__file__))
         super().__init__(agent_dir=agent_dir, hub_url=hub_url, port=port)
         self.db: TransferDB = None
+        self.media_db: MediaDB = None
         self.tg_client = None
         self.engine: TransferEngine = None
         self._pending_jobs: dict[str, str] = {}  # task_id → job_id
+        self._search_state: dict[str, dict] = {}  # task_id → {keyword, page}
 
     async def _init_services(self):
         data_dir = os.environ.get("DATA_DIR", "/data/tg_transfer")
@@ -46,13 +54,23 @@ class TGTransferAgent(BaseAgent):
         session_path = os.path.join(data_dir, session_name)
         self.tg_client = await create_client(session_path)
 
+        # Media DB
+        self.media_db = MediaDB(os.path.join(data_dir, "transfer.db"))
+        await self.media_db.init()
+
         self.engine = TransferEngine(
             client=self.tg_client,
             db=self.db,
             tmp_dir=os.path.join(data_dir, "tmp"),
             retry_limit=settings.get("retry_limit", 3),
             progress_interval=settings.get("progress_interval", 20),
+            media_db=self.media_db,
+            phash_threshold=settings.get("phash_threshold", 10),
         )
+
+        # Start liveness checker
+        interval = settings.get("liveness_check_interval", 24)
+        asyncio.create_task(run_liveness_loop(self.tg_client, self.media_db, interval))
 
         # Resume interrupted jobs
         running_jobs = await self.db.get_running_jobs()
@@ -91,6 +109,15 @@ class TGTransferAgent(BaseAgent):
         if intent == "config":
             return await self._handle_config(content)
 
+        if intent == "stats":
+            return await self._handle_stats()
+
+        if intent == "page":
+            return await self._handle_page(task)
+
+        if intent == "search":
+            return await self._handle_search(task)
+
         # Batch — use AI to parse
         return await self._handle_batch_request(task)
 
@@ -125,7 +152,16 @@ class TGTransferAgent(BaseAgent):
         else:
             if self.engine.should_skip(msg):
                 return AgentResult(status=TaskStatus.DONE, message="已跳過（不支援的訊息類型）")
-            ok = await self.engine.transfer_single(source_entity, target_entity, msg)
+            result = await self.engine.transfer_single(
+                source_entity, target_entity, msg,
+                target_chat=target_chat, source_chat=str(chat_id), job_id=None,
+            )
+            if result["similar"]:
+                text = format_similar_results(result["similar"])
+                return AgentResult(status=TaskStatus.NEED_INPUT, message=text)
+            if result["dedup"]:
+                return AgentResult(status=TaskStatus.DONE, message="已存在相同媒體，跳過")
+            ok = result["ok"]
             count = 1
 
         if ok:
@@ -142,6 +178,89 @@ class TGTransferAgent(BaseAgent):
             status=TaskStatus.NEED_INPUT,
             message="請告訴我目標群組，例如：「預設目標改成 @channel_name」",
         )
+
+    async def _handle_search(self, task: TaskRequest) -> AgentResult:
+        """Handle keyword or image search."""
+        content = task.content
+        metadata = {}
+        if task.conversation_history:
+            metadata = task.conversation_history[-1].get("metadata", {})
+
+        # Check if user sent an image (for image search)
+        if metadata.get("has_photo"):
+            return await self._handle_image_search(task, metadata)
+
+        # Keyword search — strip search trigger words
+        keyword = re.sub(r"(搜尋|查詢|search|找)\s*", "", content, flags=re.IGNORECASE).strip()
+        if not keyword:
+            return AgentResult(status=TaskStatus.NEED_INPUT, message="請輸入搜尋關鍵字")
+
+        page_size = self.config.get("settings", {}).get("search_page_size", 10)
+        results, total = await self.media_db.search_keyword(keyword, page=1, page_size=page_size)
+        text = format_search_results(results, total, page=1, page_size=page_size)
+
+        if total > page_size:
+            self._search_state[task.task_id] = {"keyword": keyword, "page": 1}
+
+        return AgentResult(status=TaskStatus.DONE, message=text)
+
+    async def _handle_image_search(self, task: TaskRequest, metadata: dict) -> AgentResult:
+        """Handle image-based similar search."""
+        if not PHASH_AVAILABLE:
+            return AgentResult(status=TaskStatus.DONE, message="pHash 不可用，僅支援關鍵字搜尋")
+
+        photo_path = metadata.get("photo_path")
+        if not photo_path:
+            return AgentResult(status=TaskStatus.DONE, message="無法取得圖片")
+
+        phash = compute_phash(photo_path)
+        if not phash:
+            return AgentResult(status=TaskStatus.DONE, message="無法計算圖片 hash")
+
+        threshold = self.config.get("settings", {}).get("phash_threshold", 10)
+        all_phashes = await self.media_db.get_all_phashes()
+        similar = []
+        for row in all_phashes:
+            dist = hamming_distance(phash, row["phash"])
+            if dist <= threshold:
+                similar.append({**row, "distance": dist})
+        similar.sort(key=lambda x: x["distance"])
+
+        text = format_similar_results(similar)
+        return AgentResult(status=TaskStatus.DONE, message=text)
+
+    async def _handle_page(self, task: TaskRequest) -> AgentResult:
+        """Handle pagination for search results."""
+        state = self._search_state.get(task.task_id)
+        if not state:
+            return AgentResult(status=TaskStatus.DONE, message="沒有進行中的搜尋")
+
+        content = task.content.strip().lower()
+        page_size = self.config.get("settings", {}).get("search_page_size", 10)
+
+        if "下一頁" in content or "next" in content:
+            state["page"] += 1
+        elif "上一頁" in content or "prev" in content:
+            state["page"] = max(1, state["page"] - 1)
+
+        results, total = await self.media_db.search_keyword(
+            state["keyword"], page=state["page"], page_size=page_size
+        )
+        text = format_search_results(results, total, page=state["page"], page_size=page_size)
+        return AgentResult(status=TaskStatus.DONE, message=text)
+
+    async def _handle_stats(self) -> AgentResult:
+        """Return media stats as text."""
+        stats = await self.media_db.get_stats()
+        lines = [
+            f"儲存媒體：{stats['total_media']} 筆",
+            f"標籤總數：{stats['total_tags']} 個",
+        ]
+        if stats["tag_counts"]:
+            lines.append("\n標籤統計：")
+            for name, count in stats["tag_counts"][:20]:
+                lines.append(f"  #{name} — {count} 筆")
+        return AgentResult(status=TaskStatus.DONE, message="\n".join(lines))
 
     async def _handle_batch_request(self, task: TaskRequest) -> AgentResult:
         """Parse batch command with AI, return estimate for confirmation."""
@@ -377,9 +496,23 @@ class TGTransferAgent(BaseAgent):
         messages.reverse()  # Oldest first
         return messages
 
+    def create_app(self) -> web.Application:
+        app = super().create_app()
+        app.router.add_get("/dashboard", dashboard_handler)
+        return app
+
     async def run(self) -> None:
         await self._init_services()
-        await super().run()
+        app = self.create_app()
+        app["media_db"] = self.media_db
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", self.port)
+        await site.start()
+        actual_port = site._server.sockets[0].getsockname()[1]
+        print(f"Agent '{self.name}' running on port {actual_port}")
+        await self.register(actual_port)
+        await self._heartbeat_loop(actual_port)
 
 
 async def main():

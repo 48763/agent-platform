@@ -59,7 +59,7 @@ async def test_transfer_single_message(engine, mock_client, db):
     await db.update_job_status(job_id, "running")
 
     result = await engine.transfer_single(source_entity, target_entity, msg)
-    assert result is True
+    assert result["ok"] is True
     mock_client.send_message.assert_called_once()
 
 
