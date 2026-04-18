@@ -168,6 +168,7 @@ agents/my_agent/
 ├── agent.yaml        # 設定
 ├── __init__.py       # 空
 ├── __main__.py       # 入口
+├── requirements.txt  # 依賴
 ├── README.md         # 這個 agent 的說明文件
 └── Dockerfile        # 容器
 ```
@@ -221,7 +222,7 @@ if __name__ == "__main__":
 FROM python:3.12-alpine
 WORKDIR /app
 RUN apk add --no-cache gcc musl-dev
-COPY requirements.txt .
+COPY agents/my_agent/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY core/ ./core/
 COPY agents/ ./agents/
@@ -230,12 +231,13 @@ CMD ["python", "-m", "agents.my_agent"]
 
 ### 5. 環境變數
 
-建立 `.env/my-agent.env`：
+建立 `.env/my-agent.env` 和 `.env/example/my-agent.env`：
 
 ```env
 HUB_URL=http://hub:9000
 AGENT_HOST=my-agent
 AGENT_PORT=8010
+DATA_DIR=/data
 ```
 
 ### 6. docker-compose.yaml

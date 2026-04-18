@@ -160,7 +160,7 @@ pip install pytest pytest-asyncio pytest-aiohttp
 ```bash
 source .venv/bin/activate
 export $(grep -v '^#' .env/gateway.env | grep -v '^$' | xargs)
-SESSION_PATH=data/gateway/bot_session python -m gateway
+DATA_DIR=data/gateway python -m gateway
 # 輸入手機號碼 → 輸入 Telegram 驗證碼 → 看到 connected 後 Ctrl+C
 ```
 
@@ -173,6 +173,18 @@ docker exec -it agent-hub-1 sh
 # 進入容器後：
 gemini auth login
 # 複製認證網址到本機瀏覽器開啟 → 登入 → 貼回 passkey → exit
+```
+
+**Agent LLM 認證（進容器手動登入）：**
+
+```bash
+# Claude Code Agent
+docker exec -it agent-claude-code-agent-1 sh
+claude auth login
+
+# TG Transfer Agent
+docker exec -it agent-tg-transfer-agent-1 sh
+gemini auth login
 ```
 
 ### 4. 啟動
@@ -196,12 +208,14 @@ open http://localhost:9000
 ├── core/                          # 共用模組
 │   ├── base_agent.py              #   Agent 基底類別
 │   ├── config.py                  #   YAML 設定載入
-│   ├── llm.py                     #   Claude API 封裝
+│   ├── llm.py                     #   統一 LLM 介面（Claude/Gemini）
+│   ├── agent_dashboard.py         #   共用 Dashboard 框架
 │   ├── models.py                  #   共用資料模型
 │   ├── sandbox.py                 #   路徑/指令沙盒
 │   └── tool_registry.py           #   @tool 裝飾器
 │
 ├── hub/                           # Hub 服務
+│   ├── run.py                     #   入口
 │   ├── server.py                  #   HTTP server + dispatch 路由
 │   ├── registry.py                #   Agent 在線管理
 │   ├── router.py                  #   關鍵字比對
@@ -209,7 +223,8 @@ open http://localhost:9000
 │   ├── gemini_fallback.py         #   Gemini 路由 + Chat
 │   ├── dashboard.py               #   Web Dashboard
 │   ├── auth.py                    #   登入驗證
-│   └── cli.py                     #   CLI 測試介面
+│   ├── cli.py                     #   CLI 測試介面
+│   └── requirements.txt           #   Hub 依賴
 │
 ├── gateway/                       # Gateway 服務
 │   ├── telegram_handler.py        #   Bot API 模式
@@ -225,21 +240,50 @@ open http://localhost:9000
 └── AGENTS.md                      # Agent 開發共用指南
 ```
 
-## 設定
+## 環境變數
 
-### Gateway 模式
+各服務的 `.env` 範本在 `.env/example/`，複製後編輯：`cp .env/example/*.env .env/`
 
-在 `.env/gateway.env` 設定 `GATEWAY_MODE`：
-- **`userbot`** — 用個人帳號（Telethon）
-- **`bot`** — 用 @BotFather 建立的 Bot
+### Hub（`.env/hub.env`）
 
-### Gemini 模型
+| 變數 | 預設值 | 說明 |
+|------|--------|------|
+| `HUB_HOST` | `0.0.0.0` | 監聽地址 |
+| `HUB_PORT` | `9000` | 監聽 port |
+| `HUB_HEARTBEAT_TIMEOUT` | `30` | heartbeat 超時秒數 |
+| `GEMINI_FAST_MODEL` | `gemini-2.5-flash` | 路由判斷用模型 |
+| `GEMINI_DEFAULT_MODEL` | `gemini-2.5-pro` | 閒聊回覆用模型 |
+| `DASHBOARD_USER` | — | Dashboard 帳號（留空不需登入） |
+| `DASHBOARD_PASS` | — | Dashboard 密碼 |
 
-在 `.env/hub.env` 設定：
-```env
-GEMINI_FAST_MODEL=gemini-2.5-flash    # 路由判斷用
-GEMINI_DEFAULT_MODEL=gemini-2.5-pro   # 閒聊回覆用
-```
+### Gateway（`.env/gateway.env`）
+
+| 變數 | 說明 |
+|------|------|
+| `HUB_URL` | Hub 地址 |
+| `DATA_DIR` | 資料目錄（session 檔案） |
+| `GATEWAY_MODE` | `userbot` 或 `bot` |
+| `TELEGRAM_API_ID` | Telegram API ID（userbot） |
+| `TELEGRAM_API_HASH` | Telegram API Hash（userbot） |
+| `TELEGRAM_PHONE` | 手機號碼（userbot） |
+| `TELEGRAM_BOT_TOKEN` | Bot token（bot mode） |
+| `ALLOWED_CHATS` | 可選，限制回應的 chat ID（逗號分隔） |
+
+### Agent 共用
+
+| 變數 | 說明 |
+|------|------|
+| `HUB_URL` | Hub 地址 |
+| `AGENT_HOST` | Agent 自身 hostname |
+| `AGENT_PORT` | Agent 自身 port |
+| `DATA_DIR` | 資料持久化目錄 |
+
+### LLM 認證（設 API key 或進容器 CLI login，二擇一）
+
+| 變數 | 說明 |
+|------|------|
+| `ANTHROPIC_API_KEY` | Claude API key |
+| `GEMINI_API_KEY` | Gemini API key |
 
 ### 自訂 Prompt
 
@@ -287,5 +331,5 @@ python -m pytest tests/ -v
 # 查詢 Telegram chat ID
 source .venv/bin/activate
 export $(grep -v '^#' .env/gateway.env | grep -v '^$' | xargs)
-SESSION_PATH=data/gateway/bot_session python gateway/list_chats.py
+DATA_DIR=data/gateway python gateway/list_chats.py
 ```
