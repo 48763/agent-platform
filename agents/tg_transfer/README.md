@@ -97,10 +97,12 @@ agents/tg_transfer/
 ├── tag_extractor.py     # #tag 提取
 ├── search.py            # 搜尋結果格式化 + 翻頁
 ├── liveness_checker.py  # 背景存活檢查
-├── dashboard.py         # 統計 HTML（/dashboard）
+├── dashboard.py         # 統計 Dashboard（使用 core/agent_dashboard.py 框架）
 ├── tg_client.py         # 獨立 Telethon client
 └── Dockerfile
 ```
+
+**初始化失敗處理：** 如果 TG_API_ID/TG_API_HASH 未設定或 Telethon 連線失敗，agent 不會 crash，會在 Hub Dashboard 顯示錯誤訊息。設定好後重啟即恢復。
 
 ## 資料庫
 

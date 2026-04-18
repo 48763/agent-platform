@@ -54,3 +54,5 @@ agents/claude_code/
 - 有既存 session → 送使用者輸入到 CLI
 - 無 session → 啟動新 CLI process
 - CLI 回傳事件轉換為 `AgentResult`（DONE / NEED_APPROVAL / NEED_INPUT / ERROR）
+
+**LLM 認證：** agent.yaml 設定 `llm: claude`，啟動時透過 `claude auth status` 檢測是否已登入（不消耗 token）。未登入時 agent 正常運行但在 Hub Dashboard 顯示 unauthenticated，不被路由。進容器 `claude auth login` 後重啟即恢復。

@@ -20,11 +20,37 @@ class MyAgent(BaseAgent):
 ### BaseAgent
 
 Agent 基底類別，繼承即可使用。自動處理：
+- LLM 認證檢測（API key 或 CLI login）
+- `_init_services()` 初始化（失敗不 crash，回報 Hub 顯示在 Dashboard）
 - HTTP server（`/task` 和 `/health` 端點）
-- Hub 註冊（name、description、route_patterns、priority）
+- Hub 註冊（name、description、route_patterns、priority、auth/error 狀態）
 - 每 10 秒 heartbeat（Hub 重啟時自動重新註冊）
 - 載入 `agent.yaml` 設定
 - 初始化 Sandbox 安全限制
+
+**Agent 啟動流程：**
+```
+BaseAgent.run()
+  → LLM 認證檢測（如有設定）
+  → _init_services()（agent override 初始化 DB、client 等）
+  → 啟動 HTTP server
+  → 向 Hub 註冊（帶 auth/error 狀態）
+  → heartbeat loop
+```
+
+任何步驟失敗都不會 crash，agent 帶著錯誤狀態註冊到 Hub。
+
+**override `_init_services()`：**
+```python
+class MyAgent(BaseAgent):
+    async def _init_services(self):
+        # 初始化你的 DB、client 等
+        self.db = await connect_db()
+        self.client = await create_client()
+
+    async def handle_task(self, task: TaskRequest) -> AgentResult:
+        return AgentResult(status=TaskStatus.DONE, message="完成")
+```
 
 ### TaskRequest
 
