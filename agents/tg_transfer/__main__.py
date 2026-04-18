@@ -19,7 +19,7 @@ from agents.tg_transfer.media_db import MediaDB
 from agents.tg_transfer.search import format_search_results, format_similar_results
 from agents.tg_transfer.hasher import compute_phash, hamming_distance, PHASH_AVAILABLE
 from agents.tg_transfer.liveness_checker import run_liveness_loop
-from agents.tg_transfer.dashboard import dashboard_handler
+from agents.tg_transfer.dashboard import create_tg_dashboard_handler
 
 logger = logging.getLogger(__name__)
 
@@ -429,7 +429,9 @@ class TGTransferAgent(BaseAgent):
         )
 
     async def _ai_parse_batch(self, content: str) -> dict | None:
-        """Use Gemini Flash to parse natural language batch command."""
+        """Use LLM to parse natural language batch command."""
+        if not self.llm:
+            return None
         prompt = (
             "你是一個指令解析器。從以下使用者訊息中提取搬移參數，回覆 JSON：\n"
             '{"source": "@channel 或連結", "target": "@channel 或連結 或 null", '
@@ -438,13 +440,7 @@ class TGTransferAgent(BaseAgent):
             f"使用者訊息：{content}\n\n只回覆 JSON，不要解釋。"
         )
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "gemini", "-p", prompt, "-m", "gemini-2.5-flash",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-            text = stdout.decode().strip()
+            text = await self.llm.prompt(prompt)
             # Extract JSON from response (may be wrapped in markdown)
             if "```" in text:
                 text = text.split("```")[1]
@@ -498,13 +494,12 @@ class TGTransferAgent(BaseAgent):
 
     def create_app(self) -> web.Application:
         app = super().create_app()
-        app.router.add_get("/dashboard", dashboard_handler)
+        app.router.add_get("/dashboard", create_tg_dashboard_handler(self.media_db))
         return app
 
     async def run(self) -> None:
         await self._init_services()
         app = self.create_app()
-        app["media_db"] = self.media_db
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", self.port)
