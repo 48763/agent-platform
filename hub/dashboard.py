@@ -23,7 +23,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .badge { padding: 2px 8px; border-radius: 12px; font-size: 0.75em; font-weight: 600; display: inline-block; }
         .badge-online { background: #238636; color: #fff; }
         .badge-offline { background: #f85149; color: #fff; }
+        .badge-error { background: #f85149; color: #fff; }
+        .badge-unauthenticated { background: #da3633; color: #fff; }
         .badge-disabled { background: #d29922; color: #000; }
+
+        .error-msg { background: #2d1b1b; border: 1px solid #f8514930; border-radius: 4px; padding: 8px 12px; margin-top: 8px; color: #f85149; font-size: 0.8em; font-family: monospace; }
+        .btn-link { background: none; border: 1px solid #58a6ff; color: #58a6ff; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 0.8em; text-decoration: none; }
+        .btn-link:hover { background: #58a6ff; color: #fff; }
         .badge-working { background: #1f6feb; color: #fff; }
         .badge-waiting { background: #d29922; color: #000; }
         .badge-done { background: #8b949e; color: #fff; }
@@ -163,7 +169,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         function agentStatusLabel(status) {
-            const map = { 'online': '在線', 'offline': '離線', 'disabled': '已停用' };
+            const map = { 'online': '在線', 'offline': '離線', 'disabled': '已停用', 'error': '錯誤', 'unauthenticated': '未認證' };
             return map[status] || status;
         }
 
@@ -194,7 +200,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
                 const toggleBtn = a.status === 'disabled'
                     ? `<button class="btn btn-success" onclick="enableAgent('${a.name}')">啟用</button>`
-                    : `<button class="btn btn-warn" onclick="disableAgent('${a.name}')">停用</button>`;
+                    : (a.status !== 'error' && a.status !== 'unauthenticated')
+                        ? `<button class="btn btn-warn" onclick="disableAgent('${a.name}')">停用</button>`
+                        : '';
+
+                const dashboardBtn = a.url && a.status === 'online'
+                    ? `<a class="btn-link" href="/dashboard/agent/${a.name}/proxy" target="_blank">Dashboard</a>`
+                    : '';
+
+                const errorMsg = a.error
+                    ? `<div class="error-msg">${a.error}</div>`
+                    : '';
 
                 const patterns = a.route_patterns.map(p =>
                     p.split('|').map(kw => `<span class="agent-pattern">${kw}</span>`).join('')
@@ -205,11 +221,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <div class="card-header">
                             <span class="card-title">${a.name}</span>
                             <div class="actions">
+                                ${dashboardBtn}
                                 <span class="badge ${badgeClass(a.status)}">${agentStatusLabel(a.status)}</span>
                                 ${toggleBtn}
                             </div>
                         </div>
-                        <div class="card-desc">${a.description}</div>
+                        <div class="card-desc">${a.description}</div>${errorMsg}
                         <div class="agent-stats">
                             <div class="agent-stat"><span class="agent-stat-label">優先級:</span> <span class="agent-stat-value">${a.priority}</span></div>
                             <div class="agent-stat"><span class="agent-stat-label">處理任務:</span> <span class="agent-stat-value">${s.total_tasks}</span></div>

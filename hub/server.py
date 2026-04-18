@@ -71,6 +71,7 @@ def create_hub_app(
     app.router.add_get("/dashboard/agents", handle_dashboard_agents)
     app.router.add_post("/dashboard/agent/{name}/disable", handle_agent_disable)
     app.router.add_post("/dashboard/agent/{name}/enable", handle_agent_enable)
+    app.router.add_get("/dashboard/agent/{name}/proxy", handle_agent_dashboard_proxy)
 
     return app
 
@@ -113,6 +114,24 @@ async def handle_set_message_id(request: web.Request) -> web.Response:
     if task_id and message_id:
         request.app["task_manager"].set_message_id(task_id, message_id)
     return web.json_response({"status": "ok"})
+
+
+async def handle_agent_dashboard_proxy(request: web.Request) -> web.Response:
+    """Proxy an agent's /dashboard endpoint through Hub."""
+    name = request.match_info["name"]
+    registry = request.app["registry"]
+    agents = {a["name"]: a for a in registry.list_all()}
+    agent = agents.get(name)
+    if not agent or not agent.get("url"):
+        return web.Response(text="Agent not found", status=404)
+    from aiohttp import ClientSession
+    try:
+        async with ClientSession() as session:
+            async with session.get(f"{agent['url']}/dashboard") as resp:
+                body = await resp.text()
+                return web.Response(text=body, content_type="text/html")
+    except Exception as e:
+        return web.Response(text=f"Cannot reach agent dashboard: {e}", status=502)
 
 
 async def handle_dispatch(request: web.Request) -> web.Response:
