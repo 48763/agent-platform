@@ -78,6 +78,11 @@ class TGTransferAgent(BaseAgent):
             logger.info(f"Found interrupted job {job['job_id']}, will resume on next dispatch")
 
     async def handle_task(self, task: TaskRequest) -> AgentResult:
+        if self._init_error:
+            return AgentResult(
+                status=TaskStatus.ERROR,
+                message=f"Agent 初始化失敗，無法處理任務：{self._init_error}",
+            )
         try:
             return await self._dispatch(task)
         except Exception as e:
@@ -494,20 +499,9 @@ class TGTransferAgent(BaseAgent):
 
     def create_app(self) -> web.Application:
         app = super().create_app()
-        app.router.add_get("/dashboard", create_tg_dashboard_handler(self.media_db))
+        if self.media_db:
+            app.router.add_get("/dashboard", create_tg_dashboard_handler(self.media_db))
         return app
-
-    async def run(self) -> None:
-        await self._init_services()
-        app = self.create_app()
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", self.port)
-        await site.start()
-        actual_port = site._server.sockets[0].getsockname()[1]
-        print(f"Agent '{self.name}' running on port {actual_port}")
-        await self.register(actual_port)
-        await self._heartbeat_loop(actual_port)
 
 
 async def main():

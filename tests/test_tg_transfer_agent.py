@@ -22,6 +22,7 @@ class TestHandleTaskDispatch:
             agent._pending_jobs = {}
             agent._search_state = {}
             agent.media_db = AsyncMock()
+            agent._init_error = ""
 
             task = TaskRequest(task_id="t1", content="https://t.me/channel/123")
 
@@ -50,6 +51,7 @@ class TestHandleTaskDispatch:
             agent._pending_jobs = {}
             agent._search_state = {}
             agent.media_db = AsyncMock()
+            agent._init_error = ""
 
             task = TaskRequest(task_id="t2", content="預設目標改成 @my_backup")
             result = await agent.handle_task(task)
@@ -73,6 +75,7 @@ class TestHandleTaskDispatch:
             agent._pending_jobs = {}
             agent._search_state = {}
             agent.media_db = AsyncMock()
+            agent._init_error = ""
 
             task = TaskRequest(
                 task_id="t3",

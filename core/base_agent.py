@@ -22,9 +22,16 @@ class BaseAgent(ABC):
         self.llm: LLMClient | None = None
         self._llm_authenticated: bool = True
         self._llm_error: str = ""
+        self._init_error: str = ""
 
     @abstractmethod
     async def handle_task(self, task: TaskRequest) -> AgentResult:
+        pass
+
+    async def _init_services(self) -> None:
+        """Override to initialize agent-specific services (DB, clients, etc).
+        Exceptions are caught by run() and reported to Hub as error state.
+        """
         pass
 
     def create_app(self) -> web.Application:
@@ -52,7 +59,10 @@ class BaseAgent(ABC):
             priority=self.config.get("priority", 0),
         )
         data = info.to_dict()
-        if not self._llm_authenticated:
+        if self._init_error:
+            data["auth_status"] = "error"
+            data["auth_error"] = self._init_error
+        elif not self._llm_authenticated:
             data["auth_status"] = "unauthenticated"
             data["auth_error"] = self._llm_error
         async with ClientSession() as session:
@@ -100,6 +110,13 @@ class BaseAgent(ABC):
                 self._llm_authenticated = False
                 self._llm_error = auth_error
                 print(f"WARNING: LLM not authenticated: {auth_error}", file=sys.stderr)
+
+        # Initialize agent-specific services
+        try:
+            await self._init_services()
+        except Exception as e:
+            self._init_error = str(e)
+            print(f"WARNING: Service init failed: {e}", file=sys.stderr)
 
         app = self.create_app()
         runner = web.AppRunner(app)

@@ -16,8 +16,11 @@ class AgentRegistry:
     def register(self, info: AgentInfo, auth_status: str = None, auth_error: str = None) -> None:
         self._agents[info.name] = info
         self._last_heartbeat[info.name] = time.time()
-        self._errors.pop(info.name, None)  # Clear any previous error
-        if auth_status == "unauthenticated":
+        self._errors.pop(info.name, None)  # Clear any previous /register_error
+        if auth_status == "error":
+            self._errors[info.name] = auth_error or "初始化失敗"
+            self._unauthenticated.pop(info.name, None)
+        elif auth_status == "unauthenticated":
             self._unauthenticated[info.name] = auth_error or "LLM 未認證"
         else:
             self._unauthenticated.pop(info.name, None)
