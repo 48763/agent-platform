@@ -46,3 +46,32 @@ def test_unregister():
     reg.register(AgentInfo(name="a", description="A", url="http://localhost:8001"))
     reg.unregister("a")
     assert reg.get("a") is None
+
+
+def test_register_error():
+    reg = AgentRegistry(heartbeat_timeout=30)
+    reg.register_error("broken-agent", "LLM 不可用：找不到 gemini CLI")
+    agents = reg.list_all()
+    broken = [a for a in agents if a["name"] == "broken-agent"]
+    assert len(broken) == 1
+    assert broken[0]["status"] == "error"
+    assert broken[0]["error"] == "LLM 不可用：找不到 gemini CLI"
+
+
+def test_register_clears_error():
+    reg = AgentRegistry(heartbeat_timeout=30)
+    reg.register_error("recover-agent", "some error")
+    info = AgentInfo(name="recover-agent", description="test", url="http://localhost:8000")
+    reg.register(info)
+    agents = reg.list_all()
+    agent = [a for a in agents if a["name"] == "recover-agent"][0]
+    assert agent["status"] == "online"
+    assert agent.get("error") is None
+
+
+def test_error_agent_not_in_online_list():
+    reg = AgentRegistry(heartbeat_timeout=30)
+    reg.register_error("err-agent", "broken")
+    online = reg.list_online()
+    names = [a.name for a in online]
+    assert "err-agent" not in names

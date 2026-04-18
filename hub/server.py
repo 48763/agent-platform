@@ -58,6 +58,7 @@ def create_hub_app(
 
     # API routes (no auth — used by agents and gateway)
     app.router.add_post("/register", handle_register)
+    app.router.add_post("/register_error", handle_register_error)
     app.router.add_post("/heartbeat", handle_heartbeat)
     app.router.add_get("/agents", handle_list_agents)
     app.router.add_post("/dispatch", handle_dispatch)
@@ -79,6 +80,14 @@ async def handle_register(request: web.Request) -> web.Response:
     info = AgentInfo.from_dict(data)
     request.app["registry"].register(info)
     return web.json_response({"status": "registered", "name": info.name})
+
+
+async def handle_register_error(request: web.Request) -> web.Response:
+    data = await request.json()
+    name = data.get("name", "unknown")
+    error = data.get("error", "unknown error")
+    request.app["registry"].register_error(name, error)
+    return web.json_response({"status": "recorded", "name": name})
 
 
 async def handle_heartbeat(request: web.Request) -> web.Response:

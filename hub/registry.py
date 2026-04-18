@@ -9,11 +9,13 @@ class AgentRegistry:
         self._registered_at: dict[str, float] = {}
         self._disabled: set[str] = set()
         self._stats: dict[str, dict] = {}  # name → {tasks, success, errors, total_ms}
+        self._errors: dict[str, str] = {}  # name → error message
         self._heartbeat_timeout = heartbeat_timeout
 
     def register(self, info: AgentInfo) -> None:
         self._agents[info.name] = info
         self._last_heartbeat[info.name] = time.time()
+        self._errors.pop(info.name, None)  # Clear any previous error
         if info.name not in self._registered_at:
             self._registered_at[info.name] = time.time()
         if info.name not in self._stats:
@@ -57,7 +59,9 @@ class AgentRegistry:
             stats = self._stats.get(name, {"tasks": 0, "success": 0, "errors": 0, "total_ms": 0})
             avg_ms = round(stats["total_ms"] / stats["tasks"]) if stats["tasks"] > 0 else 0
 
-            if disabled:
+            if name in self._errors:
+                status = "error"
+            elif disabled:
                 status = "disabled"
             elif alive:
                 status = "online"
@@ -67,6 +71,7 @@ class AgentRegistry:
             result.append({
                 **info.to_dict(),
                 "status": status,
+                "error": self._errors.get(name),
                 "last_heartbeat": last_hb,
                 "registered_at": reg_at,
                 "uptime_seconds": round(now - reg_at) if reg_at else 0,
@@ -77,6 +82,23 @@ class AgentRegistry:
                     "avg_response_ms": avg_ms,
                 },
             })
+        # Add agents that only have error state (never successfully registered)
+        for name, error in self._errors.items():
+            if name not in self._agents:
+                result.append({
+                    "name": name,
+                    "description": "",
+                    "url": "",
+                    "route_patterns": [],
+                    "capabilities": [],
+                    "priority": 0,
+                    "status": "error",
+                    "error": error,
+                    "last_heartbeat": 0,
+                    "registered_at": 0,
+                    "uptime_seconds": 0,
+                    "stats": {"total_tasks": 0, "success": 0, "errors": 0, "avg_response_ms": 0},
+                })
         return sorted(result, key=lambda a: a.get("priority", 0), reverse=False)
 
     def record_task_result(self, name: str, success: bool, duration_ms: int = 0):
@@ -94,6 +116,10 @@ class AgentRegistry:
 
     def enable(self, name: str):
         self._disabled.discard(name)
+
+    def register_error(self, name: str, error: str) -> None:
+        """Record an agent that failed to start."""
+        self._errors[name] = error
 
     def is_disabled(self, name: str) -> bool:
         return name in self._disabled
