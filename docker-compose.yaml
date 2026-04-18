@@ -59,7 +59,7 @@ services:
     env_file:
       - .env/tg-transfer-agent.env
     volumes:
-      - ./data/session/telegram_user_908:/data/tg_transfer/session
+      - ./data/session/telegram_user_908:/data/session
       - ./data/session/gemini_ai:/root/.gemini
       - ./data/tg_transfer:/data/tg_transfer
     depends_on:
