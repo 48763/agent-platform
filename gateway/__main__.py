@@ -26,7 +26,8 @@ def main():
         if allowed_chats:
             chat_list = [int(c.strip()) for c in allowed_chats.split(",")]
 
-        session_path = os.environ.get("SESSION_PATH", "gateway/bot_session")
+        data_dir = os.environ.get("DATA_DIR", "/data")
+        session_path = os.path.join(data_dir, "bot_session")
 
         handler = TelegramUserHandler(
             api_id=int(api_id),

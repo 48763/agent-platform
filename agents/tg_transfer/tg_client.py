@@ -8,12 +8,12 @@ logger = logging.getLogger(__name__)
 async def create_client(session_path: str) -> TelegramClient:
     """Create and start a Telethon client.
 
-    Requires env vars: TG_API_ID, TG_API_HASH.
+    Requires env vars: TELEGRAM_API_ID, TELEGRAM_API_HASH.
     First run requires interactive login (phone + code).
     Subsequent runs use the persisted session file.
     """
-    api_id = int(os.environ["TG_API_ID"])
-    api_hash = os.environ["TG_API_HASH"]
+    api_id = int(os.environ["TELEGRAM_API_ID"])
+    api_hash = os.environ["TELEGRAM_API_HASH"]
 
     client = TelegramClient(session_path, api_id, api_hash)
     await client.start()
