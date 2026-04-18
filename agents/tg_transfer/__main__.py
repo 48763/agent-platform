@@ -51,7 +51,8 @@ class TGTransferAgent(BaseAgent):
             await self.db.set_config("default_target_chat", yaml_target)
 
         session_name = settings.get("telethon_session", "tg_transfer")
-        session_path = os.path.join(data_dir, session_name)
+        session_dir = os.path.join(data_dir, "session")
+        session_path = os.path.join(session_dir, session_name) if os.path.isdir(session_dir) else os.path.join(data_dir, session_name)
         self.tg_client = await create_client(session_path)
 
         # Media DB
