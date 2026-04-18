@@ -8,7 +8,7 @@ services:
     env_file:
       - .env/hub.env
     volumes:
-      - ./data/hub/.gemini:/root/.gemini
+      - ./data/session/gemini_ai:/root/.gemini
       - ./data/hub/prompts:/data/prompts
       - ./data/hub/data:/data
     networks:
@@ -26,7 +26,7 @@ services:
     env_file:
       - .env/gateway.env
     volumes:
-      - ./data/gateway:/data
+      - ./data/session/telegram_user_908:/data
     depends_on:
       hub:
         condition: service_healthy
@@ -42,8 +42,8 @@ services:
       - .env/claude-code-agent.env
     volumes:
       - ~/Desktop/workspaces:/workspace
-      - ./data/claude-code-agent/.claude:/root/.claude
-      - ./data/claude-code-agent/.claude.json:/root/.claude.json
+      - ./data/session/claude_com/.claude:/root/.claude
+      - ./data/session/claude_com/.claude.json:/root/.claude.json
       - ./data/claude-code-agent/prompts:/data/prompts
     depends_on:
       hub:
