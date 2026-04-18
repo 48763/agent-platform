@@ -10,7 +10,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY core/ ./core/
 COPY hub/ ./hub/
-COPY config.yaml .
 COPY run_hub.py .
 
 EXPOSE 9000
