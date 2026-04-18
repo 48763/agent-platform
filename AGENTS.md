@@ -81,7 +81,16 @@ settings:
     model: gemini-2.5-flash
 ```
 
-Agent 啟動時自動檢測 LLM 可用性，失敗會向 Hub 回報錯誤並退出。
+**認證方式（自動偵測）：**
+- 有 API key 環境變數（`ANTHROPIC_API_KEY` / `GEMINI_API_KEY`）→ 直接使用
+- 沒有 API key → 檢查 CLI 是否已登入（`claude auth login` / `gemini auth login`）
+- 兩者都沒有 → agent 正常啟動但標記為 `unauthenticated`，不被路由選取
+
+進容器手動認證後重啟即可恢復：
+```bash
+docker exec -it agent-xxx-1 sh
+claude auth login    # 或 gemini auth login
+```
 
 ```python
 # BaseAgent 自動初始化 self.llm，直接使用：
