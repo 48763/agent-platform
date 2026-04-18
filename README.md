@@ -110,12 +110,13 @@ DASHBOARD_PASS=your-password
 
 | 模組 | 用途 |
 |------|------|
-| `base_agent.py` | Agent 基底類別：HTTP server、Hub 註冊、heartbeat、設定載入 |
+| `base_agent.py` | Agent 基底類別：HTTP server、Hub 註冊、heartbeat、LLM 檢測、錯誤回報 |
 | `models.py` | 共用資料模型：`TaskRequest`、`AgentResult`、`TaskStatus`、`AgentInfo` |
 | `config.py` | YAML 設定載入 |
 | `sandbox.py` | 路徑/指令安全限制（per-agent 設定） |
-| `llm.py` | Claude API 封裝 + agentic loop（自動執行 tool call） |
+| `llm.py` | 統一 LLM 介面：支援 Claude API + Gemini CLI，agent.yaml 擇一設定 |
 | `tool_registry.py` | `@tool` 裝飾器 + Claude API tool schema 自動產生 |
+| `agent_dashboard.py` | 共用 Dashboard 框架：agent 提供 stats dict，自動渲染 HTML |
 
 ## 快速開始
 
@@ -241,6 +242,7 @@ GEMINI_DEFAULT_MODEL=gemini-2.5-pro   # 閒聊回覆用
 | 端點 | 方法 | 說明 |
 |------|------|------|
 | `/register` | POST | Agent 註冊 |
+| `/register_error` | POST | Agent 啟動失敗回報（Dashboard 顯示錯誤） |
 | `/heartbeat` | POST | Agent 心跳 |
 | `/agents` | GET | 列出在線 agent |
 | `/dispatch` | POST | 分配訊息 |

@@ -68,25 +68,60 @@ self.sandbox.check_path("/some/path", write=True)   # 檢查是否允許寫入
 self.sandbox.check_command("git diff")               # 檢查是否允許執行
 ```
 
-### ToolRegistry + LLMClient
+### LLMClient（Claude / Gemini 統一介面）
 
-用於需要 Claude API 的 Agent。
+在 `agent.yaml` 設定使用哪個 LLM：
+
+```yaml
+settings:
+  llm: claude              # 簡寫，用預設模型
+  # 或完整寫法：
+  llm:
+    provider: gemini
+    model: gemini-2.5-flash
+```
+
+Agent 啟動時自動檢測 LLM 可用性，失敗會向 Hub 回報錯誤並退出。
+
+```python
+# BaseAgent 自動初始化 self.llm，直接使用：
+result = await self.llm.prompt("翻譯這段文字")
+
+# Claude provider 額外支援 agentic loop（Gemini 不支援）：
+result = await self.llm.run(system_prompt="...", messages=[...], tools_schema=schema, tool_executor=fn)
+```
+
+### ToolRegistry
+
+用 `@tool` 裝飾器定義 Agent 工具，搭配 Claude provider 的 agentic loop 使用。
 
 ```python
 from core.tool_registry import tool, collect_tools, tools_to_schema
-from core.llm import LLMClient
 
 @tool(description="查詢天氣")
 async def get_weather(city: str) -> str:
     return f"{city} 25°C"
 
-# 自動產生 Claude API tool schema
 tools = collect_tools(my_module)
 schema = tools_to_schema(tools)
+```
 
-# Agentic loop — 自動執行 tool call 直到最終回答
-llm = LLMClient(client=anthropic_client, model="claude-sonnet-4-20250514")
-result = await llm.run(system_prompt="...", messages=[...], tools_schema=schema, tool_executor=executor)
+### Agent Dashboard（共用框架）
+
+Agent 只需提供 `get_stats()` 函數，框架自動渲染 HTML 頁面（深色主題）。
+
+```python
+from core.agent_dashboard import create_dashboard_handler
+
+async def get_stats():
+    return {
+        "title": "My Agent 統計",
+        "counters": [("項目數", 42)],
+        "tables": [{"title": "詳細", "headers": ["名稱", "值"], "rows": [("a", 1)]}],
+    }
+
+# 在 create_app 中：
+app.router.add_get("/dashboard", create_dashboard_handler(get_stats))
 ```
 
 ## 建立新 Agent
