@@ -204,8 +204,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         ? `<button class="btn btn-warn" onclick="disableAgent('${a.name}')">停用</button>`
                         : '';
 
-                const dashboardBtn = a.has_dashboard && a.status === 'online'
-                    ? `<a class="btn-link" href="/dashboard/agent/${a.name}/proxy" target="_blank">Dashboard</a>`
+                const dashboardBtn = a.has_dashboard
+                    ? `<a class="btn-link" href="/dashboard/agent/${a.name}/proxy">Dashboard</a>`
                     : '';
 
                 const errorMsg = a.error
