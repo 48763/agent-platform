@@ -1,4 +1,4 @@
-# run_hub.py
+# hub/run.py
 import os
 from aiohttp import web
 from hub.server import create_hub_app

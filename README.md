@@ -146,7 +146,8 @@ cp .env/example/*.env .env/
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r hub/requirements.txt -r gateway/requirements.txt
+pip install -r agents/claude_code/requirements.txt -r agents/tg_transfer/requirements.txt
 pip install pytest pytest-asyncio pytest-aiohttp
 ```
 
@@ -219,9 +220,8 @@ open http://localhost:9000
 │   ├── claude_code/
 │   └── tg_transfer/
 │
-├── tests/                         # 測試（74 tests）
+├── tests/                         # 測試（147 tests）
 ├── docker-compose.yaml
-├── requirements.txt
 └── AGENTS.md                      # Agent 開發共用指南
 ```
 
