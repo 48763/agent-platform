@@ -26,7 +26,7 @@ services:
     env_file:
       - .env/gateway.env
     volumes:
-      - ./data/session/telegram_user_908:/data
+      - ./data/session/telegram_user_908/gateway:/data
     depends_on:
       hub:
         condition: service_healthy
@@ -59,8 +59,8 @@ services:
     env_file:
       - .env/tg-transfer-agent.env
     volumes:
-      - ./data/session/telegram_user_908:/data/session
       - ./data/session/gemini_ai:/root/.gemini
+      - ./data/session/telegram_user_908/tg_transfer:/data
       - ./data/tg_transfer:/data/tg_transfer
     depends_on:
       hub:
