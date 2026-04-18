@@ -1,11 +1,13 @@
 # core/base_agent.py
 import asyncio
 import os
+import sys
 from abc import ABC, abstractmethod
 from aiohttp import web, ClientSession
 from core.config import load_agent_config
 from core.models import AgentInfo, AgentResult, TaskRequest, TaskStatus
 from core.sandbox import Sandbox
+from core.llm import create_llm_client, LLMInitError, LLMClient
 
 
 class BaseAgent(ABC):
@@ -17,6 +19,7 @@ class BaseAgent(ABC):
         self.host = os.environ.get("AGENT_HOST", "localhost")
         sandbox_config = self.config.get("sandbox", {"allowed_dirs": []})
         self.sandbox = Sandbox(sandbox_config)
+        self.llm: LLMClient | None = None
 
     @abstractmethod
     async def handle_task(self, task: TaskRequest) -> AgentResult:
@@ -64,7 +67,28 @@ class BaseAgent(ABC):
                     pass
                 await asyncio.sleep(interval)
 
+    async def _register_error(self, error: str) -> None:
+        """Report startup error to Hub."""
+        try:
+            async with ClientSession() as session:
+                await session.post(
+                    f"{self.hub_url}/register_error",
+                    json={"name": self.name, "error": error},
+                )
+        except Exception:
+            pass  # Hub might not be running
+
     async def run(self) -> None:
+        # Validate LLM if configured
+        settings = self.config.get("settings", {})
+        if settings.get("llm"):
+            try:
+                self.llm = await create_llm_client(settings)
+            except LLMInitError as e:
+                await self._register_error(str(e))
+                print(f"ERROR: LLM init failed: {e}", file=sys.stderr)
+                sys.exit(1)
+
         app = self.create_app()
         runner = web.AppRunner(app)
         await runner.setup()
