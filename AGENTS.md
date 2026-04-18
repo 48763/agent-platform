@@ -43,6 +43,7 @@ class MyAgent(BaseAgent):
 | `core/tool_registry.py` | @tool 裝飾器（用於 Claude API） |
 | `core/llm.py` | Claude API 封裝 + agentic loop |
 | `agents/claude_code/` | 複雜 Agent 範例（CLI subprocess） |
+| `agents/tg_transfer/` | TG 資源搬移 Agent（媒體去重、搜尋、標籤、存活檢查） |
 | `docs/agent-development.md` | 完整開發文件 |
 
 ## Agent 回傳狀態

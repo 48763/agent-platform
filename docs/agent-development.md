@@ -379,6 +379,7 @@ curl -X POST http://localhost:9000/dispatch \
 ## 參考
 
 - `agents/claude_code/` — 複雜範例：CLI subprocess + JSON stream + 多輪 session 管理
+- `agents/tg_transfer/` — 進階範例：獨立 Telethon client + SQLite 媒體管理 + pHash 去重 + 搜尋 + Dashboard + 背景 task
 - `core/base_agent.py` — BaseAgent 原始碼
 - `core/models.py` — TaskRequest / AgentResult / TaskStatus 定義
 - `core/sandbox.py` — Sandbox 安全限制
