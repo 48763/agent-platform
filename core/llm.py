@@ -182,9 +182,11 @@ async def check_llm_auth(settings: dict) -> tuple[bool, str]:
         if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
             return True, ""
         # Method 2: CLI login — check credentials file exists
-        gemini_creds = os.path.expanduser("~/.gemini/gemini-credentials.json")
-        if os.path.exists(gemini_creds) and os.path.getsize(gemini_creds) > 0:
-            return True, ""
+        gemini_dir = os.path.expanduser("~/.gemini")
+        for creds_name in ("oauth_creds.json", "gemini-credentials.json"):
+            creds_path = os.path.join(gemini_dir, creds_name)
+            if os.path.exists(creds_path) and os.path.getsize(creds_path) > 0:
+                return True, ""
         return False, "Gemini 未認證：請設定 GEMINI_API_KEY 或進入容器執行 gemini auth login"
 
     return False, f"Unknown provider: {provider_name}"
