@@ -243,7 +243,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                             <div class="agent-stat"><span class="agent-stat-label">成功率:</span> <span class="agent-stat-value">${successRate}%</span></div>
                             <div class="agent-stat"><span class="agent-stat-label">平均回應:</span> <span class="agent-stat-value">${s.avg_response_ms}ms</span></div>
                             <div class="agent-stat"><span class="agent-stat-label">在線時長:</span> <span class="agent-stat-value">${duration(a.uptime_seconds)}</span></div>
-                            <div class="agent-stat"><span class="agent-stat-label">最後心跳:</span> <span class="agent-stat-value">${timeAgo(a.last_heartbeat)}</span></div>
+                            <div class="agent-stat"><span class="agent-stat-label">WS:</span> <span class="agent-stat-value">${a.ws_connected ? '已連線' : '未連線'}</span></div>
                         </div>
                         <div class="agent-patterns"><span class="agent-stat-label" style="font-size:0.8em;margin-right:4px">關鍵字:</span>${patterns}</div>
                     </div>

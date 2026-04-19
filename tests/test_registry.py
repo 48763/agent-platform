@@ -65,7 +65,8 @@ def test_register_clears_error():
     reg.register(info)
     agents = reg.list_all()
     agent = [a for a in agents if a["name"] == "recover-agent"][0]
-    assert agent["status"] == "online"
+    # No WS connection after registration, so status is offline (not error)
+    assert agent["status"] == "offline"
     assert agent.get("error") is None
 
 

@@ -78,7 +78,7 @@ class AgentRegistry:
                 status = "unauthenticated"
             elif disabled:
                 status = "disabled"
-            elif alive:
+            elif self.has_ws(name):
                 status = "online"
             else:
                 status = "offline"
@@ -88,6 +88,7 @@ class AgentRegistry:
                 "status": status,
                 "error": self._errors.get(name) or self._unauthenticated.get(name),
                 "has_dashboard": self._has_dashboard.get(name, False),
+                "ws_connected": self.has_ws(name),
                 "last_heartbeat": last_hb,
                 "registered_at": reg_at,
                 "uptime_seconds": round(now - reg_at) if reg_at else 0,
