@@ -4,10 +4,12 @@ import logging
 import asyncio
 from typing import Callable, Optional, Any
 from telethon import TelegramClient
+from telethon.tl.types import DocumentAttributeVideo
 from agents.tg_transfer.db import TransferDB
 from agents.tg_transfer.hasher import compute_sha256, compute_phash, compute_phash_video, hamming_distance
 from agents.tg_transfer.media_db import MediaDB
 from agents.tg_transfer.tag_extractor import extract_tags
+from agents.tg_transfer.media_utils import ffprobe_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,10 @@ class TransferEngine:
         self.progress_interval = progress_interval
         self.media_db = media_db
         self.phash_threshold = phash_threshold
+        self._cancelled: set[str] = set()
+
+    def cancel_job(self, job_id: str):
+        self._cancelled.add(job_id)
 
     def should_skip(self, message) -> bool:
         """Check if message type should be skipped (sticker, poll, voice)."""
@@ -58,26 +64,35 @@ class TransferEngine:
         return {"ok": True, "dedup": False, "similar": None}
 
     async def transfer_album(self, target_entity, messages: list) -> bool:
-        """Transfer a media group (album) as a single album."""
+        """Transfer a media group (album) as a single album.
+        Atomic: if any download fails, nothing is uploaded.
+        """
         job_dir = os.path.join(self.tmp_dir, "album")
         os.makedirs(job_dir, exist_ok=True)
 
-        files = []
         caption = None
-        try:
-            for msg in messages:
-                path = await self.client.download_media(msg, file=job_dir)
-                if path:
-                    files.append(path)
-                if msg.text and not caption:
-                    caption = msg.text
+        for msg in messages:
+            if msg.text and not caption:
+                caption = msg.text
 
-            if files:
-                await self.client.send_file(
-                    target_entity, files, caption=caption
-                )
-                return True
-            return False
+        try:
+            # Parallel download
+            download_tasks = [
+                self.client.download_media(msg, file=job_dir)
+                for msg in messages
+            ]
+            paths = await asyncio.gather(*download_tasks)
+
+            # Atomic check: all must succeed
+            if any(p is None for p in paths):
+                return False
+
+            file_paths = list(paths)
+
+            await self.client.send_file(
+                target_entity, file_paths, caption=caption,
+            )
+            return True
         finally:
             if os.path.exists(job_dir):
                 shutil.rmtree(job_dir)
@@ -132,9 +147,24 @@ class TransferEngine:
                     target_chat=target_chat, job_id=job_id,
                 )
 
+            # Build upload kwargs
+            upload_kwargs = {"caption": message.text}
+
+            # Add video metadata if applicable
+            if file_type == "video":
+                meta = await ffprobe_metadata(path)
+                if meta:
+                    upload_kwargs["attributes"] = [DocumentAttributeVideo(
+                        duration=meta["duration"],
+                        w=meta["width"],
+                        h=meta["height"],
+                        supports_streaming=True,
+                    )]
+                    upload_kwargs["supports_streaming"] = True
+
             # Upload
             result = await self.client.send_file(
-                target_entity, path, caption=message.text
+                target_entity, path, **upload_kwargs
             )
 
             # Record success
@@ -182,6 +212,12 @@ class TransferEngine:
         processed = 0
 
         while True:
+            # Check cancel
+            if job_id in self._cancelled:
+                self._cancelled.discard(job_id)
+                await self.db.update_job_status(job_id, "cancelled")
+                return "cancelled"
+
             msg_row = await self.db.get_next_pending(job_id)
             if msg_row is None:
                 break  # all done

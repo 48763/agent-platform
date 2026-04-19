@@ -5,17 +5,30 @@ from core.models import AgentInfo, TaskRequest
 from hub.registry import AgentRegistry
 from hub.task_manager import TaskManager
 from hub.router import Router
-from hub.cli import send_task_to_agent
 from hub.gemini_fallback import gemini_unified_route, GeminiChat
 from hub.dashboard import (
     handle_dashboard, handle_dashboard_tasks,
     handle_task_close, handle_task_reopen, handle_task_delete,
     handle_dashboard_agents, handle_agent_disable, handle_agent_enable,
 )
+
+
+async def handle_dashboard_gateways(request: web.Request) -> web.Response:
+    gateways = request.app.get("gateway_connections", [])
+    result = []
+    for gw in gateways:
+        if gw.get("ws") and not gw["ws"].closed:
+            result.append({
+                "mode": gw.get("mode"),
+                "phone": gw.get("phone"),
+                "allowed_chats": gw.get("allowed_chats"),
+            })
+    return web.json_response({"gateways": result})
 from hub.auth import (
     check_session, is_auth_enabled,
     handle_login_page, handle_login, handle_logout,
 )
+from hub.ws_handler import handle_agent_ws, handle_gateway_ws
 
 DB_PATH = os.environ.get("TASKS_DB_PATH", "/data/tasks.db")
 
@@ -29,7 +42,7 @@ def create_hub_app(
     async def auth_middleware(request, handler):
         # Skip auth for API routes and auth routes
         path = request.path
-        no_auth_prefixes = ("/register", "/heartbeat", "/agents", "/dispatch", "/set_message_id", "/auth/")
+        no_auth_prefixes = ("/register", "/agents", "/dispatch", "/set_message_id", "/auth/", "/ws/")
         if any(path.startswith(p) for p in no_auth_prefixes):
             return await handler(request)
 
@@ -50,6 +63,7 @@ def create_hub_app(
     app["router"] = router
     app["chat"] = chat
     app["use_gemini_fallback"] = use_gemini_fallback
+    app["gateway_connections"] = []
 
     # Auth routes (no auth required)
     app.router.add_get("/auth/login", handle_login_page)
@@ -59,7 +73,6 @@ def create_hub_app(
     # API routes (no auth — used by agents and gateway)
     app.router.add_post("/register", handle_register)
     app.router.add_post("/register_error", handle_register_error)
-    app.router.add_post("/heartbeat", handle_heartbeat)
     app.router.add_get("/agents", handle_list_agents)
     app.router.add_post("/dispatch", handle_dispatch)
     app.router.add_post("/set_message_id", handle_set_message_id)
@@ -72,6 +85,11 @@ def create_hub_app(
     app.router.add_post("/dashboard/agent/{name}/disable", handle_agent_disable)
     app.router.add_post("/dashboard/agent/{name}/enable", handle_agent_enable)
     app.router.add_get("/dashboard/agent/{name}/proxy", handle_agent_dashboard_proxy)
+    app.router.add_get("/dashboard/gateways", handle_dashboard_gateways)
+
+    # WebSocket routes (no auth — used by agents and gateway)
+    app.router.add_get("/ws/agent/{name}", handle_agent_ws)
+    app.router.add_get("/ws/gateway", handle_gateway_ws)
 
     return app
 
@@ -92,15 +110,6 @@ async def handle_register_error(request: web.Request) -> web.Response:
     error = data.get("error", "unknown error")
     request.app["registry"].register_error(name, error)
     return web.json_response({"status": "recorded", "name": name})
-
-
-async def handle_heartbeat(request: web.Request) -> web.Response:
-    data = await request.json()
-    name = data["name"]
-    success = request.app["registry"].heartbeat(name)
-    if not success:
-        return web.json_response({"error": "agent not found"}, status=404)
-    return web.json_response({"status": "ok"})
 
 
 async def handle_list_agents(request: web.Request) -> web.Response:
@@ -281,61 +290,45 @@ async def _continue_task(request: web.Request, task: dict, message: str) -> web.
             })
         return web.json_response({"status": "error", "message": "無法處理此訊息"})
 
-    # Agent task
-    agent_info = request.app["registry"].get(task["agent_name"])
-    if agent_info is None:
+    # Agent task — send via WS
+    registry = request.app["registry"]
+    agent_ws = registry.get_ws(task["agent_name"])
+    if agent_ws is None:
         return web.json_response({"status": "error", "message": "Agent 已離線"})
 
-    task_request = TaskRequest(
+    from core.ws import ws_msg, MsgType
+    await agent_ws.send_str(ws_msg(MsgType.TASK,
         task_id=task["task_id"],
         content=message,
         conversation_history=task["conversation_history"],
-    )
-    result = await send_task_to_agent(agent_info.url, task_request)
+        chat_id=task["chat_id"],
+    ))
 
-    _update_task_status(task_manager, task["task_id"], result)
-
-    if result.get("message"):
-        task_manager.append_assistant_response(task["task_id"], result["message"])
-
-    result["task_id"] = task["task_id"]
-    return web.json_response(result)
+    # Task dispatched via WS — result will come back asynchronously
+    return web.json_response({
+        "status": "working",
+        "message": "處理中...",
+        "task_id": task["task_id"],
+    })
 
 
 async def _dispatch_to_agent(request: web.Request, task: dict, message: str) -> dict:
-    """Dispatch a new task to an agent."""
-    import time as _time
-    task_manager = request.app["task_manager"]
+    """Dispatch a new task to an agent via WS."""
     registry = request.app["registry"]
-    agent_info = registry.get(task["agent_name"])
+    agent_ws = registry.get_ws(task["agent_name"])
 
-    task_request = TaskRequest(
+    if agent_ws is None:
+        return {"status": "error", "message": "Agent 已離線", "task_id": task["task_id"]}
+
+    from core.ws import ws_msg, MsgType
+    await agent_ws.send_str(ws_msg(MsgType.TASK,
         task_id=task["task_id"],
         content=message,
         conversation_history=task["conversation_history"],
-    )
+        chat_id=task["chat_id"],
+    ))
 
-    start = _time.time()
-    result = await send_task_to_agent(agent_info.url, task_request)
-    duration_ms = int((_time.time() - start) * 1000)
-
-    success = result.get("status") != "error"
-    registry.record_task_result(task["agent_name"], success, duration_ms)
-
-    _update_task_status(task_manager, task["task_id"], result)
-
-    if result.get("message"):
-        task_manager.append_assistant_response(task["task_id"], result["message"])
-
-    result["task_id"] = task["task_id"]
-    return result
+    # Task dispatched via WS — result comes back asynchronously
+    return {"status": "working", "message": "處理中...", "task_id": task["task_id"]}
 
 
-def _update_task_status(task_manager: TaskManager, task_id: str, result: dict):
-    status = result.get("status")
-    if status == "done":
-        task_manager.complete_task(task_id)
-    elif status == "need_input":
-        task_manager.update_status(task_id, "waiting_input")
-    elif status == "need_approval":
-        task_manager.update_status(task_id, "waiting_approval")

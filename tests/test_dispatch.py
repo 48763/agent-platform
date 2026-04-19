@@ -1,12 +1,13 @@
 # tests/test_dispatch.py
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, MagicMock
 from hub.server import create_hub_app
 from core.models import AgentInfo
 
 
 @pytest.mark.asyncio
-async def test_dispatch_routes_to_agent(aiohttp_client, tmp_db):
+async def test_dispatch_routes_to_agent_no_ws(aiohttp_client, tmp_db):
+    """When agent has no WS connection, dispatch returns 'Agent 已離線'."""
     app = create_hub_app(db_path=tmp_db, use_gemini_fallback=False)
     client = await aiohttp_client(app)
 
@@ -18,15 +19,12 @@ async def test_dispatch_routes_to_agent(aiohttp_client, tmp_db):
     )
     await client.post("/register", json=info.to_dict())
 
-    mock_result = {"status": "done", "message": "台北 25°C"}
-    with patch("hub.server.send_task_to_agent", new_callable=AsyncMock) as mock_send:
-        mock_send.return_value = mock_result
-        resp = await client.post("/dispatch", json={"message": "台北天氣", "chat_id": 0})
-
+    resp = await client.post("/dispatch", json={"message": "台北天氣", "chat_id": 0})
     assert resp.status == 200
     data = await resp.json()
-    assert data["status"] == "done"
-    assert data["message"] == "台北 25°C"
+    # Agent registered but no WS connection → offline
+    assert data["status"] == "error"
+    assert "離線" in data["message"]
 
 
 @pytest.mark.asyncio

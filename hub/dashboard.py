@@ -96,6 +96,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="stats" id="stats"></div>
 
         <div class="section">
+            <div class="section-header" onclick="toggleSection('gateways')">
+                <span>Gateway 連線 <span class="section-toggle" id="gateways-toggle">&#x25BC;</span></span>
+                <span style="font-size:0.8em;font-weight:normal" id="gateways-count"></span>
+            </div>
+            <div class="section-body" id="gateways-body">
+                <div id="gateways"></div>
+            </div>
+        </div>
+
+        <div class="section">
             <div class="section-header" onclick="toggleSection('agents')">
                 <span>Agents <span class="section-toggle" id="agents-toggle">&#x25BC;</span></span>
                 <span style="font-size:0.8em;font-weight:normal" id="agents-count"></span>
@@ -233,7 +243,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                             <div class="agent-stat"><span class="agent-stat-label">成功率:</span> <span class="agent-stat-value">${successRate}%</span></div>
                             <div class="agent-stat"><span class="agent-stat-label">平均回應:</span> <span class="agent-stat-value">${s.avg_response_ms}ms</span></div>
                             <div class="agent-stat"><span class="agent-stat-label">在線時長:</span> <span class="agent-stat-value">${duration(a.uptime_seconds)}</span></div>
-                            <div class="agent-stat"><span class="agent-stat-label">最後心跳:</span> <span class="agent-stat-value">${timeAgo(a.last_heartbeat)}</span></div>
+                            <div class="agent-stat"><span class="agent-stat-label">WS:</span> <span class="agent-stat-value">${a.ws_connected ? '已連線' : '未連線'}</span></div>
                         </div>
                         <div class="agent-patterns"><span class="agent-stat-label" style="font-size:0.8em;margin-right:4px">關鍵字:</span>${patterns}</div>
                     </div>
@@ -343,11 +353,37 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             renderTasks();
         }
 
+        async function loadGateways() {
+            const res = await fetch('/dashboard/gateways');
+            const data = await res.json();
+            document.getElementById('gateways-count').textContent = data.gateways.length + ' 個連線';
+            const el = document.getElementById('gateways');
+            if (!data.gateways.length) {
+                el.innerHTML = '<div class="empty">沒有 Gateway 連線</div>';
+                return data.gateways.length;
+            }
+            el.innerHTML = data.gateways.map(g => `
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Gateway (${g.mode || 'unknown'})</span>
+                        <span class="badge badge-online">已連線</span>
+                    </div>
+                    <div class="meta">
+                        ${g.phone ? '<span class="meta-item">📱 ' + g.phone + '</span>' : ''}
+                        ${g.allowed_chats ? '<span class="meta-item">💬 ' + g.allowed_chats.length + ' 個群組</span>' : ''}
+                    </div>
+                </div>
+            `).join('');
+            return data.gateways.length;
+        }
+
         async function loadAll() {
             const agentCount = await loadAgents();
             const taskInfo = await loadTasks();
+            const gwCount = await loadGateways();
             document.getElementById('stats').innerHTML = `
                 <div class="stat"><div class="stat-value">${agentCount}</div><div class="stat-label">在線 Agent</div></div>
+                <div class="stat"><div class="stat-value">${gwCount}</div><div class="stat-label">Gateway 連線</div></div>
                 <div class="stat"><div class="stat-value">${taskInfo.active}</div><div class="stat-label">處理中</div></div>
                 <div class="stat"><div class="stat-value">${taskInfo.total}</div><div class="stat-label">全部對話</div></div>
             `;
@@ -415,7 +451,18 @@ async def handle_dashboard_tasks(request: web.Request) -> web.Response:
 
 async def handle_task_close(request: web.Request) -> web.Response:
     task_id = request.match_info["task_id"]
-    request.app["task_manager"].close_task(task_id)
+    task_manager = request.app["task_manager"]
+    task = task_manager.get_task(task_id)
+
+    if task and task["status"] in ("working", "waiting_input", "waiting_approval"):
+        # Send cancel to agent via WS
+        registry = request.app["registry"]
+        agent_ws = registry.get_ws(task["agent_name"])
+        if agent_ws:
+            from core.ws import ws_msg, MsgType
+            await agent_ws.send_str(ws_msg(MsgType.CANCEL, task_id=task_id))
+
+    task_manager.close_task(task_id)
     return web.json_response({"status": "ok"})
 
 
