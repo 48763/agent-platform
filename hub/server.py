@@ -12,6 +12,19 @@ from hub.dashboard import (
     handle_task_close, handle_task_reopen, handle_task_delete,
     handle_dashboard_agents, handle_agent_disable, handle_agent_enable,
 )
+
+
+async def handle_dashboard_gateways(request: web.Request) -> web.Response:
+    gateways = request.app.get("gateway_connections", [])
+    result = []
+    for gw in gateways:
+        if gw.get("ws") and not gw["ws"].closed:
+            result.append({
+                "mode": gw.get("mode"),
+                "phone": gw.get("phone"),
+                "allowed_chats": gw.get("allowed_chats"),
+            })
+    return web.json_response({"gateways": result})
 from hub.auth import (
     check_session, is_auth_enabled,
     handle_login_page, handle_login, handle_logout,
@@ -74,6 +87,7 @@ def create_hub_app(
     app.router.add_post("/dashboard/agent/{name}/disable", handle_agent_disable)
     app.router.add_post("/dashboard/agent/{name}/enable", handle_agent_enable)
     app.router.add_get("/dashboard/agent/{name}/proxy", handle_agent_dashboard_proxy)
+    app.router.add_get("/dashboard/gateways", handle_dashboard_gateways)
 
     # WebSocket routes (no auth — used by agents and gateway)
     app.router.add_get("/ws/agent/{name}", handle_agent_ws)
