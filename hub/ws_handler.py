@@ -136,9 +136,11 @@ async def _handle_agent_result(app: web.Application, data: dict):
             app,
             task["chat_id"],
             ws_msg(MsgType.REPLY,
+                   chat_id=task["chat_id"],
                    task_id=task_id,
                    status=status or "done",
-                   message=message),
+                   message=message,
+                   options=data.get("options")),
         )
 
 
@@ -155,6 +157,7 @@ async def _forward_progress_to_gateway(app: web.Application, data: dict):
         app,
         task["chat_id"],
         ws_msg(MsgType.PROGRESS,
+               chat_id=task["chat_id"],
                task_id=task_id,
                message=data.get("message", "")),
     )
@@ -189,6 +192,7 @@ async def _close_agent_tasks(task_manager: TaskManager, agent_name: str, app: we
             app,
             task["chat_id"],
             ws_msg(MsgType.REPLY,
+                   chat_id=task["chat_id"],
                    task_id=task["task_id"],
                    status="error",
                    message=f"Agent {agent_name} 已斷線"),
@@ -218,9 +222,9 @@ async def _handle_gateway_dispatch(app: web.Application, gw_ws: web.WebSocketRes
         active = task_manager.get_active_task_for_chat(chat_id)
         if active:
             task_manager.complete_task(active["task_id"])
-            await gw_ws.send_str(ws_msg(MsgType.REPLY, status="done", message="對話已結束"))
+            await gw_ws.send_str(ws_msg(MsgType.REPLY, chat_id=chat_id, status="done", message="對話已結束"))
         else:
-            await gw_ws.send_str(ws_msg(MsgType.REPLY, status="done", message="沒有進行中的對話"))
+            await gw_ws.send_str(ws_msg(MsgType.REPLY, chat_id=chat_id, status="done", message="沒有進行中的對話"))
         return
 
     # Priority 1: Reply to a specific bot message -> exact task match
@@ -282,7 +286,7 @@ async def _handle_gateway_dispatch(app: web.Application, gw_ws: web.WebSocketRes
         return
 
     # No gemini fallback - error
-    await gw_ws.send_str(ws_msg(MsgType.REPLY, status="error", message="無法處理此訊息"))
+    await gw_ws.send_str(ws_msg(MsgType.REPLY, chat_id=chat_id, status="error", message="無法處理此訊息"))
 
 
 def _get_all_active_tasks(task_manager: TaskManager, chat_id: int) -> list[dict]:
@@ -312,27 +316,29 @@ async def _continue_task_ws(app: web.Application, gw_ws: web.WebSocketResponse,
             task_manager.append_assistant_response(task["task_id"], reply)
             task_manager.complete_task(task["task_id"])
             await gw_ws.send_str(ws_msg(MsgType.REPLY,
+                                        chat_id=chat_id,
                                         task_id=task["task_id"],
                                         status="done",
                                         message=reply))
         else:
-            await gw_ws.send_str(ws_msg(MsgType.REPLY, status="error", message="無法處理此訊息"))
+            await gw_ws.send_str(ws_msg(MsgType.REPLY, chat_id=chat_id, status="error", message="無法處理此訊息"))
         return
 
     # Agent task: send via WS
     agent_ws = registry.get_ws(task["agent_name"])
     if agent_ws is None:
-        await gw_ws.send_str(ws_msg(MsgType.REPLY, status="error", message="Agent 已離線"))
+        await gw_ws.send_str(ws_msg(MsgType.REPLY, chat_id=chat_id, status="error", message="Agent 已離線"))
         return
 
     try:
         await agent_ws.send_str(ws_msg(MsgType.TASK,
                                        task_id=task["task_id"],
                                        content=message,
-                                       conversation_history=task["conversation_history"]))
+                                       conversation_history=task["conversation_history"],
+                                       chat_id=chat_id))
     except Exception:
         logger.exception("Failed to send task to agent %s via WS", task["agent_name"])
-        await gw_ws.send_str(ws_msg(MsgType.REPLY, status="error", message="Agent 通訊失敗"))
+        await gw_ws.send_str(ws_msg(MsgType.REPLY, chat_id=chat_id, status="error", message="Agent 通訊失敗"))
 
 
 async def _dispatch_to_agent_ws(app: web.Application, gw_ws: web.WebSocketResponse,
@@ -342,17 +348,18 @@ async def _dispatch_to_agent_ws(app: web.Application, gw_ws: web.WebSocketRespon
     agent_ws = registry.get_ws(task["agent_name"])
 
     if agent_ws is None:
-        await gw_ws.send_str(ws_msg(MsgType.REPLY, status="error", message="Agent 已離線"))
+        await gw_ws.send_str(ws_msg(MsgType.REPLY, chat_id=chat_id, status="error", message="Agent 已離線"))
         return
 
     try:
         await agent_ws.send_str(ws_msg(MsgType.TASK,
                                        task_id=task["task_id"],
                                        content=message,
-                                       conversation_history=task["conversation_history"]))
+                                       conversation_history=task["conversation_history"],
+                                       chat_id=chat_id))
     except Exception:
         logger.exception("Failed to dispatch task to agent %s via WS", task["agent_name"])
-        await gw_ws.send_str(ws_msg(MsgType.REPLY, status="error", message="Agent 通訊失敗"))
+        await gw_ws.send_str(ws_msg(MsgType.REPLY, chat_id=chat_id, status="error", message="Agent 通訊失敗"))
 
 
 async def _hub_chat_reply_ws(app: web.Application, gw_ws: web.WebSocketResponse,
@@ -374,15 +381,16 @@ async def _hub_chat_reply_ws(app: web.Application, gw_ws: web.WebSocketResponse,
                 agent_name="_hub", chat_id=chat_id, content=message, source=source,
             )
         else:
-            await gw_ws.send_str(ws_msg(MsgType.REPLY, status="error", message="無法處理此訊息"))
+            await gw_ws.send_str(ws_msg(MsgType.REPLY, chat_id=chat_id, status="error", message="無法處理此訊息"))
             return
 
     if reply:
         task_manager.append_assistant_response(task["task_id"], reply)
         task_manager.complete_task(task["task_id"])
         await gw_ws.send_str(ws_msg(MsgType.REPLY,
+                                    chat_id=chat_id,
                                     task_id=task["task_id"],
                                     status="done",
                                     message=reply))
     else:
-        await gw_ws.send_str(ws_msg(MsgType.REPLY, status="error", message="無法處理此訊息"))
+        await gw_ws.send_str(ws_msg(MsgType.REPLY, chat_id=chat_id, status="error", message="無法處理此訊息"))
