@@ -5,7 +5,6 @@ from core.models import AgentInfo, TaskRequest
 from hub.registry import AgentRegistry
 from hub.task_manager import TaskManager
 from hub.router import Router
-from hub.cli import send_task_to_agent
 from hub.gemini_fallback import gemini_unified_route, GeminiChat
 from hub.dashboard import (
     handle_dashboard, handle_dashboard_tasks,
@@ -43,7 +42,7 @@ def create_hub_app(
     async def auth_middleware(request, handler):
         # Skip auth for API routes and auth routes
         path = request.path
-        no_auth_prefixes = ("/register", "/heartbeat", "/agents", "/dispatch", "/set_message_id", "/auth/", "/ws/")
+        no_auth_prefixes = ("/register", "/agents", "/dispatch", "/set_message_id", "/auth/", "/ws/")
         if any(path.startswith(p) for p in no_auth_prefixes):
             return await handler(request)
 
@@ -74,7 +73,6 @@ def create_hub_app(
     # API routes (no auth — used by agents and gateway)
     app.router.add_post("/register", handle_register)
     app.router.add_post("/register_error", handle_register_error)
-    app.router.add_post("/heartbeat", handle_heartbeat)
     app.router.add_get("/agents", handle_list_agents)
     app.router.add_post("/dispatch", handle_dispatch)
     app.router.add_post("/set_message_id", handle_set_message_id)
@@ -112,15 +110,6 @@ async def handle_register_error(request: web.Request) -> web.Response:
     error = data.get("error", "unknown error")
     request.app["registry"].register_error(name, error)
     return web.json_response({"status": "recorded", "name": name})
-
-
-async def handle_heartbeat(request: web.Request) -> web.Response:
-    data = await request.json()
-    name = data["name"]
-    success = request.app["registry"].heartbeat(name)
-    if not success:
-        return web.json_response({"error": "agent not found"}, status=404)
-    return web.json_response({"status": "ok"})
 
 
 async def handle_list_agents(request: web.Request) -> web.Response:

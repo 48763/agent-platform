@@ -6,12 +6,6 @@ from hub.router import Router
 from hub.task_manager import TaskManager
 
 
-async def send_task_to_agent(agent_url: str, task: TaskRequest) -> dict:
-    async with ClientSession() as session:
-        async with session.post(f"{agent_url}/task", json=task.to_dict()) as resp:
-            return await resp.json()
-
-
 async def dispatch_message(
     message: str,
     router: Router,
