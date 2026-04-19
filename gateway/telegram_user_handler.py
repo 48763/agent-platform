@@ -99,15 +99,18 @@ class TelegramUserHandler:
     def _setup_handlers(self):
         @self.client.on(events.NewMessage)
         async def handler(event):
+            logger.debug(f"NewMessage: chat_id={event.chat_id} out={event.out} text={bool(event.text)} reply={bool(event.reply_to)}")
             if event.out:
                 return
             if self.allowed_chats and event.chat_id not in self.allowed_chats:
+                logger.debug(f"Skipped: chat_id={event.chat_id} not in allowed_chats={self.allowed_chats}")
                 return
             if not event.text:
                 return
 
             chat_id = event.chat_id
             message = event.text
+            logger.info(f"Dispatching message from chat_id={chat_id}: {message[:50]}")
 
             if event.reply_to and event.reply_to.reply_to_msg_id:
                 reply_to_message_id = event.reply_to.reply_to_msg_id
