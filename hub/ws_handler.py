@@ -146,7 +146,7 @@ async def _handle_agent_result(app: web.Application, data: dict):
 
 
 async def _forward_progress_to_gateway(app: web.Application, data: dict):
-    """Forward a progress message from agent to gateway."""
+    """Forward a progress message from agent to gateway and record in task history."""
     task_manager: TaskManager = app["task_manager"]
     task_id = data.get("task_id")
     if not task_id:
@@ -154,6 +154,11 @@ async def _forward_progress_to_gateway(app: web.Application, data: dict):
     task = task_manager.get_task(task_id)
     if not task:
         return
+
+    # Record progress in conversation history so dashboard shows it
+    message = data.get("message", "")
+    if message:
+        task_manager.append_assistant_response(task_id, message)
     await _send_to_gateway(
         app,
         task["chat_id"],

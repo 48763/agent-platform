@@ -385,15 +385,17 @@ class TGTransferAgent(BaseAgent):
 
         chat_id = self._current_chat_id.get(task_id, 0)
 
+        # Notify user via progress (not result, so task stays active)
+        await self.ws_send_progress(task_id, chat_id,
+            f"開始搬移 {len(msg_ids)} 則訊息\n來源：{job['source_chat']}\n目標：{job['target_chat']}")
+
         # Start batch in event loop (non-blocking)
         asyncio.create_task(
             self._run_batch_background(task_id, job_id, job, source_entity, target_entity, chat_id)
         )
 
-        return AgentResult(
-            status=TaskStatus.DONE,
-            message=f"開始搬移 {len(msg_ids)} 則訊息\n來源：{job['source_chat']}\n目標：{job['target_chat']}",
-        )
+        # Return None — result will be sent by _run_batch_background when done
+        return None
 
     async def _run_batch_background(self, task_id: str, job_id: str, job: dict,
                                      source_entity, target_entity, chat_id: int):
@@ -438,20 +440,19 @@ class TGTransferAgent(BaseAgent):
         finally:
             self._pending_jobs.pop(task_id, None)
 
-    async def _resume_batch(self, task_id: str, job_id: str, job: dict) -> AgentResult:
+    async def _resume_batch(self, task_id: str, job_id: str, job: dict):
         """Resume a paused batch job (non-blocking)."""
         source_entity = await resolve_chat(self.tg_client, job["source_chat"])
         target_entity = await resolve_chat(self.tg_client, job["target_chat"])
         chat_id = self._current_chat_id.get(task_id, 0)
 
+        await self.ws_send_progress(task_id, chat_id, "繼續搬移中...")
+
         asyncio.create_task(
             self._run_batch_background(task_id, job_id, job, source_entity, target_entity, chat_id)
         )
 
-        return AgentResult(
-            status=TaskStatus.DONE,
-            message="繼續搬移中...",
-        )
+        return None  # result sent by _run_batch_background
 
     async def _ai_parse_batch(self, content: str) -> dict | None:
         """Use LLM to parse natural language batch command."""

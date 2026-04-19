@@ -159,7 +159,10 @@ class BaseAgent(ABC):
             result = AgentResult(status=TaskStatus.ERROR, message=f"執行失敗：{e}")
 
         self._cancelled_tasks.discard(task.task_id)
-        await self.ws_send_result(task.task_id, result)
+
+        # None means task is handled asynchronously (e.g. background batch)
+        if result is not None:
+            await self.ws_send_result(task.task_id, result)
 
     async def run(self) -> None:
         # Check LLM auth if configured
