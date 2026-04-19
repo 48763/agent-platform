@@ -60,26 +60,35 @@ class TransferEngine:
         return {"ok": True, "dedup": False, "similar": None}
 
     async def transfer_album(self, target_entity, messages: list) -> bool:
-        """Transfer a media group (album) as a single album."""
+        """Transfer a media group (album) as a single album.
+        Atomic: if any download fails, nothing is uploaded.
+        """
         job_dir = os.path.join(self.tmp_dir, "album")
         os.makedirs(job_dir, exist_ok=True)
 
-        files = []
         caption = None
-        try:
-            for msg in messages:
-                path = await self.client.download_media(msg, file=job_dir)
-                if path:
-                    files.append(path)
-                if msg.text and not caption:
-                    caption = msg.text
+        for msg in messages:
+            if msg.text and not caption:
+                caption = msg.text
 
-            if files:
-                await self.client.send_file(
-                    target_entity, files, caption=caption
-                )
-                return True
-            return False
+        try:
+            # Parallel download
+            download_tasks = [
+                self.client.download_media(msg, file=job_dir)
+                for msg in messages
+            ]
+            paths = await asyncio.gather(*download_tasks)
+
+            # Atomic check: all must succeed
+            if any(p is None for p in paths):
+                return False
+
+            file_paths = list(paths)
+
+            await self.client.send_file(
+                target_entity, file_paths, caption=caption,
+            )
+            return True
         finally:
             if os.path.exists(job_dir):
                 shutil.rmtree(job_dir)

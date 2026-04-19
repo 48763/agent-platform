@@ -139,3 +139,43 @@ async def test_transfer_media_video_sends_attributes(engine, mock_client, tmp_pa
     assert attrs[0].duration == 120
     assert attrs[0].w == 1920
     assert attrs[0].h == 1080
+
+
+@pytest.mark.asyncio
+async def test_transfer_album_atomic_download_failure(engine, mock_client, tmp_path):
+    """If any media in album fails to download, entire album should fail."""
+    target_entity = MagicMock()
+    msg1 = _make_message(301, text="caption", grouped_id=10)
+    msg2 = _make_message(302, grouped_id=10)
+
+    download_results = [str(tmp_path / "file1.jpg"), None]
+    mock_client.download_media = AsyncMock(side_effect=download_results)
+    mock_client.send_file = AsyncMock()
+
+    result = await engine.transfer_album(target_entity, [msg1, msg2])
+
+    assert result is False
+    mock_client.send_file.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_transfer_album_parallel_download(engine, mock_client, tmp_path):
+    """Album downloads should succeed when all files download."""
+    target_entity = MagicMock()
+    msg1 = _make_message(401, text="caption", grouped_id=20)
+    msg2 = _make_message(402, grouped_id=20)
+
+    path1 = str(tmp_path / "downloads" / "album" / "file1.jpg")
+    path2 = str(tmp_path / "downloads" / "album" / "file2.jpg")
+    os.makedirs(os.path.dirname(path1), exist_ok=True)
+    for p in [path1, path2]:
+        with open(p, "wb") as f:
+            f.write(b"\x00" * 10)
+
+    mock_client.download_media = AsyncMock(side_effect=[path1, path2])
+    mock_client.send_file = AsyncMock()
+
+    result = await engine.transfer_album(target_entity, [msg1, msg2])
+
+    assert result is True
+    mock_client.send_file.assert_called_once()
