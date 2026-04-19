@@ -4,10 +4,12 @@ import logging
 import asyncio
 from typing import Callable, Optional, Any
 from telethon import TelegramClient
+from telethon.tl.types import DocumentAttributeVideo
 from agents.tg_transfer.db import TransferDB
 from agents.tg_transfer.hasher import compute_sha256, compute_phash, compute_phash_video, hamming_distance
 from agents.tg_transfer.media_db import MediaDB
 from agents.tg_transfer.tag_extractor import extract_tags
+from agents.tg_transfer.media_utils import ffprobe_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -132,9 +134,24 @@ class TransferEngine:
                     target_chat=target_chat, job_id=job_id,
                 )
 
+            # Build upload kwargs
+            upload_kwargs = {"caption": message.text}
+
+            # Add video metadata if applicable
+            if file_type == "video":
+                meta = await ffprobe_metadata(path)
+                if meta:
+                    upload_kwargs["attributes"] = [DocumentAttributeVideo(
+                        duration=meta["duration"],
+                        w=meta["width"],
+                        h=meta["height"],
+                        supports_streaming=True,
+                    )]
+                    upload_kwargs["supports_streaming"] = True
+
             # Upload
             result = await self.client.send_file(
-                target_entity, path, caption=message.text
+                target_entity, path, **upload_kwargs
             )
 
             # Record success
