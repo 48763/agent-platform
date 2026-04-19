@@ -22,9 +22,10 @@ class MyAgent(BaseAgent):
 Agent 基底類別，繼承即可使用。自動處理：
 - LLM 認證檢測（API key 或 CLI login）
 - `_init_services()` 初始化（失敗不 crash，回報 Hub 顯示在 Dashboard）
-- HTTP server（`/task` 和 `/health` 端點）
-- Hub 註冊（name、description、route_patterns、priority、auth/error 狀態）
-- 每 10 秒 heartbeat（Hub 重啟時自動重新註冊）
+- HTTP server（`/health` 端點，可選 `/dashboard`）
+- Hub 一次性 HTTP 註冊（name、description、route_patterns、priority、auth/error 狀態）
+- WebSocket 長連線到 Hub（自動重連，ping/pong 取代 heartbeat）
+- 透過 WS 接收 task、回傳 result/progress、接收 cancel
 - 載入 `agent.yaml` 設定
 - 初始化 Sandbox 安全限制
 
@@ -33,12 +34,26 @@ Agent 基底類別，繼承即可使用。自動處理：
 BaseAgent.run()
   → LLM 認證檢測（如有設定）
   → _init_services()（agent override 初始化 DB、client 等）
-  → 啟動 HTTP server
-  → 向 Hub 註冊（帶 auth/error 狀態）
-  → heartbeat loop
+  → 啟動 HTTP server（/health、/dashboard）
+  → 向 Hub HTTP 註冊（帶 auth/error 狀態）
+  → WS 連線到 Hub（持久，自動重連）
 ```
 
 任何步驟失敗都不會 crash，agent 帶著錯誤狀態註冊到 Hub。
+
+**WS 相關方法（可在 handle_task 中使用）：**
+```python
+await self.ws_send_progress(task_id, chat_id, "進度 50%")  # 推送進度給用戶
+await self.ws_send_result(task_id, result)                  # 非同步回傳結果
+self.is_cancelled(task_id)                                  # 檢查是否被取消
+```
+
+**override `on_cancel(task_id)` 處理取消：**
+```python
+def on_cancel(self, task_id: str):
+    # Hub 後台或 WS 斷線時觸發
+    self.engine.cancel_job(self._pending_jobs[task_id])
+```
 
 **override `_init_services()`：**
 ```python
@@ -62,6 +77,7 @@ class TaskRequest:
     task_id: str                          # 唯一 task ID
     content: str                          # 使用者訊息內容
     conversation_history: list[dict]      # 完整對話歷史
+    chat_id: int = 0                      # 用戶 chat ID（用於 progress 推送）
     # [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]
 ```
 
