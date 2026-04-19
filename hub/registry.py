@@ -12,6 +12,7 @@ class AgentRegistry:
         self._errors: dict[str, str] = {}  # name → error message
         self._unauthenticated: dict[str, str] = {}  # name → auth error message
         self._has_dashboard: dict[str, bool] = {}  # name → has /dashboard
+        self._ws_connections: dict[str, "web.WebSocketResponse"] = {}  # name → ws
         self._heartbeat_timeout = heartbeat_timeout
 
     def register(self, info: AgentInfo, auth_status: str = None, auth_error: str = None, has_dashboard: bool = False) -> None:
@@ -139,6 +140,25 @@ class AgentRegistry:
     def is_disabled(self, name: str) -> bool:
         return name in self._disabled
 
+    def set_ws(self, name: str, ws):
+        self._ws_connections[name] = ws
+        self._last_heartbeat[name] = time.time()
+
+    def remove_ws(self, name: str):
+        self._ws_connections.pop(name, None)
+
+    def has_ws(self, name: str) -> bool:
+        ws = self._ws_connections.get(name)
+        return ws is not None and not ws.closed
+
+    def get_ws(self, name: str):
+        ws = self._ws_connections.get(name)
+        if ws and not ws.closed:
+            return ws
+        return None
+
     def _is_alive(self, name: str) -> bool:
+        if self.has_ws(name):
+            return True
         last = self._last_heartbeat.get(name, 0)
         return (time.time() - last) < self._heartbeat_timeout

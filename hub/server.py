@@ -16,6 +16,7 @@ from hub.auth import (
     check_session, is_auth_enabled,
     handle_login_page, handle_login, handle_logout,
 )
+from hub.ws_handler import handle_agent_ws, handle_gateway_ws
 
 DB_PATH = os.environ.get("TASKS_DB_PATH", "/data/tasks.db")
 
@@ -29,7 +30,7 @@ def create_hub_app(
     async def auth_middleware(request, handler):
         # Skip auth for API routes and auth routes
         path = request.path
-        no_auth_prefixes = ("/register", "/heartbeat", "/agents", "/dispatch", "/set_message_id", "/auth/")
+        no_auth_prefixes = ("/register", "/heartbeat", "/agents", "/dispatch", "/set_message_id", "/auth/", "/ws/")
         if any(path.startswith(p) for p in no_auth_prefixes):
             return await handler(request)
 
@@ -50,6 +51,7 @@ def create_hub_app(
     app["router"] = router
     app["chat"] = chat
     app["use_gemini_fallback"] = use_gemini_fallback
+    app["gateway_connections"] = []
 
     # Auth routes (no auth required)
     app.router.add_get("/auth/login", handle_login_page)
@@ -72,6 +74,10 @@ def create_hub_app(
     app.router.add_post("/dashboard/agent/{name}/disable", handle_agent_disable)
     app.router.add_post("/dashboard/agent/{name}/enable", handle_agent_enable)
     app.router.add_get("/dashboard/agent/{name}/proxy", handle_agent_dashboard_proxy)
+
+    # WebSocket routes (no auth — used by agents and gateway)
+    app.router.add_get("/ws/agent/{name}", handle_agent_ws)
+    app.router.add_get("/ws/gateway", handle_gateway_ws)
 
     return app
 
