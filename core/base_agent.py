@@ -112,6 +112,12 @@ class BaseAgent(ABC):
                         self._ws = ws
                         logger.info(f"WS connected to Hub: {ws_url}")
 
+                        # Re-register on every WS connect (Hub may have restarted)
+                        try:
+                            await self.register(self._actual_port)
+                        except Exception as e:
+                            logger.warning(f"Re-register failed: {e}")
+
                         async for msg in ws:
                             if msg.type == WSMsgType.TEXT:
                                 data = ws_parse(msg.data)
@@ -186,10 +192,10 @@ class BaseAgent(ABC):
         site = web.TCPSite(runner, "0.0.0.0", self.port)
         await site.start()
 
-        actual_port = site._server.sockets[0].getsockname()[1]
-        print(f"Agent '{self.name}' running on port {actual_port}")
+        self._actual_port = site._server.sockets[0].getsockname()[1]
+        print(f"Agent '{self.name}' running on port {self._actual_port}")
 
-        await self.register(actual_port)
+        await self.register(self._actual_port)
 
         # Start WS connection (runs forever, auto-reconnects)
         await self._ws_loop()
