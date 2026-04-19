@@ -85,6 +85,7 @@ class TelegramHandler:
 
                         await ws.send_json({
                             "type": MsgType.GW_REGISTER.value,
+                            "platform": "telegram",
                             "mode": "bot",
                         })
 

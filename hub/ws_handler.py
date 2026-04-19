@@ -65,7 +65,7 @@ async def handle_gateway_ws(request: web.Request) -> web.WebSocketResponse:
     await ws.prepare(request)
 
     gw_connections: list = request.app["gateway_connections"]
-    gw_info = {"ws": ws, "mode": None, "phone": None, "allowed_chats": None}
+    gw_info = {"ws": ws, "platform": None, "mode": None, "phone": None, "allowed_chats": None}
     gw_connections.append(gw_info)
     logger.info("Gateway WS connected (total: %d)", len(gw_connections))
 
@@ -80,10 +80,11 @@ async def handle_gateway_ws(request: web.Request) -> web.WebSocketResponse:
 
                 msg_type = data.get("type")
                 if msg_type == MsgType.GW_REGISTER.value:
+                    gw_info["platform"] = data.get("platform")
                     gw_info["mode"] = data.get("mode")
                     gw_info["phone"] = data.get("phone")
                     gw_info["allowed_chats"] = data.get("allowed_chats")
-                    logger.info("Gateway registered: mode=%s phone=%s", gw_info["mode"], gw_info["phone"])
+                    logger.info("Gateway registered: platform=%s mode=%s phone=%s", gw_info["platform"], gw_info["mode"], gw_info["phone"])
                 elif msg_type == MsgType.DISPATCH.value:
                     await _handle_gateway_dispatch(request.app, ws, data)
                 else:

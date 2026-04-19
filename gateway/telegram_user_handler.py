@@ -147,6 +147,7 @@ class TelegramUserHandler:
                         phone_masked = self.phone[:4] + "***" + self.phone[-3:] if self.phone else None
                         await ws.send_json({
                             "type": MsgType.GW_REGISTER.value,
+                            "platform": "telegram",
                             "mode": "userbot",
                             "phone": phone_masked,
                             "allowed_chats": self.allowed_chats,

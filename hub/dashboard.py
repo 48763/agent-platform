@@ -365,7 +365,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             el.innerHTML = data.gateways.map(g => `
                 <div class="card">
                     <div class="card-header">
-                        <span class="card-title">Gateway (${g.mode || 'unknown'})</span>
+                        <span class="card-title">${g.platform || 'unknown'} — ${g.mode || 'unknown'}</span>
                         <span class="badge badge-online">已連線</span>
                     </div>
                     <div class="meta">

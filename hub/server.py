@@ -19,6 +19,7 @@ async def handle_dashboard_gateways(request: web.Request) -> web.Response:
     for gw in gateways:
         if gw.get("ws") and not gw["ws"].closed:
             result.append({
+                "platform": gw.get("platform"),
                 "mode": gw.get("mode"),
                 "phone": gw.get("phone"),
                 "allowed_chats": gw.get("allowed_chats"),
