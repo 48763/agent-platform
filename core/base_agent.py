@@ -2,12 +2,16 @@
 import asyncio
 import os
 import sys
+import logging
 from abc import ABC, abstractmethod
-from aiohttp import web, ClientSession
+from aiohttp import web, ClientSession, WSMsgType
 from core.config import load_agent_config
 from core.models import AgentInfo, AgentResult, TaskRequest, TaskStatus
 from core.sandbox import Sandbox
 from core.llm import create_llm_client, check_llm_auth, LLMInitError, LLMClient
+from core.ws import MsgType, ws_msg, ws_parse
+
+logger = logging.getLogger(__name__)
 
 
 class BaseAgent(ABC):
@@ -23,6 +27,8 @@ class BaseAgent(ABC):
         self._llm_authenticated: bool = True
         self._llm_error: str = ""
         self._init_error: str = ""
+        self._ws = None
+        self._cancelled_tasks: set[str] = set()
 
     @abstractmethod
     async def handle_task(self, task: TaskRequest) -> AgentResult:
@@ -36,18 +42,37 @@ class BaseAgent(ABC):
 
     def create_app(self) -> web.Application:
         app = web.Application()
-        app.router.add_post("/task", self._handle_task_http)
         app.router.add_get("/health", self._handle_health)
         return app
 
-    async def _handle_task_http(self, request: web.Request) -> web.Response:
-        data = await request.json()
-        task = TaskRequest.from_dict(data)
-        result = await self.handle_task(task)
-        return web.json_response(result.to_dict())
-
     async def _handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({"name": self.name, "status": "ok"})
+
+    async def ws_send_result(self, task_id: str, result: AgentResult):
+        """Send task result to Hub via WS."""
+        if self._ws and not self._ws.closed:
+            await self._ws.send_str(ws_msg(MsgType.RESULT,
+                task_id=task_id,
+                status=result.status.value,
+                message=result.message,
+                options=result.options,
+            ))
+
+    async def ws_send_progress(self, task_id: str, chat_id: int, message: str):
+        """Send progress update to Hub via WS."""
+        if self._ws and not self._ws.closed:
+            await self._ws.send_str(ws_msg(MsgType.PROGRESS,
+                task_id=task_id,
+                chat_id=chat_id,
+                message=message,
+            ))
+
+    def is_cancelled(self, task_id: str) -> bool:
+        return task_id in self._cancelled_tasks
+
+    def on_cancel(self, task_id: str):
+        """Hook for subclasses to handle task cancellation."""
+        pass
 
     async def register(self, actual_port: int) -> None:
         info = AgentInfo(
@@ -75,31 +100,60 @@ class BaseAgent(ABC):
         async with ClientSession() as session:
             await session.post(f"{self.hub_url}/register", json=data)
 
-    async def _heartbeat_loop(self, actual_port: int, interval: int = 10) -> None:
-        async with ClientSession() as session:
-            while True:
-                try:
-                    async with session.post(
-                        f"{self.hub_url}/heartbeat",
-                        json={"name": self.name},
-                    ) as resp:
-                        if resp.status == 404:
-                            # Hub doesn't know us — re-register
-                            await self.register(actual_port)
-                except Exception:
-                    pass
-                await asyncio.sleep(interval)
+    async def _ws_loop(self) -> None:
+        """Maintain WS connection to Hub. Auto-reconnect on disconnect."""
+        ws_url = self.hub_url.replace("http://", "ws://").replace("https://", "wss://")
+        ws_url = f"{ws_url}/ws/agent/{self.name}"
 
-    async def _register_error(self, error: str) -> None:
-        """Report startup error to Hub."""
+        while True:
+            try:
+                async with ClientSession() as session:
+                    async with session.ws_connect(ws_url, heartbeat=20.0) as ws:
+                        self._ws = ws
+                        logger.info(f"WS connected to Hub: {ws_url}")
+
+                        async for msg in ws:
+                            if msg.type == WSMsgType.TEXT:
+                                data = ws_parse(msg.data)
+                                msg_type = data.get("type")
+
+                                if msg_type == MsgType.TASK.value:
+                                    asyncio.create_task(self._handle_ws_task(data))
+
+                                elif msg_type == MsgType.CANCEL.value:
+                                    task_id = data.get("task_id")
+                                    if task_id:
+                                        self._cancelled_tasks.add(task_id)
+                                        self.on_cancel(task_id)
+                                        logger.info(f"Task cancelled: {task_id}")
+
+                            elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSE):
+                                break
+
+            except Exception as e:
+                logger.warning(f"WS connection lost: {e}")
+
+            self._ws = None
+            logger.info("Reconnecting to Hub in 3 seconds...")
+            await asyncio.sleep(3)
+
+    async def _handle_ws_task(self, data: dict):
+        """Handle incoming task from Hub via WS."""
+        task = TaskRequest(
+            task_id=data["task_id"],
+            content=data["content"],
+            conversation_history=data.get("conversation_history", []),
+            chat_id=data.get("chat_id", 0),
+        )
+
         try:
-            async with ClientSession() as session:
-                await session.post(
-                    f"{self.hub_url}/register_error",
-                    json={"name": self.name, "error": error},
-                )
-        except Exception:
-            pass  # Hub might not be running
+            result = await self.handle_task(task)
+        except Exception as e:
+            logger.error(f"handle_task error: {e}", exc_info=True)
+            result = AgentResult(status=TaskStatus.ERROR, message=f"執行失敗：{e}")
+
+        self._cancelled_tasks.discard(task.task_id)
+        await self.ws_send_result(task.task_id, result)
 
     async def run(self) -> None:
         # Check LLM auth if configured
@@ -136,4 +190,6 @@ class BaseAgent(ABC):
         print(f"Agent '{self.name}' running on port {actual_port}")
 
         await self.register(actual_port)
-        await self._heartbeat_loop(actual_port)
+
+        # Start WS connection (runs forever, auto-reconnects)
+        await self._ws_loop()

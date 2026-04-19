@@ -41,12 +41,14 @@ class TaskRequest:
     task_id: str
     content: str
     conversation_history: list[dict] = field(default_factory=list)
+    chat_id: int = 0
 
     def to_dict(self) -> dict:
         return {
             "task_id": self.task_id,
             "content": self.content,
             "conversation_history": self.conversation_history,
+            "chat_id": self.chat_id,
         }
 
     @classmethod
@@ -55,6 +57,7 @@ class TaskRequest:
             task_id=data["task_id"],
             content=data["content"],
             conversation_history=data.get("conversation_history", []),
+            chat_id=data.get("chat_id", 0),
         )
 
 
