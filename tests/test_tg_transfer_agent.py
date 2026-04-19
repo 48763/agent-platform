@@ -21,6 +21,7 @@ class TestHandleTaskDispatch:
             agent.config = {"settings": {"retry_limit": 3, "progress_interval": 20}}
             agent._pending_jobs = {}
             agent._search_state = {}
+            agent._current_chat_id = {}
             agent.media_db = AsyncMock()
             agent._init_error = ""
 
@@ -50,6 +51,7 @@ class TestHandleTaskDispatch:
             agent.config = {"settings": {"retry_limit": 3, "progress_interval": 20}}
             agent._pending_jobs = {}
             agent._search_state = {}
+            agent._current_chat_id = {}
             agent.media_db = AsyncMock()
             agent._init_error = ""
 
@@ -74,6 +76,7 @@ class TestHandleTaskDispatch:
             agent.config = {"settings": {"retry_limit": 3, "progress_interval": 20}}
             agent._pending_jobs = {}
             agent._search_state = {}
+            agent._current_chat_id = {}
             agent.media_db = AsyncMock()
             agent._init_error = ""
 

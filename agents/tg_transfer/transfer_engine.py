@@ -32,6 +32,10 @@ class TransferEngine:
         self.progress_interval = progress_interval
         self.media_db = media_db
         self.phash_threshold = phash_threshold
+        self._cancelled: set[str] = set()
+
+    def cancel_job(self, job_id: str):
+        self._cancelled.add(job_id)
 
     def should_skip(self, message) -> bool:
         """Check if message type should be skipped (sticker, poll, voice)."""
@@ -208,6 +212,12 @@ class TransferEngine:
         processed = 0
 
         while True:
+            # Check cancel
+            if job_id in self._cancelled:
+                self._cancelled.discard(job_id)
+                await self.db.update_job_status(job_id, "cancelled")
+                return "cancelled"
+
             msg_row = await self.db.get_next_pending(job_id)
             if msg_row is None:
                 break  # all done

@@ -36,6 +36,7 @@ class TGTransferAgent(BaseAgent):
         self.engine: TransferEngine = None
         self._pending_jobs: dict[str, str] = {}  # task_id → job_id
         self._search_state: dict[str, dict] = {}  # task_id → {keyword, page}
+        self._current_chat_id: dict[str, int] = {}  # task_id → chat_id
 
     async def _init_services(self):
         data_dir = os.environ.get("DATA_DIR", "/data/tg_transfer")
@@ -84,11 +85,17 @@ class TGTransferAgent(BaseAgent):
                 status=TaskStatus.ERROR,
                 message=f"Agent 初始化失敗，無法處理任務：{self._init_error}",
             )
+        self._current_chat_id[task.task_id] = task.chat_id
         try:
             return await self._dispatch(task)
         except Exception as e:
             logger.error(f"handle_task error: {e}", exc_info=True)
             return AgentResult(status=TaskStatus.ERROR, message=f"執行失敗：{e}")
+
+    def on_cancel(self, task_id: str):
+        if task_id in self._pending_jobs:
+            job_id = self._pending_jobs[task_id]
+            self.engine.cancel_job(job_id)
 
     async def _dispatch(self, task: TaskRequest) -> AgentResult:
         content = task.content
@@ -356,7 +363,7 @@ class TGTransferAgent(BaseAgent):
             await self.db.mark_message(job_id, row["message_id"], "skipped")
 
     async def _start_batch(self, task_id: str, job_id: str, job: dict) -> AgentResult:
-        """Populate job_messages and start batch transfer."""
+        """Populate job_messages and start batch transfer (non-blocking)."""
         source_entity = await resolve_chat(self.tg_client, job["source_chat"])
         target_entity = await resolve_chat(self.tg_client, job["target_chat"])
 
@@ -364,7 +371,6 @@ class TGTransferAgent(BaseAgent):
         filter_value = json.loads(job["filter_value"]) if job["filter_value"] else None
         messages = await self._collect_messages(source_entity, filter_type, filter_value)
 
-        # Dedup
         already_done = await self.db.get_transferred_message_ids(job["source_chat"], job["target_chat"])
         grouped_ids = {}
         msg_ids = []
@@ -377,61 +383,74 @@ class TGTransferAgent(BaseAgent):
 
         await self.db.add_messages(job_id, msg_ids, grouped_ids)
 
-        async def report_fn(text):
-            pass  # Progress tracked in DB, reported via next handle_task
+        chat_id = self._current_chat_id.get(task_id, 0)
 
-        status = await self.engine.run_batch(job_id, source_entity, target_entity, report_fn)
-
-        if status == "paused":
-            progress = await self.db.get_progress(job_id)
-            return AgentResult(
-                status=TaskStatus.NEED_INPUT,
-                message=f"搬移暫停\n"
-                        f"進度：{progress['success']}/{progress['total']}\n"
-                        f"請選擇：重試 / 跳過 / 一律跳過",
-            )
-
-        del self._pending_jobs[task_id]
-        progress = await self.db.get_progress(job_id)
-        return AgentResult(
-            status=TaskStatus.DONE,
-            message=f"搬移完成\n"
-                    f"來源：{job['source_chat']}\n"
-                    f"目標：{job['target_chat']}\n"
-                    f"成功：{progress['success']} 則\n"
-                    f"跳過：{progress['skipped']} 則\n"
-                    f"失敗：{progress['failed']} 則",
+        # Start batch in event loop (non-blocking)
+        asyncio.create_task(
+            self._run_batch_background(task_id, job_id, job, source_entity, target_entity, chat_id)
         )
 
-    async def _resume_batch(self, task_id: str, job_id: str, job: dict) -> AgentResult:
-        """Resume a paused batch job."""
-        source_entity = await resolve_chat(self.tg_client, job["source_chat"])
-        target_entity = await resolve_chat(self.tg_client, job["target_chat"])
-
-        async def report_fn(text):
-            pass
-
-        status = await self.engine.run_batch(job_id, source_entity, target_entity, report_fn)
-
-        if status == "paused":
-            progress = await self.db.get_progress(job_id)
-            return AgentResult(
-                status=TaskStatus.NEED_INPUT,
-                message=f"搬移暫停\n"
-                        f"進度：{progress['success']}/{progress['total']}\n"
-                        f"請選擇：重試 / 跳過 / 一律跳過",
-            )
-
-        del self._pending_jobs[task_id]
-        progress = await self.db.get_progress(job_id)
         return AgentResult(
             status=TaskStatus.DONE,
-            message=f"搬移完成\n"
-                    f"來源：{job['source_chat']}\n"
-                    f"目標：{job['target_chat']}\n"
-                    f"成功：{progress['success']} 則\n"
-                    f"跳過：{progress['skipped']} 則\n"
-                    f"失敗：{progress['failed']} 則",
+            message=f"開始搬移 {len(msg_ids)} 則訊息\n來源：{job['source_chat']}\n目標：{job['target_chat']}",
+        )
+
+    async def _run_batch_background(self, task_id: str, job_id: str, job: dict,
+                                     source_entity, target_entity, chat_id: int):
+        """Run batch transfer and report via WS."""
+        async def report_fn(text):
+            await self.ws_send_progress(task_id, chat_id, text)
+
+        try:
+            status = await self.engine.run_batch(job_id, source_entity, target_entity, report_fn)
+            progress = await self.db.get_progress(job_id)
+
+            if status == "paused":
+                await self.ws_send_result(task_id, AgentResult(
+                    status=TaskStatus.NEED_INPUT,
+                    message=f"搬移暫停\n"
+                            f"進度：{progress['success']}/{progress['total']}\n"
+                            f"請選擇：重試 / 跳過 / 一律跳過",
+                ))
+            elif status == "cancelled":
+                await self.ws_send_result(task_id, AgentResult(
+                    status=TaskStatus.DONE,
+                    message=f"搬移已取消\n"
+                            f"成功：{progress['success']} 則\n"
+                            f"跳過：{progress['skipped']} 則",
+                ))
+            else:
+                await self.ws_send_result(task_id, AgentResult(
+                    status=TaskStatus.DONE,
+                    message=f"搬移完成\n"
+                            f"來源：{job['source_chat']}\n"
+                            f"目標：{job['target_chat']}\n"
+                            f"成功：{progress['success']} 則\n"
+                            f"跳過：{progress['skipped']} 則\n"
+                            f"失敗：{progress['failed']} 則",
+                ))
+        except Exception as e:
+            logger.error(f"Batch transfer error: {e}", exc_info=True)
+            await self.ws_send_result(task_id, AgentResult(
+                status=TaskStatus.ERROR,
+                message=f"搬移失敗：{e}",
+            ))
+        finally:
+            self._pending_jobs.pop(task_id, None)
+
+    async def _resume_batch(self, task_id: str, job_id: str, job: dict) -> AgentResult:
+        """Resume a paused batch job (non-blocking)."""
+        source_entity = await resolve_chat(self.tg_client, job["source_chat"])
+        target_entity = await resolve_chat(self.tg_client, job["target_chat"])
+        chat_id = self._current_chat_id.get(task_id, 0)
+
+        asyncio.create_task(
+            self._run_batch_background(task_id, job_id, job, source_entity, target_entity, chat_id)
+        )
+
+        return AgentResult(
+            status=TaskStatus.DONE,
+            message="繼續搬移中...",
         )
 
     async def _ai_parse_batch(self, content: str) -> dict | None:
