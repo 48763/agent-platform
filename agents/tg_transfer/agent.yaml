@@ -8,7 +8,7 @@ sandbox:
   writable: false
 settings:
   llm: gemini
-  default_target_chat: ""
+  default_target_chat: "-5176214746"
   retry_limit: 3
   progress_interval: 20
   telethon_session: "tg_transfer"

@@ -42,6 +42,7 @@ class TGTransferAgent(BaseAgent):
         self._pending_jobs: dict[str, str] = {}  # task_id → job_id
         self._search_state: dict[str, dict] = {}  # task_id → {keyword, page}
         self._current_chat_id: dict[str, int] = {}  # task_id → chat_id
+        self._awaiting_target: dict[str, dict] = {}  # task_id → {chat, message_id}
 
     async def _init_services(self):
         data_dir = os.environ.get("DATA_DIR", "/data/tg_transfer")
@@ -151,6 +152,11 @@ class TGTransferAgent(BaseAgent):
         if task.conversation_history:
             metadata = task.conversation_history[-1].get("metadata", {})
 
+        # Awaiting target: user previously sent a link but no target was
+        # configured. They're now replying with the target chat.
+        if task.task_id in self._awaiting_target:
+            return await self._handle_target_reply(task)
+
         # Threshold change must be accepted even while a job is in-flight,
         # otherwise the user can't lower the limit mid-run. Check BEFORE
         # routing to _handle_paused_response.
@@ -231,9 +237,13 @@ class TGTransferAgent(BaseAgent):
     async def _handle_single(self, task: TaskRequest, chat_id, message_id: int) -> AgentResult:
         target_chat = await self.db.get_config("default_target_chat")
         if not target_chat:
+            self._awaiting_target[task.task_id] = {
+                "chat": chat_id, "message_id": message_id,
+            }
             return AgentResult(
                 status=TaskStatus.NEED_INPUT,
-                message="尚未設定預設目標。請先設定：「預設目標改成 @名稱」（群組/頻道/用戶/bot 皆可）",
+                message="請指定目標（群組/頻道/用戶/bot），例如 @my_backup\n"
+                        "回覆後會自動設為預設目標並開始轉存",
             )
 
         source_entity = await self.tg_client.get_entity(chat_id)
@@ -284,6 +294,13 @@ class TGTransferAgent(BaseAgent):
         if ok:
             return AgentResult(status=TaskStatus.DONE, message=f"已轉存 {count} 則訊息到 {target_chat}")
         return AgentResult(status=TaskStatus.ERROR, message="轉存失敗")
+
+    async def _handle_target_reply(self, task: TaskRequest) -> AgentResult:
+        """User replied with a target chat after we asked for one."""
+        pending = self._awaiting_target.pop(task.task_id)
+        target_chat = task.content.strip()
+        await self.db.set_config("default_target_chat", target_chat)
+        return await self._handle_single(task, pending["chat"], pending["message_id"])
 
     async def _handle_threshold(self, content: str) -> AgentResult:
         """Change the global per-message / album-sum size threshold.

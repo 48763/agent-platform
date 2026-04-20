@@ -22,6 +22,7 @@ class TestHandleTaskDispatch:
             agent._pending_jobs = {}
             agent._search_state = {}
             agent._current_chat_id = {}
+            agent._awaiting_target = {}
             agent.media_db = AsyncMock()
             agent._init_error = ""
 
@@ -52,6 +53,7 @@ class TestHandleTaskDispatch:
             agent._pending_jobs = {}
             agent._search_state = {}
             agent._current_chat_id = {}
+            agent._awaiting_target = {}
             agent.media_db = AsyncMock()
             agent._init_error = ""
 
@@ -77,6 +79,7 @@ class TestHandleTaskDispatch:
             agent._pending_jobs = {}
             agent._search_state = {}
             agent._current_chat_id = {}
+            agent._awaiting_target = {}
             agent.media_db = AsyncMock()
             agent._init_error = ""
 
@@ -155,6 +158,75 @@ class TestIncrementalTargetSyncBeforeBatch:
         )
 
 
+class TestAwaitingTargetFlow:
+    """When no default_target_chat is configured, the bot asks the user for a
+    target. On the user's reply, the bot should set the target AND proceed
+    with the original transfer — not re-classify the reply as a new command."""
+
+    @pytest.mark.asyncio
+    async def test_no_target_asks_then_reply_sets_and_transfers(self):
+        from agents.tg_transfer.__main__ import TGTransferAgent
+
+        with patch.object(TGTransferAgent, "__init__", lambda self, **kw: None):
+            agent = TGTransferAgent.__new__(TGTransferAgent)
+            agent.db = AsyncMock()
+            agent.db.get_config = AsyncMock(return_value=None)  # no default_target
+            agent.db.set_config = AsyncMock()
+            agent.tg_client = AsyncMock()
+            agent.engine = AsyncMock()
+            agent.engine.transfer_single = AsyncMock(
+                return_value={"ok": True, "dedup": False, "similar": None},
+            )
+            agent.engine.should_skip = MagicMock(return_value=False)
+            agent.config = {"settings": {}}
+            agent._pending_jobs = {}
+            agent._search_state = {}
+            agent._current_chat_id = {}
+            agent._awaiting_target = {}
+            agent.media_db = AsyncMock()
+            agent._init_error = ""
+            agent.llm = None
+
+            # Step 1: send link with no target configured → NEED_INPUT
+            task1 = TaskRequest(task_id="t-target", content="https://t.me/channel/123")
+            with patch("agents.tg_transfer.__main__.resolve_chat", new_callable=AsyncMock):
+                result1 = await agent.handle_task(task1)
+            assert result1.status == TaskStatus.NEED_INPUT
+
+            # Step 2: user replies with target → should set config + transfer
+            # After set_config is called, get_config should return the new value.
+            config_store = {}
+
+            async def fake_set_config(key, val):
+                config_store[key] = val
+
+            async def fake_get_config(key):
+                return config_store.get(key)
+
+            agent.db.set_config = AsyncMock(side_effect=fake_set_config)
+            agent.db.get_config = AsyncMock(side_effect=fake_get_config)
+            task2 = TaskRequest(
+                task_id="t-target",
+                content="@my_backup",
+                conversation_history=[
+                    {"role": "user", "content": "https://t.me/channel/123"},
+                    {"role": "assistant", "content": result1.message},
+                    {"role": "user", "content": "@my_backup"},
+                ],
+            )
+            with patch("agents.tg_transfer.__main__.resolve_chat", new_callable=AsyncMock) as mock_resolve:
+                mock_resolve.return_value = MagicMock()
+                msg = MagicMock()
+                msg.text = "hello"
+                msg.media = None
+                msg.grouped_id = None
+                agent.tg_client.get_messages = AsyncMock(return_value=msg)
+                result2 = await agent.handle_task(task2)
+
+            assert result2.status == TaskStatus.DONE
+            agent.db.set_config.assert_called_with("default_target_chat", "@my_backup")
+
+
 class TestLLMFallbackRouting:
     """When the regex classifier falls through to 'batch' but the LLM
     recognises the fuzzy phrasing as a known command, dispatch should route
@@ -176,6 +248,7 @@ class TestLLMFallbackRouting:
         agent._pending_jobs = {}
         agent._search_state = {}
         agent._current_chat_id = {}
+        agent._awaiting_target = {}
         agent._init_error = ""
         agent.llm = MagicMock()
         return agent
