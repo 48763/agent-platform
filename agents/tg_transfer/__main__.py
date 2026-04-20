@@ -10,12 +10,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from aiohttp import web
 from core.base_agent import BaseAgent
 from core.models import AgentResult, TaskRequest, TaskStatus
-from agents.tg_transfer.parser import parse_tg_link, detect_forward, classify_intent
+from agents.tg_transfer.parser import (
+    parse_tg_link, detect_forward, classify_intent, parse_threshold,
+    ai_classify_command,
+)
 from agents.tg_transfer.chat_resolver import resolve_chat
 from agents.tg_transfer.db import TransferDB
 from agents.tg_transfer.transfer_engine import TransferEngine
 from agents.tg_transfer.tg_client import create_client
 from agents.tg_transfer.media_db import MediaDB
+from agents.tg_transfer.byte_budget import ByteBudget
 from agents.tg_transfer.search import format_search_results, format_similar_results
 from agents.tg_transfer.hasher import compute_phash, hamming_distance, PHASH_AVAILABLE
 from agents.tg_transfer.liveness_checker import run_liveness_loop
@@ -60,6 +64,12 @@ class TGTransferAgent(BaseAgent):
         self.media_db = MediaDB(os.path.join(data_dir, "transfer.db"))
         await self.media_db.init()
 
+        # Global byte budget: caps total in-flight download bytes across all
+        # concurrent transfers. Default 1 GiB; configurable via
+        # settings.byte_budget_mb.
+        budget_mb = int(settings.get("byte_budget_mb", 1024))
+        byte_budget = ByteBudget(capacity=budget_mb * 1024 * 1024)
+
         self.engine = TransferEngine(
             client=self.tg_client,
             db=self.db,
@@ -68,16 +78,53 @@ class TGTransferAgent(BaseAgent):
             progress_interval=settings.get("progress_interval", 20),
             media_db=self.media_db,
             phash_threshold=settings.get("phash_threshold", 10),
+            byte_budget=byte_budget,
         )
 
         # Start liveness checker
         interval = settings.get("liveness_check_interval", 24)
         asyncio.create_task(run_liveness_loop(self.tg_client, self.media_db, interval))
 
-        # Resume interrupted jobs
-        running_jobs = await self.db.get_running_jobs()
-        for job in running_jobs:
-            logger.info(f"Found interrupted job {job['job_id']}, will resume on next dispatch")
+        # Resume interrupted jobs (running + paused)
+        await self._resume_interrupted_jobs()
+
+    async def _resume_interrupted_jobs(self):
+        """On startup re-attach running/paused jobs to their original TG task.
+        Running jobs get respawned in background; paused jobs get a reminder
+        message so user can reply retry/skip/skip-all."""
+        jobs = await self.db.get_resumable_jobs()
+        for job in jobs:
+            task_id = job.get("task_id")
+            chat_id = job.get("chat_id")
+            if not task_id or not chat_id:
+                logger.warning(
+                    f"Job {job['job_id']} has no task_id/chat_id binding, cannot resume"
+                )
+                continue
+
+            self._pending_jobs[task_id] = job["job_id"]
+            self._current_chat_id[task_id] = chat_id
+
+            if job["status"] == "running":
+                try:
+                    source_entity = await resolve_chat(self.tg_client, job["source_chat"])
+                    target_entity = await resolve_chat(self.tg_client, job["target_chat"])
+                except Exception as e:
+                    logger.error(f"Resume {job['job_id']} resolve failed: {e}")
+                    continue
+                await self.ws_send_progress(
+                    task_id, chat_id, f"繼續搬移任務 {job['job_id']}"
+                )
+                asyncio.create_task(
+                    self._run_batch_background(
+                        task_id, job["job_id"], job, source_entity, target_entity, chat_id
+                    )
+                )
+            elif job["status"] == "paused":
+                await self.ws_send_progress(
+                    task_id, chat_id,
+                    f"服務重啟，關於任務 {job['job_id']}，請回覆：重試 / 跳過 / 一律跳過",
+                )
 
     async def handle_task(self, task: TaskRequest) -> AgentResult:
         if self._init_error:
@@ -102,6 +149,12 @@ class TGTransferAgent(BaseAgent):
         metadata = {}
         if task.conversation_history:
             metadata = task.conversation_history[-1].get("metadata", {})
+
+        # Threshold change must be accepted even while a job is in-flight,
+        # otherwise the user can't lower the limit mid-run. Check BEFORE
+        # routing to _handle_paused_response.
+        if classify_intent(content) == "threshold":
+            return await self._handle_threshold(content)
 
         # Check if this is a response to a paused job
         if task.task_id in self._pending_jobs:
@@ -131,15 +184,52 @@ class TGTransferAgent(BaseAgent):
         if intent == "search":
             return await self._handle_search(task)
 
+        # Regex fell through to 'batch'. Before committing to the batch path,
+        # let the LLM take a pass — fuzzy phrasing like "我不想要超過 500 的檔案"
+        # should route to threshold, not batch. None = LLM couldn't classify.
+        ai_cmd = await ai_classify_command(content, getattr(self, "llm", None))
+        if ai_cmd:
+            routed = await self._route_ai_command(task, ai_cmd)
+            if routed is not None:
+                return routed
+
         # Batch — use AI to parse
         return await self._handle_batch_request(task)
+
+    async def _route_ai_command(self, task: TaskRequest, ai_cmd: dict):
+        """Dispatch a command that the LLM fuzzy-classifier produced. Returns
+        an AgentResult, or None to indicate the caller should fall through to
+        the regex-path default."""
+        intent = ai_cmd.get("intent")
+        params = ai_cmd.get("params") or {}
+        if intent == "threshold":
+            mb = params.get("mb")
+            if isinstance(mb, int) and mb >= 0:
+                await self.db.set_config("size_limit_mb", str(mb))
+                if mb == 0:
+                    return AgentResult(status=TaskStatus.DONE, message="已取消大小門檻")
+                return AgentResult(
+                    status=TaskStatus.DONE,
+                    message=f"大小門檻已改為 {mb} MB（下一則訊息起生效）",
+                )
+            # LLM picked threshold but gave us no usable number — fall back to
+            # the regex handler so it can ask the user for a value.
+            return await self._handle_threshold(task.content)
+        if intent == "config":
+            return await self._handle_config(task.content)
+        if intent == "stats":
+            return await self._handle_stats()
+        if intent == "search":
+            return await self._handle_search(task)
+        # 'batch' — let the normal batch path handle it.
+        return None
 
     async def _handle_single(self, task: TaskRequest, chat_id, message_id: int) -> AgentResult:
         target_chat = await self.db.get_config("default_target_chat")
         if not target_chat:
             return AgentResult(
                 status=TaskStatus.NEED_INPUT,
-                message="尚未設定預設目標群組。請先設定：「預設目標改成 @群組名稱」",
+                message="尚未設定預設目標。請先設定：「預設目標改成 @名稱」（群組/頻道/用戶/bot 皆可）",
             )
 
         source_entity = await self.tg_client.get_entity(chat_id)
@@ -160,6 +250,12 @@ class TGTransferAgent(BaseAgent):
             if self.engine.should_skip(album_msgs[0]):
                 return AgentResult(status=TaskStatus.DONE, message="已跳過（不支援的訊息類型）")
 
+            # Respect size_limit_mb for direct album links too.
+            if await self.engine._album_over_limit(album_msgs):
+                return AgentResult(
+                    status=TaskStatus.DONE, message="已跳過（超過大小門檻）",
+                )
+
             ok = await self.engine.transfer_album(target_entity, album_msgs)
             count = len(album_msgs)
         else:
@@ -169,6 +265,10 @@ class TGTransferAgent(BaseAgent):
                 source_entity, target_entity, msg,
                 target_chat=target_chat, source_chat=str(chat_id), job_id=None,
             )
+            if result.get("over_limit"):
+                return AgentResult(
+                    status=TaskStatus.DONE, message="已跳過（超過大小門檻）",
+                )
             if result["similar"]:
                 text = format_similar_results(result["similar"])
                 return AgentResult(status=TaskStatus.NEED_INPUT, message=text)
@@ -181,6 +281,24 @@ class TGTransferAgent(BaseAgent):
             return AgentResult(status=TaskStatus.DONE, message=f"已轉存 {count} 則訊息到 {target_chat}")
         return AgentResult(status=TaskStatus.ERROR, message="轉存失敗")
 
+    async def _handle_threshold(self, content: str) -> AgentResult:
+        """Change the global per-message / album-sum size threshold.
+        Takes effect on the NEXT message in any running batch (engine reads
+        size_limit_mb from DB config on every message)."""
+        mb = parse_threshold(content)
+        if mb is None:
+            return AgentResult(
+                status=TaskStatus.NEED_INPUT,
+                message="請提供數字和單位，例如：「門檻改成 200MB」或「限制 1GB」",
+            )
+        await self.db.set_config("size_limit_mb", str(mb))
+        if mb == 0:
+            return AgentResult(status=TaskStatus.DONE, message="已取消大小門檻")
+        return AgentResult(
+            status=TaskStatus.DONE,
+            message=f"大小門檻已改為 {mb} MB（下一則訊息起生效）",
+        )
+
     async def _handle_config(self, content: str) -> AgentResult:
         m = _TARGET_RE.search(content)
         if m:
@@ -189,7 +307,7 @@ class TGTransferAgent(BaseAgent):
             return AgentResult(status=TaskStatus.DONE, message=f"預設目標已設為 {target}")
         return AgentResult(
             status=TaskStatus.NEED_INPUT,
-            message="請告訴我目標群組，例如：「預設目標改成 @channel_name」",
+            message="請告訴我目標，例如：「預設目標改成 @name」（群組/頻道/用戶/bot 皆可）",
         )
 
     async def _handle_search(self, task: TaskRequest) -> AgentResult:
@@ -283,7 +401,7 @@ class TGTransferAgent(BaseAgent):
             return AgentResult(
                 status=TaskStatus.NEED_INPUT,
                 message="我沒有理解你的搬移指令，可以再說一次嗎？\n"
-                        "例如：「把 @source_channel 的內容搬到 @target」\n"
+                        "例如：「把 @source 的內容搬到 @target」（來源可以是群組/頻道/用戶/bot）\n"
                         "或：「搬移 @source 最近 100 則到 @target」",
             )
 
@@ -292,7 +410,7 @@ class TGTransferAgent(BaseAgent):
         if not target:
             return AgentResult(
                 status=TaskStatus.NEED_INPUT,
-                message="請指定目標群組，或先設定預設目標",
+                message="請指定目標（群組/頻道/用戶/bot），或先設定預設目標",
             )
 
         source_entity = await resolve_chat(self.tg_client, source)
@@ -313,6 +431,8 @@ class TGTransferAgent(BaseAgent):
             mode="batch",
             filter_type=filter_type,
             filter_value=json.dumps(parsed.get("filter_value_raw")) if parsed.get("filter_value_raw") else None,
+            task_id=task.task_id,
+            chat_id=task.chat_id,
         )
         self._pending_jobs[task.task_id] = job_id
 
@@ -446,6 +566,11 @@ class TGTransferAgent(BaseAgent):
         target_entity = await resolve_chat(self.tg_client, job["target_chat"])
         chat_id = self._current_chat_id.get(task_id, 0)
 
+        # If the reply came in under a new task_id (e.g. hub created a fresh
+        # task), rewrite the DB binding so future progress goes to the new task.
+        if job.get("task_id") != task_id or job.get("chat_id") != chat_id:
+            await self.db.update_job_binding(job_id, task_id, chat_id)
+
         await self.ws_send_progress(task_id, chat_id, "繼續搬移中...")
 
         asyncio.create_task(
@@ -460,7 +585,8 @@ class TGTransferAgent(BaseAgent):
             return None
         prompt = (
             "你是一個指令解析器。從以下使用者訊息中提取搬移參數，回覆 JSON：\n"
-            '{"source": "@channel 或連結", "target": "@channel 或連結 或 null", '
+            '{"source": "@username / 連結 / 數字 chat_id（可以是群組、頻道、用戶、bot 等任何聊天對象）", '
+            '"target": "同 source 格式 或 null", '
             '"filter_type": "all 或 count 或 date_range", '
             '"filter_value_raw": null 或 {"count": N} 或 {"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}}\n\n'
             f"使用者訊息：{content}\n\n只回覆 JSON，不要解釋。"

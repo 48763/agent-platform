@@ -12,18 +12,22 @@ CREATE TABLE IF NOT EXISTS jobs (
     mode        TEXT NOT NULL,
     status      TEXT DEFAULT 'pending',
     auto_skip   BOOLEAN DEFAULT 0,
+    task_id     TEXT,
+    chat_id     INTEGER,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS job_messages (
-    job_id      TEXT NOT NULL,
-    message_id  INTEGER NOT NULL,
-    grouped_id  INTEGER,
-    status      TEXT DEFAULT 'pending',
-    retry_count INTEGER DEFAULT 0,
-    error       TEXT,
-    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    job_id           TEXT NOT NULL,
+    message_id       INTEGER NOT NULL,
+    grouped_id       INTEGER,
+    status           TEXT DEFAULT 'pending',
+    retry_count      INTEGER DEFAULT 0,
+    error            TEXT,
+    partial_path     TEXT,
+    downloaded_bytes INTEGER DEFAULT 0,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (job_id, message_id),
     FOREIGN KEY (job_id) REFERENCES jobs(job_id)
 );
@@ -47,7 +51,26 @@ class TransferDB:
         self._db = await aiosqlite.connect(self.db_path)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(_SCHEMA)
+        await self._migrate()
         await self._db.commit()
+
+    async def _migrate(self):
+        """Add columns introduced after initial schema to legacy DBs."""
+        async with self._db.execute("PRAGMA table_info(jobs)") as cur:
+            cols = {row["name"] for row in await cur.fetchall()}
+        if "task_id" not in cols:
+            await self._db.execute("ALTER TABLE jobs ADD COLUMN task_id TEXT")
+        if "chat_id" not in cols:
+            await self._db.execute("ALTER TABLE jobs ADD COLUMN chat_id INTEGER")
+
+        async with self._db.execute("PRAGMA table_info(job_messages)") as cur:
+            jm_cols = {row["name"] for row in await cur.fetchall()}
+        if "partial_path" not in jm_cols:
+            await self._db.execute("ALTER TABLE job_messages ADD COLUMN partial_path TEXT")
+        if "downloaded_bytes" not in jm_cols:
+            await self._db.execute(
+                "ALTER TABLE job_messages ADD COLUMN downloaded_bytes INTEGER DEFAULT 0"
+            )
 
     async def close(self):
         if self._db:
@@ -62,12 +85,14 @@ class TransferDB:
         mode: str,
         filter_type: str = None,
         filter_value: str = None,
+        task_id: str = None,
+        chat_id: int = None,
     ) -> str:
         job_id = uuid.uuid4().hex[:12]
         await self._db.execute(
-            "INSERT INTO jobs (job_id, source_chat, target_chat, mode, filter_type, filter_value) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (job_id, source_chat, target_chat, mode, filter_type, filter_value),
+            "INSERT INTO jobs (job_id, source_chat, target_chat, mode, filter_type, filter_value, task_id, chat_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (job_id, source_chat, target_chat, mode, filter_type, filter_value, task_id, chat_id),
         )
         await self._db.commit()
         return job_id
@@ -93,6 +118,24 @@ class TransferDB:
     async def get_running_jobs(self) -> list[dict]:
         async with self._db.execute("SELECT * FROM jobs WHERE status = 'running'") as cur:
             return [dict(row) for row in await cur.fetchall()]
+
+    async def get_resumable_jobs(self) -> list[dict]:
+        """Jobs that should be re-attached on agent startup: running (mid-transfer)
+        and paused (awaiting user decision). Pending/completed are excluded."""
+        async with self._db.execute(
+            "SELECT * FROM jobs WHERE status IN ('running', 'paused')"
+        ) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def update_job_binding(self, job_id: str, task_id: str, chat_id: int):
+        """Rewrite a job's TG task/chat binding. Used when a paused job resumes
+        under a new user reply whose task_id differs from the original."""
+        await self._db.execute(
+            "UPDATE jobs SET task_id = ?, chat_id = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE job_id = ?",
+            (task_id, chat_id, job_id),
+        )
+        await self._db.commit()
 
     # -- Messages --
 
@@ -134,6 +177,27 @@ class TransferDB:
     async def increment_retry(self, job_id: str, message_id: int):
         await self._db.execute(
             "UPDATE job_messages SET retry_count = retry_count + 1 WHERE job_id = ? AND message_id = ?",
+            (job_id, message_id),
+        )
+        await self._db.commit()
+
+    async def set_partial(self, job_id: str, message_id: int, path: str, downloaded_bytes: int):
+        """Record partial-download state so the next run can resume from
+        `downloaded_bytes` via iter_download(offset=...). Called on every
+        flush-interval (e.g. 64MB) during a download."""
+        await self._db.execute(
+            "UPDATE job_messages SET partial_path = ?, downloaded_bytes = ? "
+            "WHERE job_id = ? AND message_id = ?",
+            (path, downloaded_bytes, job_id, message_id),
+        )
+        await self._db.commit()
+
+    async def clear_partial(self, job_id: str, message_id: int):
+        """Clear partial-download state after successful upload; prevents the
+        next run from resuming a file that's already been delivered."""
+        await self._db.execute(
+            "UPDATE job_messages SET partial_path = NULL, downloaded_bytes = 0 "
+            "WHERE job_id = ? AND message_id = ?",
             (job_id, message_id),
         )
         await self._db.commit()

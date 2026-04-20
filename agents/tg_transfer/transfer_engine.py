@@ -10,8 +10,15 @@ from agents.tg_transfer.hasher import compute_sha256, compute_phash, compute_pha
 from agents.tg_transfer.media_db import MediaDB
 from agents.tg_transfer.tag_extractor import extract_tags
 from agents.tg_transfer.media_utils import ffprobe_metadata
+from agents.tg_transfer.byte_budget import ByteBudget
 
 logger = logging.getLogger(__name__)
+
+
+class OverSizeLimit(Exception):
+    """Raised mid-download when the user's live size_limit_mb has been lowered
+    below the number of bytes already pulled. Caller marks the message as
+    'skipped' (not 'failed') so retry logic doesn't fire."""
 
 
 def _meta_from_message(message) -> dict | None:
@@ -37,6 +44,7 @@ class TransferEngine:
         progress_interval: int = 20,
         media_db: MediaDB = None,
         phash_threshold: int = 10,
+        byte_budget: ByteBudget | None = None,
     ):
         self.client = client
         self.db = db
@@ -45,10 +53,134 @@ class TransferEngine:
         self.progress_interval = progress_interval
         self.media_db = media_db
         self.phash_threshold = phash_threshold
+        # Optional global byte budget. When set, every _download_with_resume
+        # reserves the remaining file bytes from it before streaming, so
+        # concurrent downloads can't exceed the configured cap (e.g. 1GB).
+        self.byte_budget = byte_budget
         self._cancelled: set[str] = set()
 
     def cancel_job(self, job_id: str):
         self._cancelled.add(job_id)
+
+    async def _size_limit_bytes(self) -> int:
+        """Current per-message byte cap. Read from DB on every call so the
+        user can change it live while a batch is running. 0 = no limit."""
+        raw = await self.db.get_config("size_limit_mb")
+        if not raw:
+            return 0
+        try:
+            mb = int(raw)
+        except (TypeError, ValueError):
+            return 0
+        return max(mb, 0) * 1024 * 1024
+
+    @staticmethod
+    def _declared_size(message) -> int:
+        """TG-reported file size (bytes), 0 if unknown. Used for pre-download
+        policy checks — never a ground truth, but good enough to skip."""
+        f = getattr(message, "file", None)
+        if not f:
+            return 0
+        size = getattr(f, "size", None)
+        return int(size) if isinstance(size, int) else 0
+
+    async def _album_over_limit(self, messages: list) -> bool:
+        """True if the SUM of declared file sizes in the album exceeds the
+        current size_limit_mb. An album is atomic — one file over the
+        allowance fails the whole group."""
+        limit = await self._size_limit_bytes()
+        if limit <= 0:
+            return False
+        total = sum(self._declared_size(m) for m in messages)
+        return total > limit
+
+    async def _download_with_resume(
+        self, message, fresh_dest: str,
+        job_id: str | None = None, message_id: int | None = None,
+        flush_bytes: int = 64 * 1024 * 1024,
+    ) -> str:
+        """Download `message`'s media to disk, resuming from a previous
+        partial download if one is recorded. Updates `job_messages.partial_path`
+        + `downloaded_bytes` every `flush_bytes` so a crash mid-stream can
+        resume close to the last flush.
+
+        If no job_id/message_id is given, behaves as a plain streaming
+        download to `fresh_dest`.
+        """
+        # Decide where to write + what offset to start at.
+        dest = fresh_dest
+        offset = 0
+        if job_id is not None and message_id is not None:
+            row = await self.db.get_message(job_id, message_id)
+            stored_path = (row or {}).get("partial_path")
+            stored_bytes = (row or {}).get("downloaded_bytes") or 0
+            if stored_path and os.path.exists(stored_path):
+                dest = stored_path
+                actual = os.path.getsize(dest)
+                # Trust whichever is smaller — disk wins if OS lost bytes,
+                # DB wins if the file has extra unflushed tail from a crash.
+                offset = min(actual, stored_bytes)
+                if actual > offset:
+                    with open(dest, "rb+") as f:
+                        f.truncate(offset)
+
+        if job_id is not None and message_id is not None:
+            await self.db.set_partial(job_id, message_id, dest, offset)
+
+        # Figure out how many bytes this stream will actually pull. Used to
+        # reserve from the byte_budget when present so total concurrent in-
+        # flight bytes stay under the cap.
+        reserve = 0
+        if self.byte_budget is not None:
+            file_obj = getattr(message, "file", None)
+            total_size = getattr(file_obj, "size", None) if file_obj else None
+            if isinstance(total_size, int) and total_size > 0:
+                reserve = max(total_size - offset, 0)
+
+        mode = "ab" if offset > 0 else "wb"
+        downloaded = offset
+        since_flush = 0
+
+        async def _stream():
+            nonlocal downloaded, since_flush
+            with open(dest, mode) as f:
+                async for chunk in self.client.iter_download(message, offset=offset):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    since_flush += len(chunk)
+                    if since_flush >= flush_bytes:
+                        f.flush()
+                        try:
+                            os.fsync(f.fileno())
+                        except OSError:
+                            pass
+                        if job_id is not None and message_id is not None:
+                            await self.db.set_partial(
+                                job_id, message_id, dest, downloaded,
+                            )
+                        since_flush = 0
+                        # Live threshold check: if user lowered the limit
+                        # since start, bail out here instead of pulling more.
+                        live_limit = await self._size_limit_bytes()
+                        if live_limit > 0 and downloaded > live_limit:
+                            raise OverSizeLimit(
+                                f"downloaded {downloaded}B exceeds live limit {live_limit}B"
+                            )
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+
+        if self.byte_budget is not None:
+            async with self.byte_budget.slot(reserve):
+                await _stream()
+        else:
+            await _stream()
+
+        if job_id is not None and message_id is not None:
+            await self.db.set_partial(job_id, message_id, dest, downloaded)
+        return dest
 
     def should_skip(self, message) -> bool:
         """Check if message type should be skipped (sticker, poll, voice)."""
@@ -104,10 +236,28 @@ class TransferEngine:
                 planned_paths.append(dest)
                 artefacts.append(dest)
 
-            download_tasks = [
-                self.client.download_media(msg, file=dest)
-                for msg, dest in zip(messages, planned_paths)
-            ]
+            # Use resumable streaming per file when we have a job binding, so a
+            # restart picks up each file from its last 64MB flush. Falls back
+            # to atomic download when job_id is missing (single-transfer flow).
+            if job_id is not None:
+                async def _safe(m, d):
+                    try:
+                        return await self._download_with_resume(
+                            m, d, job_id=job_id, message_id=m.id,
+                        )
+                    except Exception as e:
+                        # Preserve legacy "download fail → False" contract;
+                        # partial state stays in DB for the next retry.
+                        logger.warning(f"Resume download failed for msg {m.id}: {e}")
+                        return None
+                download_tasks = [
+                    _safe(msg, dest) for msg, dest in zip(messages, planned_paths)
+                ]
+            else:
+                download_tasks = [
+                    self.client.download_media(msg, file=dest)
+                    for msg, dest in zip(messages, planned_paths)
+                ]
             paths = await asyncio.gather(*download_tasks)
 
             # Atomic check: all must succeed
@@ -115,7 +265,8 @@ class TransferEngine:
                 return False
 
             # Track any paths Telethon wrote elsewhere (e.g. when file arg was
-            # ignored) so we still clean them up.
+            # ignored, or resume used a stored partial_path) so we still clean
+            # them up.
             for p in paths:
                 if p not in artefacts:
                     artefacts.append(p)
@@ -196,6 +347,15 @@ class TransferEngine:
                         tags = extract_tags(msg.text)
                         if tags:
                             await self.media_db.add_tags(mid, tags)
+
+            # Upload delivered → wipe partial state for every message in the
+            # group so future runs don't try to resume already-delivered files.
+            if job_id is not None:
+                for msg in messages:
+                    try:
+                        await self.db.clear_partial(job_id, msg.id)
+                    except Exception:
+                        pass
             return True
         except Exception:
             if self.media_db and media_ids:
@@ -219,6 +379,16 @@ class TransferEngine:
         Returns: {"ok": bool, "dedup": bool, "similar": list | None}
         """
         os.makedirs(self.tmp_dir, exist_ok=True)
+        # Size-limit gate: reject oversize messages before spending any
+        # bandwidth. Caller marks the result as 'skipped', not 'failed'.
+        limit = await self._size_limit_bytes()
+        if limit > 0:
+            declared = self._declared_size(message)
+            if declared > limit:
+                return {
+                    "ok": False, "dedup": False, "similar": None,
+                    "over_limit": True,
+                }
         # Flat layout: per-message filenames share one directory to keep
         # filesystem metadata churn (mkdir/rmtree per message) minimal.
         base = f"{message.id}_{uuid.uuid4().hex[:8]}"
@@ -229,7 +399,14 @@ class TransferEngine:
         media_id = None
 
         try:
-            path = await self.client.download_media(message, file=media_path)
+            # Resumable download: if a partial exists in job_messages, pick
+            # up from downloaded_bytes; else stream fresh into media_path.
+            if job_id is not None:
+                path = await self._download_with_resume(
+                    message, media_path, job_id=job_id, message_id=message.id,
+                )
+            else:
+                path = await self.client.download_media(message, file=media_path)
             if not path:
                 return {"ok": False, "dedup": False, "similar": None}
             if path != media_path:
@@ -312,7 +489,26 @@ class TransferEngine:
                     if tags:
                         await self.media_db.add_tags(media_id, tags)
 
+            # Upload succeeded → wipe partial state so a future rerun doesn't
+            # try to resume a file that was already delivered.
+            if job_id is not None:
+                try:
+                    await self.db.clear_partial(job_id, message.id)
+                except Exception:
+                    pass
+
             return {"ok": True, "dedup": False, "similar": None}
+        except OverSizeLimit:
+            # Live threshold fired mid-download — treat as policy skip, not
+            # retryable failure. Clean up media_db row so stats reflect reality.
+            if self.media_db and media_id:
+                try:
+                    await self.media_db.mark_failed(media_id)
+                except Exception:
+                    pass
+            return {
+                "ok": False, "dedup": False, "similar": None, "over_limit": True,
+            }
         except Exception as e:
             if self.media_db and media_id:
                 try:
@@ -400,13 +596,18 @@ class TransferEngine:
                             messages.append(msg)
 
                     if messages and not self.should_skip(messages[0]):
-                        ok = await self.transfer_album(
-                            target_entity, messages,
-                            target_chat=job["target_chat"],
-                            source_chat=job["source_chat"],
-                            job_id=job_id,
-                        )
-                        status = "success" if ok else "failed"
+                        # Album sum-size gate: if total > size_limit_mb,
+                        # skip the entire group without downloading (atomic).
+                        if await self._album_over_limit(messages):
+                            status = "skipped"
+                        else:
+                            ok = await self.transfer_album(
+                                target_entity, messages,
+                                target_chat=job["target_chat"],
+                                source_chat=job["source_chat"],
+                                job_id=job_id,
+                            )
+                            status = "success" if ok else "failed"
                     elif messages and self.should_skip(messages[0]):
                         status = "skipped"
                     else:
@@ -426,6 +627,19 @@ class TransferEngine:
                     if self.should_skip(msg):
                         await self.db.mark_message(job_id, message_id, "skipped")
                     else:
+                        # Live size-limit gate: re-read config for every
+                        # message so user threshold changes take effect
+                        # immediately on the next message.
+                        limit = await self._size_limit_bytes()
+                        declared = self._declared_size(msg)
+                        if limit > 0 and declared > limit:
+                            await self.db.mark_message(
+                                job_id, message_id, "skipped",
+                                error="over size limit",
+                            )
+                            processed += 1
+                            continue
+
                         job = await self.db.get_job(job_id)
                         result = await self.transfer_single(
                             source_entity, target_entity, msg,
@@ -435,6 +649,12 @@ class TransferEngine:
                         )
                         if result["dedup"]:
                             await self.db.mark_message(job_id, message_id, "skipped")
+                        elif result.get("over_limit"):
+                            # Exceeded size_limit_mb → skip, don't fail/retry.
+                            await self.db.mark_message(
+                                job_id, message_id, "skipped",
+                                error="over size limit",
+                            )
                         elif result["similar"]:
                             # In batch mode, skip similar (no interactive prompt)
                             await self.db.mark_message(job_id, message_id, "skipped")
@@ -443,6 +663,26 @@ class TransferEngine:
                                 job_id, message_id, "success" if result["ok"] else "failed"
                             )
                     processed += 1
+
+            except OverSizeLimit as e:
+                # Fired mid-download because the user lowered the live limit.
+                # Mark skipped (no retry), including all album siblings.
+                logger.info(f"Oversize during stream for msg {message_id}: {e}")
+                if grouped_id:
+                    group_rows = await self.db.get_grouped_messages(job_id, grouped_id)
+                    for gr in group_rows:
+                        await self.db.mark_message(
+                            job_id, gr["message_id"], "skipped",
+                            error="over size limit",
+                        )
+                    processed += len(group_rows)
+                else:
+                    await self.db.mark_message(
+                        job_id, message_id, "skipped",
+                        error="over size limit",
+                    )
+                    processed += 1
+                continue
 
             except Exception as e:
                 logger.error(f"Transfer error for msg {message_id}: {e}")

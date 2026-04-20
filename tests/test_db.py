@@ -140,3 +140,179 @@ async def test_reset_message_to_pending(db):
     msg = await db.get_message(job_id, 400)
     assert msg["status"] == "pending"
     assert msg["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_job_persists_task_id_and_chat_id(db):
+    """Jobs must persist the TG task_id/chat_id so that agent can re-attach
+    them to WS progress/result messages after an unannounced restart."""
+    job_id = await db.create_job(
+        source_chat="@src", target_chat="@dst", mode="batch",
+        task_id="task-abc", chat_id=12345,
+    )
+    job = await db.get_job(job_id)
+    assert job["task_id"] == "task-abc"
+    assert job["chat_id"] == 12345
+
+
+@pytest.mark.asyncio
+async def test_get_resumable_jobs_includes_running_and_paused(db):
+    """On startup the agent must pick up both running and paused jobs:
+    running = was in the middle of transferring; paused = was waiting for a
+    user decision (retry/skip). Both should be re-attached."""
+    running = await db.create_job("@s", "@d", "batch", task_id="t1", chat_id=1)
+    paused = await db.create_job("@s", "@d", "batch", task_id="t2", chat_id=2)
+    done = await db.create_job("@s", "@d", "batch", task_id="t3", chat_id=3)
+    pending = await db.create_job("@s", "@d", "batch", task_id="t4", chat_id=4)
+
+    await db.update_job_status(running, "running")
+    await db.update_job_status(paused, "paused")
+    await db.update_job_status(done, "completed")
+    # leave `pending` alone — it never started
+
+    rows = await db.get_resumable_jobs()
+    ids = {r["job_id"] for r in rows}
+    assert running in ids
+    assert paused in ids
+    assert done not in ids
+    assert pending not in ids
+
+
+@pytest.mark.asyncio
+async def test_update_job_binding_updates_task_id_and_chat_id(db):
+    """When a paused job resumes under a new user reply, its task_id/chat_id
+    may change — agent must be able to rewrite the binding so future progress
+    goes to the new task."""
+    job_id = await db.create_job(
+        "@s", "@d", "batch", task_id="old", chat_id=100,
+    )
+    await db.update_job_binding(job_id, task_id="new", chat_id=200)
+    job = await db.get_job(job_id)
+    assert job["task_id"] == "new"
+    assert job["chat_id"] == 200
+
+
+@pytest.mark.asyncio
+async def test_set_partial_persists_path_and_bytes(db):
+    """Partial-download state must survive restart so we can resume from
+    downloaded_bytes instead of starting over."""
+    job_id = await db.create_job("@s", "@d", "batch")
+    await db.add_messages(job_id, [500])
+    await db.set_partial(job_id, 500, "/tmp/tg/500.dat", 64 * 1024 * 1024)
+    msg = await db.get_message(job_id, 500)
+    assert msg["partial_path"] == "/tmp/tg/500.dat"
+    assert msg["downloaded_bytes"] == 64 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_set_partial_overwrites_on_repeat_calls(db):
+    """Each 64MB flush updates downloaded_bytes — latest call wins."""
+    job_id = await db.create_job("@s", "@d", "batch")
+    await db.add_messages(job_id, [501])
+    await db.set_partial(job_id, 501, "/tmp/tg/501.dat", 64 * 1024 * 1024)
+    await db.set_partial(job_id, 501, "/tmp/tg/501.dat", 128 * 1024 * 1024)
+    msg = await db.get_message(job_id, 501)
+    assert msg["downloaded_bytes"] == 128 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_clear_partial_resets_state(db):
+    """On successful upload, partial state is cleared so future resumes start
+    fresh and cleanup can safely remove the artefact."""
+    job_id = await db.create_job("@s", "@d", "batch")
+    await db.add_messages(job_id, [502])
+    await db.set_partial(job_id, 502, "/tmp/tg/502.dat", 999)
+    await db.clear_partial(job_id, 502)
+    msg = await db.get_message(job_id, 502)
+    assert msg["partial_path"] is None
+    assert msg["downloaded_bytes"] == 0
+
+
+@pytest.mark.asyncio
+async def test_migration_adds_partial_columns_to_legacy_job_messages(tmp_path):
+    """Legacy DBs (before 1b) get partial_path/downloaded_bytes added without
+    losing existing rows."""
+    import aiosqlite
+    path = str(tmp_path / "legacy_jm.db")
+    legacy = await aiosqlite.connect(path)
+    await legacy.executescript("""
+        CREATE TABLE jobs (
+            job_id TEXT PRIMARY KEY, source_chat TEXT NOT NULL,
+            target_chat TEXT NOT NULL, mode TEXT NOT NULL,
+            status TEXT DEFAULT 'pending'
+        );
+        CREATE TABLE job_messages (
+            job_id      TEXT NOT NULL,
+            message_id  INTEGER NOT NULL,
+            grouped_id  INTEGER,
+            status      TEXT DEFAULT 'pending',
+            retry_count INTEGER DEFAULT 0,
+            error       TEXT,
+            PRIMARY KEY (job_id, message_id)
+        );
+        INSERT INTO jobs (job_id, source_chat, target_chat, mode, status)
+            VALUES ('legacy_j', '@s', '@d', 'batch', 'running');
+        INSERT INTO job_messages (job_id, message_id, status)
+            VALUES ('legacy_j', 7, 'pending');
+    """)
+    await legacy.commit()
+    await legacy.close()
+
+    db = TransferDB(path)
+    await db.init()
+    try:
+        m = await db.get_message("legacy_j", 7)
+        assert m is not None
+        assert m["partial_path"] is None
+        assert m["downloaded_bytes"] == 0
+        await db.set_partial("legacy_j", 7, "/tmp/x.dat", 1024)
+        m = await db.get_message("legacy_j", 7)
+        assert m["partial_path"] == "/tmp/x.dat"
+        assert m["downloaded_bytes"] == 1024
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_adds_task_id_chat_id_to_legacy_jobs(tmp_path):
+    """A DB created before this feature must be auto-migrated without losing
+    data. Simulate a legacy DB by creating the old schema, then reopen via
+    TransferDB.init() and confirm new columns exist + old rows are intact."""
+    import aiosqlite
+    path = str(tmp_path / "legacy.db")
+    legacy = await aiosqlite.connect(path)
+    await legacy.executescript("""
+        CREATE TABLE jobs (
+            job_id TEXT PRIMARY KEY,
+            source_chat TEXT NOT NULL,
+            target_chat TEXT NOT NULL,
+            filter_type TEXT,
+            filter_value TEXT,
+            mode TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            auto_skip BOOLEAN DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT INTO jobs (job_id, source_chat, target_chat, mode, status)
+        VALUES ('legacy_job', '@s', '@d', 'batch', 'running');
+    """)
+    await legacy.commit()
+    await legacy.close()
+
+    db = TransferDB(path)
+    await db.init()
+    try:
+        job = await db.get_job("legacy_job")
+        assert job is not None
+        assert job["source_chat"] == "@s"
+        # New columns exist, default NULL on migrated rows
+        assert job["task_id"] is None
+        assert job["chat_id"] is None
+        # And new writes work
+        await db.update_job_binding("legacy_job", task_id="t", chat_id=9)
+        job = await db.get_job("legacy_job")
+        assert job["task_id"] == "t"
+        assert job["chat_id"] == 9
+    finally:
+        await db.close()

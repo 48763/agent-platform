@@ -100,3 +100,85 @@ class TestHandleTaskDispatch:
                 result = await agent.handle_task(task)
 
             assert result.status == TaskStatus.DONE
+
+
+class TestLLMFallbackRouting:
+    """When the regex classifier falls through to 'batch' but the LLM
+    recognises the fuzzy phrasing as a known command, dispatch should route
+    to that command instead of treating it as a batch request."""
+
+    def _build_agent(self):
+        from agents.tg_transfer.__main__ import TGTransferAgent
+        agent = TGTransferAgent.__new__(TGTransferAgent)
+        agent.db = AsyncMock()
+        agent.db.set_config = AsyncMock()
+        agent.db.get_config = AsyncMock(return_value=None)
+        agent.tg_client = AsyncMock()
+        agent.engine = AsyncMock()
+        agent.media_db = AsyncMock()
+        agent.media_db.get_stats = AsyncMock(return_value={
+            "total_media": 0, "total_tags": 0, "tag_counts": [],
+        })
+        agent.config = {"settings": {}}
+        agent._pending_jobs = {}
+        agent._search_state = {}
+        agent._current_chat_id = {}
+        agent._init_error = ""
+        agent.llm = MagicMock()
+        return agent
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_threshold_routes_to_threshold_handler(self):
+        """'我不想要超過 500 的' has no regex trigger, but LLM says threshold."""
+        agent = self._build_agent()
+
+        async def fake_ai_classify(content, llm):
+            return {"intent": "threshold", "params": {"mb": 500}}
+
+        with patch(
+            "agents.tg_transfer.__main__.ai_classify_command",
+            side_effect=fake_ai_classify,
+        ):
+            task = TaskRequest(task_id="fuzzy1", content="我不想要超過 500 的檔案了")
+            result = await agent.handle_task(task)
+
+        assert result.status == TaskStatus.DONE
+        agent.db.set_config.assert_called_once_with("size_limit_mb", "500")
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_stats_routes_to_stats_handler(self):
+        agent = self._build_agent()
+
+        async def fake_ai_classify(content, llm):
+            return {"intent": "stats", "params": {}}
+
+        with patch(
+            "agents.tg_transfer.__main__.ai_classify_command",
+            side_effect=fake_ai_classify,
+        ):
+            task = TaskRequest(task_id="fuzzy2", content="看一下目前儲存狀況")
+            result = await agent.handle_task(task)
+
+        assert result.status == TaskStatus.DONE
+        agent.media_db.get_stats.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_llm_returns_none_falls_back_to_batch(self):
+        """When LLM can't classify, we proceed to the original batch path."""
+        agent = self._build_agent()
+
+        async def fake_ai_classify(content, llm):
+            return None
+
+        async def fake_ai_parse_batch(content):
+            return None
+        agent._ai_parse_batch = fake_ai_parse_batch
+
+        with patch(
+            "agents.tg_transfer.__main__.ai_classify_command",
+            side_effect=fake_ai_classify,
+        ):
+            task = TaskRequest(task_id="fuzzy3", content="完全看不懂的句子")
+            result = await agent.handle_task(task)
+
+        assert result.status == TaskStatus.NEED_INPUT

@@ -3,8 +3,26 @@ from agents.tg_transfer.parser import (
     parse_tg_link,
     detect_forward,
     classify_intent,
+    parse_threshold,
+    ai_classify_command,
     ParsedLink,
 )
+
+
+class _FakeLLM:
+    """Minimal stub matching the LLM interface (.prompt(str) -> str)."""
+    def __init__(self, reply: str):
+        self._reply = reply
+        self.calls = []
+
+    async def prompt(self, text: str) -> str:
+        self.calls.append(text)
+        return self._reply
+
+
+class _RaisingLLM:
+    async def prompt(self, text: str) -> str:
+        raise RuntimeError("LLM down")
 
 
 class TestParseTgLink:
@@ -57,3 +75,101 @@ class TestClassifyIntent:
 
     def test_link_with_surrounding_text(self):
         assert classify_intent("幫我搬 https://t.me/c/123/456") == "single_transfer"
+
+    def test_threshold_intent_chinese(self):
+        assert classify_intent("門檻改成 200MB") == "threshold"
+
+    def test_threshold_intent_chinese_simple(self):
+        assert classify_intent("大小限制 500MB") == "threshold"
+
+    def test_threshold_intent_english(self):
+        assert classify_intent("size limit 1GB") == "threshold"
+
+
+class TestParseThreshold:
+    """parse_threshold returns the threshold in MB (int), or None if it can't
+    parse one. Used to let users change size_limit_mb mid-batch via chat."""
+
+    def test_mb_explicit(self):
+        assert parse_threshold("門檻改成 200MB") == 200
+
+    def test_gb_uppercase(self):
+        assert parse_threshold("size limit 1GB") == 1024
+
+    def test_gb_lowercase(self):
+        assert parse_threshold("限制 2gb") == 2048
+
+    def test_decimal_gb(self):
+        # 1.5 GB = 1536 MB
+        assert parse_threshold("threshold 1.5GB") == 1536
+
+    def test_bare_number_treated_as_mb(self):
+        """Bare number with no unit — assume MB (convention)."""
+        assert parse_threshold("門檻 500") == 500
+
+    def test_zero_means_disable(self):
+        """Explicit 0 is a valid threshold — means 'no limit'."""
+        assert parse_threshold("門檻改成 0") == 0
+
+    def test_no_number(self):
+        assert parse_threshold("門檻改成") is None
+
+    def test_kb_unsupported_returns_none(self):
+        """Too small to be meaningful; don't guess."""
+        assert parse_threshold("門檻 500KB") is None
+
+    def test_surrounding_text_ok(self):
+        assert parse_threshold("你好，請幫我把大小限制改成 300MB 謝謝") == 300
+
+
+class TestAIClassifyCommand:
+    """LLM-based fuzzy command classifier used as fallback when regex
+    classify_intent returns 'batch' but the message isn't actually a batch
+    request. Returns {'intent': str, 'params': dict} or None."""
+
+    @pytest.mark.asyncio
+    async def test_none_when_no_llm(self):
+        result = await ai_classify_command("anything", None)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_threshold_fuzzy_phrasing(self):
+        llm = _FakeLLM('{"intent": "threshold", "params": {"mb": 500}}')
+        result = await ai_classify_command("我不想要超過 500 的檔案了", llm)
+        assert result == {"intent": "threshold", "params": {"mb": 500}}
+
+    @pytest.mark.asyncio
+    async def test_stats_fuzzy_phrasing(self):
+        llm = _FakeLLM('{"intent": "stats", "params": {}}')
+        result = await ai_classify_command("看一下目前儲存了多少", llm)
+        assert result == {"intent": "stats", "params": {}}
+
+    @pytest.mark.asyncio
+    async def test_strips_markdown_fence(self):
+        llm = _FakeLLM('```json\n{"intent": "stats", "params": {}}\n```')
+        result = await ai_classify_command("狀態", llm)
+        assert result == {"intent": "stats", "params": {}}
+
+    @pytest.mark.asyncio
+    async def test_non_json_returns_none(self):
+        llm = _FakeLLM("不知道你在說什麼")
+        result = await ai_classify_command("???", llm)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_llm_error_returns_none(self):
+        result = await ai_classify_command("anything", _RaisingLLM())
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_intent_returns_none(self):
+        """LLM returns a nonsense intent — we reject it rather than trusting."""
+        llm = _FakeLLM('{"intent": "delete_everything", "params": {}}')
+        result = await ai_classify_command("清掉所有東西", llm)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_missing_params_defaults_to_empty_dict(self):
+        llm = _FakeLLM('{"intent": "stats"}')
+        result = await ai_classify_command("狀態", llm)
+        assert result == {"intent": "stats", "params": {}}
