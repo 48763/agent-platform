@@ -2,6 +2,7 @@ import os
 import shutil
 import logging
 import asyncio
+import uuid
 from typing import Callable, Optional, Any
 from telethon import TelegramClient
 from telethon.tl.types import DocumentAttributeVideo
@@ -12,6 +13,19 @@ from agents.tg_transfer.tag_extractor import extract_tags
 from agents.tg_transfer.media_utils import ffprobe_metadata
 
 logger = logging.getLogger(__name__)
+
+
+def _meta_from_message(message) -> dict | None:
+    """Fallback video metadata from telethon Message.file (uploader-reported)."""
+    f = getattr(message, "file", None)
+    if not f:
+        return None
+    width = getattr(f, "width", None) or 0
+    height = getattr(f, "height", None) or 0
+    duration = getattr(f, "duration", None) or 0
+    if not width or not height:
+        return None
+    return {"duration": int(duration), "width": int(width), "height": int(height)}
 
 
 class TransferEngine:
@@ -102,21 +116,29 @@ class TransferEngine:
         """Download and re-upload a single media message.
         Returns: {"ok": bool, "dedup": bool, "similar": list | None}
         """
-        job_dir = os.path.join(self.tmp_dir, str(message.id))
-        os.makedirs(job_dir, exist_ok=True)
+        os.makedirs(self.tmp_dir, exist_ok=True)
+        # Flat layout: per-message filenames share one directory to keep
+        # filesystem metadata churn (mkdir/rmtree per message) minimal.
+        base = f"{message.id}_{uuid.uuid4().hex[:8]}"
+        media_path = os.path.join(self.tmp_dir, f"{base}.dat")
+        frame_path = os.path.join(self.tmp_dir, f"{base}.frame.jpg")
+        thumb_path_target = os.path.join(self.tmp_dir, f"{base}.thumb.jpg")
+        artefacts = [media_path, frame_path, thumb_path_target]
         media_id = None
 
         try:
-            path = await self.client.download_media(message, file=job_dir)
+            path = await self.client.download_media(message, file=media_path)
             if not path:
                 return {"ok": False, "dedup": False, "similar": None}
+            if path != media_path:
+                artefacts.append(path)
 
             # Compute hashes
             sha256 = compute_sha256(path)
             file_type = self._detect_file_type(message)
             phash = None
             if file_type == "video":
-                phash = await compute_phash_video(path, job_dir)
+                phash = await compute_phash_video(path, frame_path)
             elif file_type == "photo":
                 phash = compute_phash(path)
 
@@ -153,6 +175,8 @@ class TransferEngine:
             # Add video metadata if applicable
             if file_type == "video":
                 meta = await ffprobe_metadata(path)
+                if not meta:
+                    meta = _meta_from_message(message)
                 if meta:
                     upload_kwargs["attributes"] = [DocumentAttributeVideo(
                         duration=meta["duration"],
@@ -161,6 +185,13 @@ class TransferEngine:
                         supports_streaming=True,
                     )]
                     upload_kwargs["supports_streaming"] = True
+
+            # Attach TG original thumbnail (largest variant) so preview shows
+            thumb_path = await self._download_tg_thumb(message, thumb_path_target)
+            if thumb_path:
+                upload_kwargs["thumb"] = thumb_path
+                if thumb_path != thumb_path_target:
+                    artefacts.append(thumb_path)
 
             # Upload
             result = await self.client.send_file(
@@ -185,8 +216,29 @@ class TransferEngine:
                     pass
             raise
         finally:
-            if os.path.exists(job_dir):
-                shutil.rmtree(job_dir)
+            for p in artefacts:
+                try:
+                    if p and os.path.exists(p):
+                        os.unlink(p)
+                except Exception:
+                    logger.debug(f"Failed to unlink tmp file {p}", exc_info=True)
+
+    async def _download_tg_thumb(self, message, thumb_path: str) -> str | None:
+        """Download the largest available TG-provided thumbnail for a message
+        to the given path. Returns None if the message has no thumbs or the
+        download fails."""
+        thumbs = None
+        doc = getattr(message, "document", None)
+        if doc is not None:
+            thumbs = getattr(doc, "thumbs", None)
+        if not thumbs:
+            return None
+        try:
+            path = await self.client.download_media(message, file=thumb_path, thumb=-1)
+            return path or None
+        except Exception as e:
+            logger.debug(f"Thumb download failed for msg {getattr(message, 'id', '?')}: {e}")
+            return None
 
     @staticmethod
     def _detect_file_type(message) -> str:

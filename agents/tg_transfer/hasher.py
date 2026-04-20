@@ -35,11 +35,14 @@ def compute_phash(file_path: str) -> str | None:
         return None
 
 
-async def compute_phash_video(file_path: str, tmp_dir: str) -> str | None:
-    """Extract first frame from video with ffmpeg, then compute pHash."""
+async def compute_phash_video(file_path: str, frame_path: str) -> str | None:
+    """Extract first frame from video with ffmpeg, then compute pHash.
+
+    frame_path: exact file path where the extracted frame will be written
+    (and deleted after hashing). Caller chooses a unique path.
+    """
     if not PHASH_AVAILABLE:
         return None
-    frame_path = os.path.join(tmp_dir, "frame.jpg")
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-i", file_path, "-ss", "1", "-frames:v", "1",

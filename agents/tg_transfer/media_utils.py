@@ -17,7 +17,7 @@ async def ffprobe_metadata(file_path: str) -> dict | None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
         if proc.returncode != 0:
             return None
 
@@ -29,6 +29,19 @@ async def ffprobe_metadata(file_path: str) -> dict | None:
         stream = streams[0]
         width = int(stream.get("width", 0))
         height = int(stream.get("height", 0))
+
+        # Apply rotation from side_data if present. ffprobe reports coded
+        # width/height; TG does not auto-rotate by metadata, so we must swap.
+        rotation = 0
+        for sd in stream.get("side_data_list", []) or []:
+            if "rotation" in sd:
+                try:
+                    rotation = int(sd["rotation"])
+                except (TypeError, ValueError):
+                    rotation = 0
+                break
+        if rotation % 180 != 0:
+            width, height = height, width
 
         # Duration can be in stream or format level
         duration_str = stream.get("duration")
