@@ -119,7 +119,7 @@ DASHBOARD_PASS=your-password
 | Agent | 說明 | 文件 |
 |-------|------|------|
 | **Claude Code** | 透過 Claude Code CLI 執行程式任務 | [`agents/claude_code/README.md`](agents/claude_code/README.md) |
-| **TG Transfer** | Telegram 群組資源搬移、媒體去重、搜尋、標籤 | [`agents/tg_transfer/README.md`](agents/tg_transfer/README.md) |
+| **TG Transfer** | Telegram 聊天資源搬移（群組/頻道/用戶/bot 皆可）、媒體去重、搜尋、標籤 | [`agents/tg_transfer/README.md`](agents/tg_transfer/README.md) |
 
 ## 共用模組（core/）
 

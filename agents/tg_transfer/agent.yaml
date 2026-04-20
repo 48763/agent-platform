@@ -1,8 +1,8 @@
 name: tg-transfer-agent
-description: "Telegram 群組資源搬移工具：支援單則/批量搬移、斷點續傳、跨 Job 去重、媒體搜尋"
+description: "Telegram 聊天資源搬移工具（群組/頻道/用戶/bot 皆可）：支援單則/批量搬移、斷點續傳、跨 Job 去重、媒體搜尋"
 priority: 3
 route_patterns:
-  - "搬移|轉存|複製群組|搬到|copy to|transfer|備份群組|搜尋|查詢|search|統計|stats"
+  - "搬移|轉存|複製|搬到|copy to|transfer|備份|搜尋|查詢|search|統計|stats"
 sandbox:
   allowed_dirs: []
   writable: false
