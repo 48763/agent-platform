@@ -475,6 +475,16 @@ async def handle_task_reopen(request: web.Request) -> web.Response:
 async def handle_task_delete(request: web.Request) -> web.Response:
     task_id = request.match_info["task_id"]
     tm = request.app["task_manager"]
+    task = tm.get_task(task_id)
+
+    # Cancel running agent before deleting — same logic as handle_task_close
+    if task and task["status"] in ("working", "waiting_input", "waiting_approval"):
+        registry = request.app["registry"]
+        agent_ws = registry.get_ws(task["agent_name"])
+        if agent_ws:
+            from core.ws import ws_msg, MsgType
+            await agent_ws.send_str(ws_msg(MsgType.CANCEL, task_id=task_id))
+
     tm._conn.execute("DELETE FROM task_messages WHERE task_id = ?", (task_id,))
     tm._conn.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
     tm._conn.commit()

@@ -1336,3 +1336,172 @@ async def test_transfer_album_no_limit_set_is_no_op(
                 target_chat="@dst", source_chat="@src", job_id="nolim",
             )
     assert ok is True
+
+
+class TestUploadFilenameExtension:
+    """Regression: transferred files were arriving with `.dat` filenames because
+    the local temp path used a hardcoded `.dat` suffix, and Telethon uses the
+    path basename as the uploaded filename. Recipients saw every photo/video as
+    a generic .dat file. Fix: derive the extension from the source message."""
+
+    @pytest.mark.asyncio
+    async def test_photo_upload_ends_with_jpg(self, engine, mock_client, tmp_path):
+        target_entity = MagicMock()
+        msg = _make_message(7001, text="pic", media=True)
+        msg.document = None
+        msg.file = MagicMock()
+        msg.file.ext = ".jpg"
+        msg.file.name = None
+
+        # Record whatever path send_file / download_media see.
+        captured = {}
+
+        async def fake_download(message, file=None, **kw):
+            captured["download_file"] = file
+            os.makedirs(os.path.dirname(file), exist_ok=True)
+            with open(file, "wb") as fh:
+                fh.write(b"\x89PNG\x00")
+            return file
+
+        mock_client.download_media = AsyncMock(side_effect=fake_download)
+        mock_client.send_file = AsyncMock(return_value=MagicMock(id=1))
+
+        with patch(
+            "agents.tg_transfer.transfer_engine.compute_sha256", return_value="p1",
+        ), patch(
+            "agents.tg_transfer.transfer_engine.compute_phash", return_value=None,
+        ):
+            await engine.transfer_single(MagicMock(), target_entity, msg)
+
+        uploaded_path = mock_client.send_file.call_args.args[1]
+        assert uploaded_path.endswith(".jpg"), (
+            f"photo upload path should end in .jpg, got {uploaded_path!r} "
+            f"— Telegram needs a real image extension to render inline"
+        )
+        assert not captured["download_file"].endswith(".dat")
+
+    @pytest.mark.asyncio
+    async def test_video_upload_ends_with_mp4(self, engine, mock_client, tmp_path):
+        target_entity = MagicMock()
+        msg = _make_video_message(7002, text="clip")
+        msg.document = MagicMock()
+        msg.document.thumbs = None
+        msg.file = MagicMock()
+        msg.file.ext = ".mp4"
+        msg.file.name = None
+        msg.file.width = 640
+        msg.file.height = 480
+        msg.file.duration = 5
+
+        async def fake_download(message, file=None, **kw):
+            os.makedirs(os.path.dirname(file), exist_ok=True)
+            with open(file, "wb") as fh:
+                fh.write(b"\x00")
+            return file
+
+        mock_client.download_media = AsyncMock(side_effect=fake_download)
+        mock_client.send_file = AsyncMock(return_value=MagicMock(id=2))
+
+        with patch(
+            "agents.tg_transfer.transfer_engine.ffprobe_metadata",
+            new_callable=AsyncMock, return_value=None,
+        ), patch(
+            "agents.tg_transfer.transfer_engine.compute_sha256", return_value="v1",
+        ), patch(
+            "agents.tg_transfer.transfer_engine.compute_phash_video",
+            new_callable=AsyncMock, return_value=None,
+        ):
+            await engine.transfer_single(MagicMock(), target_entity, msg)
+
+        uploaded_path = mock_client.send_file.call_args.args[1]
+        assert uploaded_path.endswith(".mp4"), (
+            f"video upload path should end in .mp4, got {uploaded_path!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_document_preserves_original_extension(
+        self, engine, mock_client, tmp_path,
+    ):
+        """For arbitrary documents, keep the source's original extension so
+        recipients see `report.pdf` rather than `report.dat`."""
+        target_entity = MagicMock()
+        msg = _make_message(7003, text=None, media=True)
+        msg.photo = None
+        msg.video = None
+        msg.document = MagicMock()
+        msg.document.thumbs = None
+        msg.file = MagicMock()
+        msg.file.ext = ".pdf"
+        msg.file.name = "report.pdf"
+
+        async def fake_download(message, file=None, **kw):
+            os.makedirs(os.path.dirname(file), exist_ok=True)
+            with open(file, "wb") as fh:
+                fh.write(b"%PDF-")
+            return file
+
+        mock_client.download_media = AsyncMock(side_effect=fake_download)
+        mock_client.send_file = AsyncMock(return_value=MagicMock(id=3))
+
+        with patch(
+            "agents.tg_transfer.transfer_engine.compute_sha256", return_value="d1",
+        ):
+            await engine.transfer_single(MagicMock(), target_entity, msg)
+
+        uploaded_path = mock_client.send_file.call_args.args[1]
+        assert uploaded_path.endswith(".pdf"), (
+            f"document upload path should preserve .pdf, got {uploaded_path!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_album_photos_end_with_jpg(
+        self, engine_with_media_db, mock_client, tmp_path,
+    ):
+        target_entity = MagicMock()
+        msg1 = _make_message(7010, text="album", grouped_id=70)
+        msg2 = _make_message(7011, grouped_id=70)
+        for m in (msg1, msg2):
+            m.file = MagicMock(ext=".jpg", name=None)
+
+        def _make_iter(msg, offset=0):
+            async def gen():
+                yield b"\x89PNG"
+            return gen()
+        mock_client.iter_download = _make_iter
+        mock_client.send_file = AsyncMock(
+            return_value=[MagicMock(id=1), MagicMock(id=2)],
+        )
+
+        with patch(
+            "agents.tg_transfer.transfer_engine.compute_sha256",
+            side_effect=["a1", "a2"],
+        ), patch(
+            "agents.tg_transfer.transfer_engine.compute_phash", return_value=None,
+        ):
+            ok = await engine_with_media_db.transfer_album(
+                target_entity, [msg1, msg2],
+                target_chat="@dst", source_chat="@src", job_id="ext-album",
+            )
+
+        assert ok is True
+        sent_paths = mock_client.send_file.call_args.args[1]
+        for p in sent_paths:
+            assert p.endswith(".jpg"), (
+                f"album file path should end in .jpg, got {p!r}"
+            )
+
+    def test_derive_upload_ext_uses_metadata(self):
+        """Extension comes from Telethon's message.file.ext (metadata-derived)."""
+        from agents.tg_transfer.transfer_engine import _derive_upload_ext
+        msg = MagicMock()
+        msg.file = MagicMock(ext=".webp")
+        assert _derive_upload_ext(msg) == ".webp"
+
+    def test_derive_upload_ext_no_metadata_returns_empty(self):
+        """When metadata has no ext, return empty string — not .dat."""
+        from agents.tg_transfer.transfer_engine import _derive_upload_ext
+        msg = MagicMock()
+        msg.file = MagicMock(ext=None)
+        result = _derive_upload_ext(msg)
+        assert result == ""
+        assert ".dat" not in result

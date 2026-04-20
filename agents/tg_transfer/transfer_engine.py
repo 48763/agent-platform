@@ -21,6 +21,16 @@ class OverSizeLimit(Exception):
     'skipped' (not 'failed') so retry logic doesn't fire."""
 
 
+def _derive_upload_ext(message) -> str:
+    """Return the file extension from Telethon metadata (message.file.ext).
+    Telethon resolves this from DocumentAttributeFilename or mime_type,
+    covering all media types. Falls back to empty string if unavailable."""
+    ext = getattr(getattr(message, "file", None), "ext", None)
+    if isinstance(ext, str) and ext.startswith(".") and len(ext) > 1:
+        return ext
+    return ""
+
+
 def _meta_from_message(message) -> dict | None:
     """Fallback video metadata from telethon Message.file (uploader-reported)."""
     f = getattr(message, "file", None)
@@ -232,7 +242,8 @@ class TransferEngine:
             planned_paths = []
             for msg in messages:
                 base = f"{msg.id}_{uuid.uuid4().hex[:8]}"
-                dest = os.path.join(self.tmp_dir, f"{base}.dat")
+                ext = _derive_upload_ext(msg)
+                dest = os.path.join(self.tmp_dir, f"{base}{ext}")
                 planned_paths.append(dest)
                 artefacts.append(dest)
 
@@ -260,8 +271,10 @@ class TransferEngine:
                 ]
             paths = await asyncio.gather(*download_tasks)
 
-            # Atomic check: all must succeed
+            # Atomic check: all must succeed and have real content
             if any(p is None for p in paths):
+                return False
+            if any(not os.path.exists(p) or os.path.getsize(p) == 0 for p in paths):
                 return False
 
             # Track any paths Telethon wrote elsewhere (e.g. when file arg was
@@ -392,7 +405,8 @@ class TransferEngine:
         # Flat layout: per-message filenames share one directory to keep
         # filesystem metadata churn (mkdir/rmtree per message) minimal.
         base = f"{message.id}_{uuid.uuid4().hex[:8]}"
-        media_path = os.path.join(self.tmp_dir, f"{base}.dat")
+        ext = _derive_upload_ext(message)
+        media_path = os.path.join(self.tmp_dir, f"{base}{ext}")
         frame_path = os.path.join(self.tmp_dir, f"{base}.frame.jpg")
         thumb_path_target = os.path.join(self.tmp_dir, f"{base}.thumb.jpg")
         artefacts = [media_path, frame_path, thumb_path_target]
@@ -411,6 +425,8 @@ class TransferEngine:
                 return {"ok": False, "dedup": False, "similar": None}
             if path != media_path:
                 artefacts.append(path)
+            if not os.path.exists(path) or os.path.getsize(path) == 0:
+                return {"ok": False, "dedup": False, "similar": None}
 
             # Compute hashes
             sha256 = compute_sha256(path)
