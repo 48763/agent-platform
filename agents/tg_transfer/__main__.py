@@ -557,6 +557,36 @@ class TGTransferAgent(BaseAgent):
         source_entity = await resolve_chat(self.tg_client, job["source_chat"])
         target_entity = await resolve_chat(self.tg_client, job["target_chat"])
 
+        # Phase 3: incrementally sync the target chat's thumb index so the
+        # upcoming source-side dedup (Phase 4) sees any messages added to
+        # target since our last scan. scan_target is a no-op when nothing
+        # new appeared, so the normal-case cost is one iter_messages call.
+        chat_id = self._current_chat_id.get(task_id, 0)
+
+        async def sync_progress_cb(scanned, total):
+            await self.ws_send_progress(
+                task_id, chat_id, f"同步目標索引：{scanned}/{total}"
+            )
+
+        try:
+            total_msgs = None
+            try:
+                m = await self.tg_client.get_messages(target_entity, limit=0)
+                total_msgs = getattr(m, "total", None)
+            except Exception:
+                total_msgs = None
+            indexer = TargetIndexer(
+                client=self.tg_client, tdb=self.db, mdb=self.media_db,
+            )
+            await indexer.scan_target(
+                job["target_chat"], total_hint=total_msgs,
+                progress_cb=sync_progress_cb,
+            )
+        except Exception as e:
+            # Sync failure shouldn't block the batch — dedup will just fall
+            # through to the full-file path for anything the index missed.
+            logger.warning(f"pre-batch target sync failed: {e}")
+
         filter_type = job["filter_type"] or "all"
         filter_value = json.loads(job["filter_value"]) if job["filter_value"] else None
         messages = await self._collect_messages(source_entity, filter_type, filter_value)
@@ -572,8 +602,6 @@ class TGTransferAgent(BaseAgent):
                 grouped_ids[msg.id] = msg.grouped_id
 
         await self.db.add_messages(job_id, msg_ids, grouped_ids)
-
-        chat_id = self._current_chat_id.get(task_id, 0)
 
         # Notify user via progress (not result, so task stays active)
         await self.ws_send_progress(task_id, chat_id,
