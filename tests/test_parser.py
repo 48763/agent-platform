@@ -85,6 +85,39 @@ class TestClassifyIntent:
     def test_threshold_intent_english(self):
         assert classify_intent("size limit 1GB") == "threshold"
 
+    def test_index_target_explicit_slash_command(self):
+        assert classify_intent("/index_target") == "index_target"
+
+    def test_index_target_with_chat_arg(self):
+        assert classify_intent("/index_target @my_archive") == "index_target"
+
+    def test_index_target_chinese_phrase(self):
+        assert classify_intent("索引目標") == "index_target"
+
+
+class TestParseIndexTargetChat:
+    """Extracts the chat argument from '/index_target [chat]' input. Returns
+    None when the user gave no explicit chat — caller should fall back to
+    default_target_chat config."""
+
+    def test_extracts_username_arg(self):
+        from agents.tg_transfer.parser import parse_index_target_chat
+        assert parse_index_target_chat("/index_target @my_backup") == "@my_backup"
+
+    def test_returns_none_when_no_arg(self):
+        from agents.tg_transfer.parser import parse_index_target_chat
+        assert parse_index_target_chat("/index_target") is None
+
+    def test_returns_none_for_chinese_phrase(self):
+        from agents.tg_transfer.parser import parse_index_target_chat
+        assert parse_index_target_chat("索引目標") is None
+
+    def test_extracts_numeric_chat_id(self):
+        """Private chats are identified by numeric IDs like -1001234567890."""
+        from agents.tg_transfer.parser import parse_index_target_chat
+        assert parse_index_target_chat("/index_target -1001234567890") \
+            == "-1001234567890"
+
 
 class TestParseThreshold:
     """parse_threshold returns the threshold in MB (int), or None if it can't

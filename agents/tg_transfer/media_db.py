@@ -232,6 +232,64 @@ class MediaDB:
         await self._db.commit()
         return row["media_id"] if row else None
 
+    async def insert_thumb_record(
+        self, thumb_phash: str | None, file_type: str, file_size: int | None,
+        caption: str | None, duration: int | None,
+        target_chat: str, target_msg_id: int,
+    ) -> int:
+        """Record a media that already lives in the target chat, indexed via
+        its TG thumbnail. sha256/phash are unknown (we never downloaded the
+        full file), so trust starts as 'thumb_only'. Re-scanning the same
+        (target_chat, target_msg_id) refreshes the metadata in place instead
+        of creating a second row, so /index_target is safely resumable and
+        re-runnable.
+
+        source_chat/source_msg_id are required NOT NULL by the legacy schema
+        but have no natural value for scan rows — we park them as ''/0.
+        """
+        async with self._db.execute(
+            "SELECT media_id FROM media WHERE target_chat = ? "
+            "AND target_msg_id = ?",
+            (target_chat, target_msg_id),
+        ) as cur:
+            existing = await cur.fetchone()
+        if existing:
+            await self._db.execute(
+                "UPDATE media SET thumb_phash = ?, file_type = ?, "
+                "file_size = ?, caption = ?, duration = ? "
+                "WHERE media_id = ?",
+                (thumb_phash, file_type, file_size, caption, duration,
+                 existing["media_id"]),
+            )
+            await self._db.commit()
+            return existing["media_id"]
+
+        async with self._db.execute(
+            "INSERT INTO media (thumb_phash, file_type, file_size, caption, "
+            "duration, source_chat, source_msg_id, target_chat, "
+            "target_msg_id, status, trust) "
+            "VALUES (?, ?, ?, ?, ?, '', 0, ?, ?, 'uploaded', 'thumb_only') "
+            "RETURNING media_id",
+            (thumb_phash, file_type, file_size, caption, duration,
+             target_chat, target_msg_id),
+        ) as cur:
+            row = await cur.fetchone()
+        await self._db.commit()
+        return row["media_id"]
+
+    async def find_by_thumb_phash(
+        self, thumb_phash: str, target_chat: str,
+    ) -> list[dict]:
+        """Exact thumb_phash matches scoped to a target chat. The caller is
+        expected to cross-validate via caption/file_size/duration before
+        trusting any of these as a true dedup hit (thumb collisions exist)."""
+        async with self._db.execute(
+            "SELECT * FROM media WHERE thumb_phash = ? AND target_chat = ? "
+            "ORDER BY media_id ASC",
+            (thumb_phash, target_chat),
+        ) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
     async def delete_media(self, media_id: int):
         await self._db.execute("DELETE FROM media WHERE media_id = ?", (media_id,))
         # media_tags rows auto-cascade via FK ON DELETE CASCADE. Tags that

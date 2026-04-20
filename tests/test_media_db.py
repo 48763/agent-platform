@@ -634,3 +634,103 @@ class TestMediaDBMigration:
             assert media["sha256"] == "x"
         finally:
             await db2.close()
+
+
+class TestInsertThumbRecord:
+    """Phase 2 — /index_target scan produces thumb-only rows. These rows
+    represent media that exists in the target chat but whose full-file
+    hashes (sha256/phash) have not been computed. trust='thumb_only'
+    signals the dedup layer that a match here needs cross-validation via
+    caption/file_size/duration before it can be treated as authoritative."""
+
+    @pytest.mark.asyncio
+    async def test_insert_thumb_record_sets_thumb_only_trust(self, mdb):
+        mid = await mdb.insert_thumb_record(
+            thumb_phash="abcd1234deadbeef",
+            file_type="photo",
+            file_size=12345,
+            caption="sunset",
+            duration=None,
+            target_chat="@t",
+            target_msg_id=500,
+        )
+        row = await mdb.get_media(mid)
+        assert row["thumb_phash"] == "abcd1234deadbeef"
+        assert row["trust"] == "thumb_only"
+        assert row["sha256"] is None
+        assert row["phash"] is None
+        assert row["status"] == "uploaded"  # already in target
+        assert row["target_chat"] == "@t"
+        assert row["target_msg_id"] == 500
+        assert row["source_chat"] == ""  # scan path has no source
+        assert row["source_msg_id"] == 0
+
+    @pytest.mark.asyncio
+    async def test_insert_thumb_record_stores_duration_for_video(self, mdb):
+        mid = await mdb.insert_thumb_record(
+            thumb_phash="ff00ff00ff00ff00",
+            file_type="video",
+            file_size=500_000_000,
+            caption="clip",
+            duration=42,
+            target_chat="@t",
+            target_msg_id=501,
+        )
+        row = await mdb.get_media(mid)
+        assert row["duration"] == 42
+        assert row["file_type"] == "video"
+
+    @pytest.mark.asyncio
+    async def test_insert_thumb_record_is_idempotent_per_target_msg(self, mdb):
+        """Re-scanning the same target message shouldn't create duplicate
+        rows — keyed on (target_chat, target_msg_id)."""
+        for _ in range(2):
+            await mdb.insert_thumb_record(
+                thumb_phash="aa00",
+                file_type="photo",
+                file_size=10,
+                caption=None,
+                duration=None,
+                target_chat="@t",
+                target_msg_id=700,
+            )
+        async with mdb._db.execute(
+            "SELECT COUNT(*) as c FROM media WHERE target_chat='@t' "
+            "AND target_msg_id=700"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["c"] == 1
+
+
+class TestFindByThumbPhash:
+    @pytest.mark.asyncio
+    async def test_find_by_thumb_phash_exact_match(self, mdb):
+        await mdb.insert_thumb_record(
+            thumb_phash="1111222233334444",
+            file_type="photo", file_size=100, caption="a",
+            duration=None, target_chat="@t", target_msg_id=1,
+        )
+        await mdb.insert_thumb_record(
+            thumb_phash="ffffffffffffffff",
+            file_type="photo", file_size=200, caption="b",
+            duration=None, target_chat="@t", target_msg_id=2,
+        )
+        hits = await mdb.find_by_thumb_phash("1111222233334444", "@t")
+        assert len(hits) == 1
+        assert hits[0]["target_msg_id"] == 1
+
+    @pytest.mark.asyncio
+    async def test_find_by_thumb_phash_scoped_to_target(self, mdb):
+        await mdb.insert_thumb_record(
+            thumb_phash="aaaa", file_type="photo", file_size=1,
+            caption=None, duration=None,
+            target_chat="@t1", target_msg_id=1,
+        )
+        await mdb.insert_thumb_record(
+            thumb_phash="aaaa", file_type="photo", file_size=1,
+            caption=None, duration=None,
+            target_chat="@t2", target_msg_id=1,
+        )
+        hits = await mdb.find_by_thumb_phash("aaaa", "@t1")
+        assert len(hits) == 1
+        assert hits[0]["target_chat"] == "@t1"

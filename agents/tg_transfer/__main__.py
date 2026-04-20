@@ -12,13 +12,14 @@ from core.base_agent import BaseAgent
 from core.models import AgentResult, TaskRequest, TaskStatus
 from agents.tg_transfer.parser import (
     parse_tg_link, detect_forward, classify_intent, parse_threshold,
-    ai_classify_command,
+    parse_index_target_chat, ai_classify_command,
 )
 from agents.tg_transfer.chat_resolver import resolve_chat
 from agents.tg_transfer.db import TransferDB
 from agents.tg_transfer.transfer_engine import TransferEngine
 from agents.tg_transfer.tg_client import create_client
 from agents.tg_transfer.media_db import MediaDB
+from agents.tg_transfer.indexer import TargetIndexer
 from agents.tg_transfer.byte_budget import ByteBudget
 from agents.tg_transfer.search import format_search_results, format_similar_results
 from agents.tg_transfer.hasher import compute_phash, hamming_distance, PHASH_AVAILABLE
@@ -177,6 +178,9 @@ class TGTransferAgent(BaseAgent):
 
         if intent == "stats":
             return await self._handle_stats()
+
+        if intent == "index_target":
+            return await self._handle_index_target(task, content)
 
         if intent == "page":
             return await self._handle_page(task)
@@ -379,6 +383,72 @@ class TGTransferAgent(BaseAgent):
         )
         text = format_search_results(results, total, page=state["page"], page_size=page_size)
         return AgentResult(status=TaskStatus.DONE, message=text)
+
+    async def _handle_index_target(self, task: TaskRequest, content: str):
+        """Run a thumb-only scan over the target chat and update media_db.
+        Returns None so the task stays active — progress and completion are
+        pushed via ws_send_progress / ws_send_result.
+        """
+        chat = parse_index_target_chat(content)
+        if chat is None:
+            chat = await self.db.get_config("default_target_chat")
+        if not chat:
+            return AgentResult(
+                status=TaskStatus.ERROR,
+                message="沒有指定目標對話，且未設定 default_target_chat。\n"
+                        "用法：/index_target @your_target",
+            )
+
+        task_id = task.task_id
+        chat_id = self._current_chat_id.get(task_id, 0)
+
+        await self.ws_send_progress(
+            task_id, chat_id, f"開始索引目標：{chat}"
+        )
+        asyncio.create_task(
+            self._run_index_background(task_id, chat_id, chat)
+        )
+        return None
+
+    async def _run_index_background(
+        self, task_id: str, chat_id: int, target_chat: str,
+    ):
+        try:
+            entity = await resolve_chat(self.tg_client, target_chat)
+            total = 0
+            try:
+                total = await self.tg_client.get_messages(entity, limit=0).total
+            except Exception:
+                # `total` is best-effort — scan still works, we just can't
+                # produce a percentage. iter_messages will eventually drain.
+                total = None
+
+            async def progress_cb(scanned, total_n):
+                await self.ws_send_progress(
+                    task_id, chat_id,
+                    f"索引中：{scanned}/{total_n}",
+                )
+
+            indexer = TargetIndexer(
+                client=self.tg_client, tdb=self.db, mdb=self.media_db,
+            )
+            stats = await indexer.scan_target(
+                target_chat, total_hint=total, progress_cb=progress_cb,
+            )
+            await self.ws_send_result(task_id, AgentResult(
+                status=TaskStatus.DONE,
+                message=(
+                    f"索引完成：{target_chat}\n"
+                    f"掃描 {stats['scanned']} 則，新增/更新 "
+                    f"{stats['inserted']} 筆 thumb 記錄"
+                ),
+            ))
+        except Exception as e:
+            logger.error(f"index_target error: {e}", exc_info=True)
+            await self.ws_send_result(task_id, AgentResult(
+                status=TaskStatus.ERROR,
+                message=f"索引失敗：{e}",
+            ))
 
     async def _handle_stats(self) -> AgentResult:
         """Return media stats as text."""

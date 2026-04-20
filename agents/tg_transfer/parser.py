@@ -24,6 +24,9 @@ _PAGE_RE = re.compile(r"(下一頁|上一頁|next|prev)", re.IGNORECASE)
 _THRESHOLD_RE = re.compile(
     r"(門檻|大小限制|size\s*limit|threshold|限制)", re.IGNORECASE,
 )
+# /index_target or /index_target @chat or "索引目標"
+_INDEX_TARGET_RE = re.compile(r"(^/index_target\b|索引目標|掃描目標)", re.IGNORECASE)
+_INDEX_TARGET_ARG_RE = re.compile(r"^/index_target\s+(\S+)", re.IGNORECASE)
 # Matches "300MB", "1.5GB", "2gb", "500" (MB implied), etc.
 _THRESHOLD_VALUE_RE = re.compile(
     r"(\d+(?:\.\d+)?)\s*(gb|mb|kb)?", re.IGNORECASE,
@@ -64,6 +67,8 @@ def classify_intent(text: str) -> str:
     """
     if parse_tg_link(text) is not None:
         return "single_transfer"
+    if _INDEX_TARGET_RE.search(text):
+        return "index_target"
     if _CONFIG_RE.search(text):
         return "config"
     if _THRESHOLD_RE.search(text):
@@ -75,6 +80,16 @@ def classify_intent(text: str) -> str:
     if _SEARCH_RE.search(text):
         return "search"
     return "batch"
+
+
+def parse_index_target_chat(text: str) -> Optional[str]:
+    """Pull the chat argument out of `/index_target <chat>`. Returns None
+    when the user supplied no explicit chat — the caller then falls back
+    to the configured default_target_chat."""
+    m = _INDEX_TARGET_ARG_RE.match(text.strip())
+    if m:
+        return m.group(1)
+    return None
 
 
 def parse_threshold(text: str) -> Optional[int]:
