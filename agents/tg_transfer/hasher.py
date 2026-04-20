@@ -1,4 +1,5 @@
 import hashlib
+import io
 import logging
 import asyncio
 import os
@@ -63,3 +64,34 @@ async def compute_phash_video(file_path: str, frame_path: str) -> str | None:
 def hamming_distance(hash1: str, hash2: str) -> int:
     """Compute Hamming distance between two hex hash strings."""
     return bin(int(hash1, 16) ^ int(hash2, 16)).count("1")
+
+
+async def download_thumb_and_phash(client, message) -> str | None:
+    """Download the smallest TG thumbnail for `message` and return its phash.
+
+    Used by the cross-source dedup path: TG always attaches a small preview
+    to photos/videos, so we can build a target-side index without ever
+    fetching the full file. `None` is returned whenever a phash can't be
+    produced (no media, no thumb, decode error, download error) — callers
+    should treat that as "no thumb-level match possible" and fall through
+    to the full-file path.
+    """
+    if not PHASH_AVAILABLE:
+        return None
+    if getattr(message, "media", None) is None:
+        return None
+    try:
+        # thumb=0 = smallest available preview; bytes=True keeps it in-memory
+        # so we avoid spilling temp files to disk during a scan.
+        data = await client.download_media(message, file=bytes, thumb=0)
+    except Exception as e:
+        logger.debug(f"Thumb download failed: {e}")
+        return None
+    if not data:
+        return None
+    try:
+        img = Image.open(io.BytesIO(data))
+        return str(imagehash.phash(img))
+    except Exception as e:
+        logger.debug(f"Thumb pHash failed: {e}")
+        return None

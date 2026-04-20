@@ -1,3 +1,5 @@
+import io
+from unittest.mock import AsyncMock, MagicMock
 import pytest
 from PIL import Image
 from agents.tg_transfer.hasher import compute_sha256, compute_phash, hamming_distance
@@ -47,6 +49,73 @@ class TestPHash:
         f = tmp_path / "test.txt"
         f.write_text("not an image")
         result = compute_phash(str(f))
+        assert result is None
+
+
+class TestDownloadThumbAndPhash:
+    """Phase 1 — dedicated helper for computing thumb_phash directly from a
+    Telegram message without touching the full media file. Used by the
+    /index_target scan (Phase 2) and the source-side dedup path (Phase 4)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_text_only_message(self):
+        from agents.tg_transfer.hasher import download_thumb_and_phash
+        client = AsyncMock()
+        msg = MagicMock()
+        msg.media = None
+        result = await download_thumb_and_phash(client, msg)
+        assert result is None
+        client.download_media.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_downloads_thumb_and_returns_phash(self):
+        from agents.tg_transfer.hasher import download_thumb_and_phash
+        # Produce real PNG bytes so Pillow can decode them.
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 64), color="green").save(buf, format="PNG")
+        thumb_bytes = buf.getvalue()
+
+        client = AsyncMock()
+        client.download_media = AsyncMock(return_value=thumb_bytes)
+        msg = MagicMock()
+        msg.media = MagicMock()  # has media
+
+        result = await download_thumb_and_phash(client, msg)
+        assert result is not None
+        assert len(result) == 16  # 16-char hex phash
+
+        # Must request the thumb, not the full file.
+        _, kwargs = client.download_media.call_args
+        assert "thumb" in kwargs
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_download_returns_empty(self):
+        from agents.tg_transfer.hasher import download_thumb_and_phash
+        client = AsyncMock()
+        client.download_media = AsyncMock(return_value=None)
+        msg = MagicMock()
+        msg.media = MagicMock()
+        result = await download_thumb_and_phash(client, msg)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_download_raises(self):
+        from agents.tg_transfer.hasher import download_thumb_and_phash
+        client = AsyncMock()
+        client.download_media = AsyncMock(side_effect=RuntimeError("boom"))
+        msg = MagicMock()
+        msg.media = MagicMock()
+        result = await download_thumb_and_phash(client, msg)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_bytes_are_not_image(self):
+        from agents.tg_transfer.hasher import download_thumb_and_phash
+        client = AsyncMock()
+        client.download_media = AsyncMock(return_value=b"not-an-image")
+        msg = MagicMock()
+        msg.media = MagicMock()
+        result = await download_thumb_and_phash(client, msg)
         assert result is None
 
 

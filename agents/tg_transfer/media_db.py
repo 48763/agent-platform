@@ -1,11 +1,15 @@
 import aiosqlite
 from typing import Optional
 
-_MEDIA_SCHEMA = """
+_MEDIA_TABLES = """
 CREATE TABLE IF NOT EXISTS media (
     media_id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    sha256          TEXT NOT NULL,
+    sha256          TEXT,
     phash           TEXT,
+    thumb_phash     TEXT,
+    duration        INTEGER,
+    trust           TEXT DEFAULT 'full',
+    verified_by     TEXT,
     file_type       TEXT NOT NULL,
     file_size       INTEGER,
     caption         TEXT,
@@ -18,12 +22,6 @@ CREATE TABLE IF NOT EXISTS media (
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_checked_at TIMESTAMP
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_media_sha256_target
-    ON media(sha256, target_chat);
-CREATE INDEX IF NOT EXISTS idx_media_phash ON media(phash);
-CREATE INDEX IF NOT EXISTS idx_media_caption ON media(caption);
-CREATE INDEX IF NOT EXISTS idx_media_status ON media(status);
 
 CREATE TABLE IF NOT EXISTS tags (
     tag_id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,6 +37,17 @@ CREATE TABLE IF NOT EXISTS media_tags (
 );
 """
 
+# Indexes run AFTER _migrate() so a legacy `media` table (missing
+# thumb_phash) has the column added before we try to index it.
+_MEDIA_INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_media_sha256_target
+    ON media(sha256, target_chat);
+CREATE INDEX IF NOT EXISTS idx_media_phash ON media(phash);
+CREATE INDEX IF NOT EXISTS idx_media_thumb_phash ON media(thumb_phash);
+CREATE INDEX IF NOT EXISTS idx_media_caption ON media(caption);
+CREATE INDEX IF NOT EXISTS idx_media_status ON media(status);
+"""
+
 
 class MediaDB:
     def __init__(self, db_path: str):
@@ -49,8 +58,96 @@ class MediaDB:
         self._db = await aiosqlite.connect(self.db_path)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA foreign_keys = ON")
-        await self._db.executescript(_MEDIA_SCHEMA)
+        await self._db.executescript(_MEDIA_TABLES)
+        await self._migrate()
+        await self._db.executescript(_MEDIA_INDEXES)
         await self._db.commit()
+
+    async def _migrate(self):
+        """Upgrade legacy media tables in-place.
+
+        Legacy DBs have `sha256 TEXT NOT NULL` and no
+        thumb_phash/duration/trust/verified_by columns. The scan path
+        (Phase 2) creates rows from TG thumbnails alone, so sha256 must
+        become nullable. SQLite can't ALTER a NOT NULL constraint in
+        place — the only portable fix is table-rebuild: create a new
+        table with the current schema, copy rows, swap names.
+        """
+        async with self._db.execute("PRAGMA table_info(media)") as cur:
+            info = list(await cur.fetchall())
+        cols = {row["name"]: row for row in info}
+
+        needs_rebuild = (
+            "sha256" in cols and cols["sha256"]["notnull"] == 1
+        )
+        missing = {
+            "thumb_phash", "duration", "trust", "verified_by",
+        } - set(cols.keys())
+
+        if needs_rebuild:
+            # Rebuild: create _new with full schema, copy, swap.
+            await self._db.execute("PRAGMA foreign_keys = OFF")
+            await self._db.executescript(
+                """
+                CREATE TABLE media_new (
+                    media_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sha256          TEXT,
+                    phash           TEXT,
+                    thumb_phash     TEXT,
+                    duration        INTEGER,
+                    trust           TEXT DEFAULT 'full',
+                    verified_by     TEXT,
+                    file_type       TEXT NOT NULL,
+                    file_size       INTEGER,
+                    caption         TEXT,
+                    source_chat     TEXT NOT NULL,
+                    source_msg_id   INTEGER NOT NULL,
+                    target_chat     TEXT NOT NULL,
+                    target_msg_id   INTEGER,
+                    status          TEXT DEFAULT 'pending',
+                    job_id          TEXT,
+                    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_checked_at TIMESTAMP
+                );
+                INSERT INTO media_new (
+                    media_id, sha256, phash, file_type, file_size, caption,
+                    source_chat, source_msg_id, target_chat, target_msg_id,
+                    status, job_id, created_at, last_checked_at
+                )
+                SELECT
+                    media_id, sha256, phash, file_type, file_size, caption,
+                    source_chat, source_msg_id, target_chat, target_msg_id,
+                    status, job_id, created_at, last_checked_at
+                FROM media;
+                DROP TABLE media;
+                ALTER TABLE media_new RENAME TO media;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_media_sha256_target
+                    ON media(sha256, target_chat);
+                CREATE INDEX IF NOT EXISTS idx_media_phash ON media(phash);
+                CREATE INDEX IF NOT EXISTS idx_media_thumb_phash
+                    ON media(thumb_phash);
+                CREATE INDEX IF NOT EXISTS idx_media_caption ON media(caption);
+                CREATE INDEX IF NOT EXISTS idx_media_status ON media(status);
+                """
+            )
+            await self._db.execute("PRAGMA foreign_keys = ON")
+        elif missing:
+            # Non-legacy but pre-Phase-1 DB: columns just need to be added.
+            # (Unlikely branch, but covers future intermediate versions.)
+            type_map = {
+                "thumb_phash": "TEXT",
+                "duration": "INTEGER",
+                "trust": "TEXT DEFAULT 'full'",
+                "verified_by": "TEXT",
+            }
+            for col in missing:
+                await self._db.execute(
+                    f"ALTER TABLE media ADD COLUMN {col} {type_map[col]}"
+                )
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_thumb_phash "
+                "ON media(thumb_phash)"
+            )
 
     async def close(self):
         if self._db:

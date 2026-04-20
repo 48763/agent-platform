@@ -464,3 +464,173 @@ class TestDeleteMediaCleansTags:
         ) as cur:
             names = [r["name"] for r in await cur.fetchall()]
         assert names == ["shared"]
+
+
+class TestNewSchemaColumns:
+    """Phase 1 of cross-source dedup: three-level hash trust model.
+    The media schema gains thumb_phash / duration / trust / verified_by
+    so we can index target chats from TG thumbnails alone (no full
+    download). sha256 / phash become nullable because scanned rows don't
+    have them."""
+
+    @pytest.mark.asyncio
+    async def test_sha256_is_nullable(self, mdb):
+        """Scanned rows have no full-file hash. Schema must allow it."""
+        await mdb._db.execute(
+            "INSERT INTO media (sha256, phash, file_type, source_chat, "
+            "source_msg_id, target_chat, target_msg_id, status) "
+            "VALUES (NULL, NULL, 'photo', '@s', 1, '@t', 10, 'uploaded')"
+        )
+        await mdb._db.commit()
+        async with mdb._db.execute(
+            "SELECT sha256 FROM media WHERE target_msg_id = 10"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["sha256"] is None
+
+    @pytest.mark.asyncio
+    async def test_thumb_phash_column_exists(self, mdb):
+        async with mdb._db.execute("PRAGMA table_info(media)") as cur:
+            cols = {row["name"] for row in await cur.fetchall()}
+        assert "thumb_phash" in cols
+
+    @pytest.mark.asyncio
+    async def test_duration_column_exists(self, mdb):
+        async with mdb._db.execute("PRAGMA table_info(media)") as cur:
+            cols = {row["name"] for row in await cur.fetchall()}
+        assert "duration" in cols
+
+    @pytest.mark.asyncio
+    async def test_trust_column_defaults_to_full(self, mdb):
+        mid = await mdb.insert_media(
+            sha256="tr1", phash=None, file_type="photo", file_size=1,
+            caption=None, source_chat="@s", source_msg_id=1, target_chat="@t",
+        )
+        media = await mdb.get_media(mid)
+        # Transfer path (has sha256) → trust full by default.
+        assert media["trust"] == "full"
+
+    @pytest.mark.asyncio
+    async def test_verified_by_column_exists_and_nullable(self, mdb):
+        mid = await mdb.insert_media(
+            sha256="vb1", phash=None, file_type="photo", file_size=1,
+            caption=None, source_chat="@s", source_msg_id=1, target_chat="@t",
+        )
+        media = await mdb.get_media(mid)
+        assert "verified_by" in media
+        assert media["verified_by"] is None
+
+    @pytest.mark.asyncio
+    async def test_thumb_phash_index_exists(self, mdb):
+        async with mdb._db.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='media'"
+        ) as cur:
+            names = {r["name"] for r in await cur.fetchall()}
+        # Either named explicitly or any index whose SQL references thumb_phash
+        async with mdb._db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='media'"
+        ) as cur:
+            sqls = [r["sql"] or "" for r in await cur.fetchall()]
+        assert any("thumb_phash" in s for s in sqls), (
+            f"No index on thumb_phash; indexes: {names}"
+        )
+
+
+class TestMediaDBMigration:
+    """Legacy DBs (sha256 NOT NULL, no new columns) must be upgraded
+    in-place without losing existing rows."""
+
+    @pytest.mark.asyncio
+    async def test_legacy_db_gets_new_columns_preserving_rows(self, tmp_path):
+        import aiosqlite
+        path = str(tmp_path / "legacy_media.db")
+        legacy = await aiosqlite.connect(path)
+        await legacy.executescript("""
+            CREATE TABLE media (
+                media_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sha256 TEXT NOT NULL,
+                phash TEXT,
+                file_type TEXT NOT NULL,
+                file_size INTEGER,
+                caption TEXT,
+                source_chat TEXT NOT NULL,
+                source_msg_id INTEGER NOT NULL,
+                target_chat TEXT NOT NULL,
+                target_msg_id INTEGER,
+                status TEXT DEFAULT 'pending',
+                job_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_checked_at TIMESTAMP
+            );
+            CREATE UNIQUE INDEX idx_media_sha256_target ON media(sha256, target_chat);
+            CREATE TABLE tags (
+                tag_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE media_tags (
+                media_id INTEGER NOT NULL,
+                tag_id INTEGER NOT NULL,
+                PRIMARY KEY (media_id, tag_id)
+            );
+            INSERT INTO media (sha256, file_type, source_chat, source_msg_id,
+                               target_chat, status)
+            VALUES ('legacy_sha', 'photo', '@s', 99, '@t', 'uploaded');
+        """)
+        await legacy.commit()
+        await legacy.close()
+
+        db = MediaDB(path)
+        await db.init()
+        try:
+            # New columns present
+            async with db._db.execute("PRAGMA table_info(media)") as cur:
+                cols = {row["name"] for row in await cur.fetchall()}
+            assert {"thumb_phash", "duration", "trust", "verified_by"} <= cols
+
+            # Old row preserved
+            async with db._db.execute(
+                "SELECT * FROM media WHERE sha256 = 'legacy_sha'"
+            ) as cur:
+                row = await cur.fetchone()
+            assert row is not None
+            assert row["target_chat"] == "@t"
+            assert row["trust"] == "full"  # legacy rows default to full
+
+            # After migration, can insert a scanned row with NULL sha256
+            await db._db.execute(
+                "INSERT INTO media (sha256, file_type, source_chat, "
+                "source_msg_id, target_chat, target_msg_id, status, "
+                "thumb_phash, trust) "
+                "VALUES (NULL, 'photo', '@s', 100, '@t', 500, 'uploaded', "
+                "'abcd1234', 'thumb_only')"
+            )
+            await db._db.commit()
+            async with db._db.execute(
+                "SELECT trust, thumb_phash FROM media WHERE target_msg_id = 500"
+            ) as cur:
+                scanned = await cur.fetchone()
+            assert scanned["trust"] == "thumb_only"
+            assert scanned["thumb_phash"] == "abcd1234"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_migration_is_idempotent(self, tmp_path):
+        """Running init() twice on the same DB shouldn't error or duplicate."""
+        path = str(tmp_path / "idem.db")
+        db1 = MediaDB(path)
+        await db1.init()
+        mid = await db1.insert_media(
+            sha256="x", phash=None, file_type="photo", file_size=1,
+            caption=None, source_chat="@s", source_msg_id=1, target_chat="@t",
+        )
+        await db1.close()
+
+        db2 = MediaDB(path)
+        await db2.init()
+        try:
+            media = await db2.get_media(mid)
+            assert media is not None
+            assert media["sha256"] == "x"
+        finally:
+            await db2.close()
