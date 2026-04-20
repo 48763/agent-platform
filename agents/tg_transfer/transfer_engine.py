@@ -342,8 +342,42 @@ class TransferEngine:
             if not effective_paths:
                 return True
 
+            # Build per-file attributes + thumbs for videos in album
+            per_file_attrs = []
+            per_file_thumbs = []
+            for msg, path in zip(effective_messages, effective_paths):
+                file_type = self._detect_file_type(msg)
+                attrs = None
+                thumb = None
+                if file_type == "video":
+                    meta = await ffprobe_metadata(path)
+                    if not meta:
+                        meta = _meta_from_message(msg)
+                    if meta:
+                        attrs = [DocumentAttributeVideo(
+                            duration=meta["duration"],
+                            w=meta["width"],
+                            h=meta["height"],
+                            supports_streaming=True,
+                        )]
+                    thumb_dest = os.path.join(
+                        self.tmp_dir,
+                        f"{msg.id}_{uuid.uuid4().hex[:8]}.athumb.jpg",
+                    )
+                    artefacts.append(thumb_dest)
+                    thumb = await self._download_tg_thumb(msg, thumb_dest)
+                per_file_attrs.append(attrs)
+                per_file_thumbs.append(thumb)
+
+            upload_kwargs = {"caption": caption}
+            # Only pass attributes/thumb lists if any file has them
+            if any(a is not None for a in per_file_attrs):
+                upload_kwargs["attributes"] = per_file_attrs
+            if any(t is not None for t in per_file_thumbs):
+                upload_kwargs["thumb"] = per_file_thumbs
+
             result = await self.client.send_file(
-                target_entity, effective_paths, caption=caption,
+                target_entity, effective_paths, **upload_kwargs,
             )
 
             # Mark uploaded per file. send_file for a list returns a list of
