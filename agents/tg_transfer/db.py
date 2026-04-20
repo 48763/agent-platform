@@ -2,6 +2,11 @@ import aiosqlite
 import uuid
 from typing import Optional
 
+# Statuses after which a job can't be resumed. Reaching any of these triggers
+# job_messages cleanup so the per-message rows (potentially thousands) don't
+# linger forever; the jobs row itself stays as history.
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     job_id      TEXT PRIMARY KEY,
@@ -107,6 +112,10 @@ class TransferDB:
             "UPDATE jobs SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?",
             (status, job_id),
         )
+        if status in _TERMINAL_STATUSES:
+            await self._db.execute(
+                "DELETE FROM job_messages WHERE job_id = ?", (job_id,),
+            )
         await self._db.commit()
 
     async def set_auto_skip(self, job_id: str, auto_skip: bool):

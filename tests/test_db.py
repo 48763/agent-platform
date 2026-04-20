@@ -84,15 +84,30 @@ async def test_set_auto_skip(db):
 
 
 @pytest.mark.asyncio
-async def test_dedup_returns_existing_success_ids(db):
+async def test_dedup_returns_success_ids_while_job_running(db):
+    """Cross-job text-message dedup is sourced from job_messages.status.
+    It works WHILE the job is alive (running / paused). Once the job
+    reaches a terminal status the messages are pruned — see
+    TestJobTerminalCleanup for the contract."""
     job1 = await db.create_job("@src", "@dst", "batch")
     await db.add_messages(job1, [10, 11, 12])
     await db.mark_message(job1, 10, "success")
     await db.mark_message(job1, 11, "success")
     await db.mark_message(job1, 12, "failed")
-    await db.update_job_status(job1, "completed")
     already_done = await db.get_transferred_message_ids("@src", "@dst")
     assert already_done == {10, 11}
+
+
+@pytest.mark.asyncio
+async def test_dedup_empty_after_job_completed(db):
+    """After terminal cleanup, job_messages are gone, so cross-job text
+    dedup returns empty. Media dedup is unaffected (uses the media table)."""
+    job1 = await db.create_job("@src", "@dst", "batch")
+    await db.add_messages(job1, [10, 11])
+    await db.mark_message(job1, 10, "success")
+    await db.mark_message(job1, 11, "success")
+    await db.update_job_status(job1, "completed")
+    assert await db.get_transferred_message_ids("@src", "@dst") == set()
 
 
 @pytest.mark.asyncio
@@ -316,3 +331,58 @@ async def test_migration_adds_task_id_chat_id_to_legacy_jobs(tmp_path):
         assert job["chat_id"] == 9
     finally:
         await db.close()
+
+
+class TestJobTerminalCleanup:
+    """When a job transitions to a terminal status (completed / failed /
+    cancelled), its job_messages rows should be deleted to reclaim space. The
+    jobs row itself stays so history is still visible."""
+
+    @pytest.mark.asyncio
+    async def test_completed_removes_job_messages(self, db):
+        job_id = await db.create_job(
+            source_chat="@s", target_chat="@t", mode="batch",
+        )
+        await db.add_messages(job_id, [1, 2, 3])
+        await db.update_job_status(job_id, "completed")
+
+        # Messages wiped, job row remains.
+        assert await db.get_next_pending(job_id) is None
+        progress = await db.get_progress(job_id)
+        assert progress["total"] == 0
+        assert await db.get_job(job_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_failed_removes_job_messages(self, db):
+        job_id = await db.create_job(
+            source_chat="@s", target_chat="@t", mode="batch",
+        )
+        await db.add_messages(job_id, [10, 20])
+        await db.update_job_status(job_id, "failed")
+
+        progress = await db.get_progress(job_id)
+        assert progress["total"] == 0
+        assert await db.get_job(job_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_cancelled_removes_job_messages(self, db):
+        job_id = await db.create_job(
+            source_chat="@s", target_chat="@t", mode="batch",
+        )
+        await db.add_messages(job_id, [5])
+        await db.update_job_status(job_id, "cancelled")
+
+        progress = await db.get_progress(job_id)
+        assert progress["total"] == 0
+
+    @pytest.mark.asyncio
+    async def test_non_terminal_preserves_job_messages(self, db):
+        """Transitions like running / paused must NOT wipe messages."""
+        job_id = await db.create_job(
+            source_chat="@s", target_chat="@t", mode="batch",
+        )
+        await db.add_messages(job_id, [1, 2, 3])
+        await db.update_job_status(job_id, "running")
+        assert (await db.get_progress(job_id))["total"] == 3
+        await db.update_job_status(job_id, "paused")
+        assert (await db.get_progress(job_id))["total"] == 3

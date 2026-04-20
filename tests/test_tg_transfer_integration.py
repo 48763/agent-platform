@@ -60,13 +60,16 @@ async def test_single_transfer_via_link(db, mock_tg_client):
 
 @pytest.mark.asyncio
 async def test_batch_with_dedup(db):
-    """Second batch run on same source->target should skip already-done messages."""
+    """Cross-job text dedup via job_messages works WHILE the job is still
+    alive. Once the job reaches a terminal status, job_messages are pruned
+    to keep DB small, so dedup would return empty — media dedup (via the
+    media table) is the long-term guard there."""
     job1 = await db.create_job("@src", "@dst", "batch")
     await db.add_messages(job1, [1, 2, 3])
     await db.mark_message(job1, 1, "success")
     await db.mark_message(job1, 2, "success")
     await db.mark_message(job1, 3, "success")
-    await db.update_job_status(job1, "completed")
+    # Do NOT mark completed here — that would wipe the per-message rows.
 
     already = await db.get_transferred_message_ids("@src", "@dst")
     assert already == {1, 2, 3}
