@@ -137,6 +137,13 @@ class MediaDB:
 
     async def delete_media(self, media_id: int):
         await self._db.execute("DELETE FROM media WHERE media_id = ?", (media_id,))
+        # media_tags rows auto-cascade via FK ON DELETE CASCADE. Tags that
+        # no longer have ANY media linking to them become orphans — drop
+        # them so total_tags / dashboard reflect reality.
+        await self._db.execute(
+            "DELETE FROM tags WHERE tag_id NOT IN "
+            "(SELECT DISTINCT tag_id FROM media_tags)"
+        )
         await self._db.commit()
 
     # -- Dedup --
@@ -214,7 +221,25 @@ class MediaDB:
             for row in await cur.fetchall():
                 by_status[row["status"]] = row["cnt"]
         total_media = by_status.get("uploaded", 0)
-        async with self._db.execute("SELECT COUNT(*) as cnt FROM tags") as cur:
+
+        # Breakdown by media kind (photo / video / document / ...) — only
+        # uploaded rows, so failed / skipped attempts don't pad the numbers.
+        by_type: dict[str, int] = {}
+        async with self._db.execute(
+            "SELECT file_type, COUNT(*) as cnt FROM media "
+            "WHERE status = 'uploaded' GROUP BY file_type"
+        ) as cur:
+            for row in await cur.fetchall():
+                by_type[row["file_type"]] = row["cnt"]
+
+        # Count only tags that are still linked to an uploaded media — orphans
+        # from deleted / unfinished transfers shouldn't inflate the total.
+        async with self._db.execute(
+            "SELECT COUNT(DISTINCT t.tag_id) as cnt FROM tags t "
+            "JOIN media_tags mt ON t.tag_id = mt.tag_id "
+            "JOIN media m ON mt.media_id = m.media_id "
+            "WHERE m.status = 'uploaded'"
+        ) as cur:
             total_tags = (await cur.fetchone())["cnt"]
         async with self._db.execute(
             "SELECT t.name, COUNT(mt.media_id) as cnt FROM tags t "
@@ -228,6 +253,7 @@ class MediaDB:
             "total_tags": total_tags,
             "tag_counts": tag_counts,
             "by_status": by_status,
+            "by_type": by_type,
         }
 
     # -- Liveness --

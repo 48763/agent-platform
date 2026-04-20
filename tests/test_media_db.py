@@ -348,3 +348,119 @@ async def test_update_last_checked(mdb):
     await mdb.update_last_checked(m1)
     media = await mdb.get_media(m1)
     assert media["last_checked_at"] is not None
+
+
+class TestStatsByType:
+    """get_stats() should break uploaded media down by file_type so the
+    dashboard can show photos / videos / documents separately."""
+
+    @pytest.mark.asyncio
+    async def test_by_type_counts_only_uploaded(self, mdb):
+        # Two uploaded photos
+        for i, sha in enumerate(["p1", "p2"]):
+            mid = await mdb.insert_media(
+                sha256=sha, phash=None, file_type="photo", file_size=10,
+                caption=None, source_chat="@s", source_msg_id=i,
+                target_chat=f"@d{i}",
+            )
+            await mdb.mark_uploaded(mid, target_msg_id=100 + i)
+        # One uploaded video
+        v = await mdb.insert_media(
+            sha256="v1", phash=None, file_type="video", file_size=100,
+            caption=None, source_chat="@s", source_msg_id=50, target_chat="@d",
+        )
+        await mdb.mark_uploaded(v, target_msg_id=200)
+        # One pending photo — should NOT be counted
+        await mdb.insert_media(
+            sha256="p3", phash=None, file_type="photo", file_size=10,
+            caption=None, source_chat="@s", source_msg_id=60, target_chat="@d3",
+        )
+        stats = await mdb.get_stats()
+        assert stats["by_type"] == {"photo": 2, "video": 1}
+        # total_media remains the overall uploaded count
+        assert stats["total_media"] == 3
+
+    @pytest.mark.asyncio
+    async def test_by_type_empty_when_none_uploaded(self, mdb):
+        stats = await mdb.get_stats()
+        assert stats["by_type"] == {}
+
+
+class TestTagsUsedOnly:
+    """total_tags should count only tags that are still linked to uploaded
+    media. Orphan tags (left behind after media is deleted) must not inflate
+    the count."""
+
+    @pytest.mark.asyncio
+    async def test_orphan_tags_not_counted(self, mdb):
+        m = await mdb.insert_media(
+            sha256="a", phash=None, file_type="photo", file_size=1,
+            caption=None, source_chat="@s", source_msg_id=1, target_chat="@d",
+        )
+        await mdb.mark_uploaded(m, target_msg_id=10)
+        await mdb.add_tags(m, ["used_tag"])
+
+        # Create an orphan tag by inserting directly (simulates leftover from
+        # deleted media before we had cascade).
+        await mdb._db.execute(
+            "INSERT INTO tags (name) VALUES ('orphan_tag')"
+        )
+        await mdb._db.commit()
+
+        stats = await mdb.get_stats()
+        assert stats["total_tags"] == 1  # only 'used_tag'
+
+    @pytest.mark.asyncio
+    async def test_tags_only_from_uploaded_media(self, mdb):
+        """A tag only linked to a pending/failed/skipped media counts as
+        orphan — we only track usage on uploaded."""
+        m = await mdb.insert_media(
+            sha256="x", phash=None, file_type="photo", file_size=1,
+            caption=None, source_chat="@s", source_msg_id=1, target_chat="@d",
+        )
+        # still pending (not uploaded)
+        await mdb.add_tags(m, ["ghost"])
+        stats = await mdb.get_stats()
+        assert stats["total_tags"] == 0
+
+
+class TestDeleteMediaCleansTags:
+    """Deleting a media should also drop any tags that are left with no
+    references (orphan cleanup)."""
+
+    @pytest.mark.asyncio
+    async def test_delete_media_removes_orphan_tags(self, mdb):
+        m = await mdb.insert_media(
+            sha256="a", phash=None, file_type="photo", file_size=1,
+            caption=None, source_chat="@s", source_msg_id=1, target_chat="@d",
+        )
+        await mdb.mark_uploaded(m, target_msg_id=10)
+        await mdb.add_tags(m, ["t1", "t2"])
+
+        await mdb.delete_media(m)
+
+        async with mdb._db.execute("SELECT COUNT(*) AS n FROM tags") as cur:
+            assert (await cur.fetchone())["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_delete_media_keeps_tags_still_used(self, mdb):
+        m1 = await mdb.insert_media(
+            sha256="a", phash=None, file_type="photo", file_size=1,
+            caption=None, source_chat="@s", source_msg_id=1, target_chat="@d1",
+        )
+        m2 = await mdb.insert_media(
+            sha256="b", phash=None, file_type="photo", file_size=1,
+            caption=None, source_chat="@s", source_msg_id=2, target_chat="@d2",
+        )
+        await mdb.mark_uploaded(m1, target_msg_id=10)
+        await mdb.mark_uploaded(m2, target_msg_id=20)
+        await mdb.add_tags(m1, ["shared", "only_on_1"])
+        await mdb.add_tags(m2, ["shared"])
+
+        await mdb.delete_media(m1)
+
+        async with mdb._db.execute(
+            "SELECT name FROM tags ORDER BY name"
+        ) as cur:
+            names = [r["name"] for r in await cur.fetchall()]
+        assert names == ["shared"]
