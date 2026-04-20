@@ -87,7 +87,14 @@ class TGTransferAgent(BaseAgent):
         interval = settings.get("liveness_check_interval", 24)
         asyncio.create_task(run_liveness_loop(self.tg_client, self.media_db, interval))
 
-        # Resume interrupted jobs (running + paused)
+        # Resume is triggered by on_ws_connected(), not here,
+        # because WS must be up before we can send progress/result.
+
+    async def on_ws_connected(self):
+        """Resume interrupted jobs once WS is up (first connect only)."""
+        if getattr(self, '_resumed', False):
+            return
+        self._resumed = True
         await self._resume_interrupted_jobs()
 
     async def _resume_interrupted_jobs(self):

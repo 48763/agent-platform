@@ -40,6 +40,11 @@ class BaseAgent(ABC):
         """
         pass
 
+    async def on_ws_connected(self) -> None:
+        """Called after WS connects (and re-register completes).
+        Override to resume work that needs WS to send progress/results."""
+        pass
+
     def create_app(self) -> web.Application:
         app = web.Application()
         app.router.add_get("/health", self._handle_health)
@@ -117,6 +122,12 @@ class BaseAgent(ABC):
                             await self.register(self._actual_port)
                         except Exception as e:
                             logger.warning(f"Re-register failed: {e}")
+
+                        # Let subclass resume work that needs WS
+                        try:
+                            await self.on_ws_connected()
+                        except Exception as e:
+                            logger.warning(f"on_ws_connected error: {e}")
 
                         async for msg in ws:
                             if msg.type == WSMsgType.TEXT:
