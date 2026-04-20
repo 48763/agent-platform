@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import os
 from agents.tg_transfer.transfer_engine import TransferEngine
 from agents.tg_transfer.db import TransferDB
+from agents.tg_transfer.media_db import MediaDB
 
 
 @pytest_asyncio.fixture
@@ -44,6 +45,26 @@ def engine(mock_client, db, tmp_path):
         tmp_dir=str(tmp_path / "downloads"),
         retry_limit=2,
         progress_interval=2,
+    )
+
+
+@pytest_asyncio.fixture
+async def media_db(tmp_path):
+    mdb = MediaDB(str(tmp_path / "media.db"))
+    await mdb.init()
+    yield mdb
+    await mdb.close()
+
+
+@pytest.fixture
+def engine_with_media_db(mock_client, db, media_db, tmp_path):
+    return TransferEngine(
+        client=mock_client,
+        db=db,
+        tmp_dir=str(tmp_path / "downloads"),
+        retry_limit=2,
+        progress_interval=2,
+        media_db=media_db,
     )
 
 
@@ -309,6 +330,109 @@ async def test_transfer_album_atomic_download_failure(engine, mock_client, tmp_p
 
     assert result is False
     mock_client.send_file.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_transfer_album_writes_media_db_per_file(
+    engine_with_media_db, mock_client, media_db, tmp_path
+):
+    """Regression: transfer_album must insert one media row per file and mark
+    each as uploaded, so dashboard stats match actual transfer count. Previously
+    albums bypassed media_db entirely, causing total_media to under-count."""
+    target_entity = MagicMock()
+    msg1 = _make_message(501, text="album caption", grouped_id=50)
+    msg2 = _make_message(502, grouped_id=50)
+    msg3 = _make_message(503, grouped_id=50)
+
+    paths = []
+    for i, msg_id in enumerate([501, 502, 503]):
+        p = str(tmp_path / "downloads" / f"f{msg_id}.jpg")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(bytes([i]) * 10)  # different content → different sha256
+        paths.append(p)
+
+    mock_client.download_media = AsyncMock(side_effect=paths)
+
+    sent_msgs = []
+    for i, msg_id in enumerate([501, 502, 503]):
+        sm = MagicMock()
+        sm.id = 9000 + i
+        sent_msgs.append(sm)
+    mock_client.send_file = AsyncMock(return_value=sent_msgs)
+
+    with patch("agents.tg_transfer.transfer_engine.compute_phash", return_value=None):
+        ok = await engine_with_media_db.transfer_album(
+            target_entity, [msg1, msg2, msg3],
+            target_chat="@dst", source_chat="@src", job_id="job-album",
+        )
+
+    assert ok is True
+    stats = await media_db.get_stats()
+    assert stats["total_media"] == 3, (
+        f"expected 3 uploaded media rows, got {stats['total_media']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_transfer_album_download_fail_no_media_row(
+    engine_with_media_db, mock_client, media_db, tmp_path
+):
+    """Download failure in album → no media rows inserted (we only insert
+    after all downloads succeed)."""
+    target_entity = MagicMock()
+    msg1 = _make_message(601, text="cap", grouped_id=60)
+    msg2 = _make_message(602, grouped_id=60)
+
+    mock_client.download_media = AsyncMock(
+        side_effect=[str(tmp_path / "f1.jpg"), None]
+    )
+    mock_client.send_file = AsyncMock()
+
+    # First download path must exist for the test setup consistency
+    p = str(tmp_path / "f1.jpg")
+    with open(p, "wb") as f:
+        f.write(b"\x00" * 5)
+
+    ok = await engine_with_media_db.transfer_album(
+        target_entity, [msg1, msg2],
+        target_chat="@dst", source_chat="@src", job_id="job-fail",
+    )
+    assert ok is False
+    stats = await media_db.get_stats()
+    assert stats["total_media"] == 0
+
+
+@pytest.mark.asyncio
+async def test_transfer_album_upload_exception_rolls_back_media_rows(
+    engine_with_media_db, mock_client, media_db, tmp_path
+):
+    """If send_file raises, media rows inserted earlier must be deleted so
+    dashboard doesn't show phantom entries."""
+    target_entity = MagicMock()
+    msg1 = _make_message(701, text="cap", grouped_id=70)
+    msg2 = _make_message(702, grouped_id=70)
+
+    paths = []
+    for mid in [701, 702]:
+        p = str(tmp_path / "downloads" / f"f{mid}.jpg")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(bytes([mid % 256]) * 10)
+        paths.append(p)
+
+    mock_client.download_media = AsyncMock(side_effect=paths)
+    mock_client.send_file = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with patch("agents.tg_transfer.transfer_engine.compute_phash", return_value=None):
+        with pytest.raises(RuntimeError):
+            await engine_with_media_db.transfer_album(
+                target_entity, [msg1, msg2],
+                target_chat="@dst", source_chat="@src", job_id="job-rollback",
+            )
+
+    stats = await media_db.get_stats()
+    assert stats["total_media"] == 0
 
 
 @pytest.mark.asyncio

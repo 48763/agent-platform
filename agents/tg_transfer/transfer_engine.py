@@ -1,5 +1,4 @@
 import os
-import shutil
 import logging
 import asyncio
 import uuid
@@ -77,23 +76,37 @@ class TransferEngine:
             return {"ok": False, "dedup": False, "similar": None}
         return {"ok": True, "dedup": False, "similar": None}
 
-    async def transfer_album(self, target_entity, messages: list) -> bool:
+    async def transfer_album(self, target_entity, messages: list,
+                              target_chat: str = "", source_chat: str = "",
+                              job_id: str = None) -> bool:
         """Transfer a media group (album) as a single album.
         Atomic: if any download fails, nothing is uploaded.
+
+        Also writes one media_db row per file (status=uploaded on success) so
+        dashboard stats reflect real transfer count.
         """
-        job_dir = os.path.join(self.tmp_dir, "album")
-        os.makedirs(job_dir, exist_ok=True)
+        os.makedirs(self.tmp_dir, exist_ok=True)
 
         caption = None
         for msg in messages:
             if msg.text and not caption:
                 caption = msg.text
 
+        artefacts: list[str] = []
+        media_ids: list[int] = []
+
         try:
-            # Parallel download
+            # Parallel download into flat tmp_dir with unique per-file names.
+            planned_paths = []
+            for msg in messages:
+                base = f"{msg.id}_{uuid.uuid4().hex[:8]}"
+                dest = os.path.join(self.tmp_dir, f"{base}.dat")
+                planned_paths.append(dest)
+                artefacts.append(dest)
+
             download_tasks = [
-                self.client.download_media(msg, file=job_dir)
-                for msg in messages
+                self.client.download_media(msg, file=dest)
+                for msg, dest in zip(messages, planned_paths)
             ]
             paths = await asyncio.gather(*download_tasks)
 
@@ -101,15 +114,73 @@ class TransferEngine:
             if any(p is None for p in paths):
                 return False
 
+            # Track any paths Telethon wrote elsewhere (e.g. when file arg was
+            # ignored) so we still clean them up.
+            for p in paths:
+                if p not in artefacts:
+                    artefacts.append(p)
+
             file_paths = list(paths)
 
-            await self.client.send_file(
+            # Insert pending media rows per file.
+            if self.media_db:
+                for msg, path in zip(messages, file_paths):
+                    sha256 = compute_sha256(path)
+                    file_type = self._detect_file_type(msg)
+                    phash = None
+                    if file_type == "photo":
+                        phash = compute_phash(path)
+                    elif file_type == "video":
+                        frame_path = os.path.join(
+                            self.tmp_dir,
+                            f"{msg.id}_{uuid.uuid4().hex[:8]}.frame.jpg",
+                        )
+                        artefacts.append(frame_path)
+                        phash = await compute_phash_video(path, frame_path)
+
+                    file_size = os.path.getsize(path) if os.path.exists(path) else None
+                    media_id = await self.media_db.insert_media(
+                        sha256=sha256, phash=phash, file_type=file_type,
+                        file_size=file_size, caption=msg.text or "",
+                        source_chat=source_chat, source_msg_id=msg.id,
+                        target_chat=target_chat, job_id=job_id,
+                    )
+                    media_ids.append(media_id)
+
+            result = await self.client.send_file(
                 target_entity, file_paths, caption=caption,
             )
+
+            # Mark uploaded per file. send_file for a list returns a list of
+            # Message objects (one per media); fall back gracefully if TG
+            # returned a single object or something unexpected.
+            if self.media_db and media_ids and result:
+                sent_list = list(result) if isinstance(result, (list, tuple)) else [result]
+                for idx, mid in enumerate(media_ids):
+                    sent = sent_list[idx] if idx < len(sent_list) else None
+                    sent_id = getattr(sent, "id", None) if sent else None
+                    if sent_id:
+                        await self.media_db.mark_uploaded(mid, sent_id)
+                        msg = messages[idx]
+                        tags = extract_tags(msg.text)
+                        if tags:
+                            await self.media_db.add_tags(mid, tags)
             return True
+        except Exception:
+            if self.media_db and media_ids:
+                for mid in media_ids:
+                    try:
+                        await self.media_db.delete_media(mid)
+                    except Exception:
+                        pass
+            raise
         finally:
-            if os.path.exists(job_dir):
-                shutil.rmtree(job_dir)
+            for p in artefacts:
+                try:
+                    if p and os.path.exists(p):
+                        os.unlink(p)
+                except Exception:
+                    logger.debug(f"Failed to unlink tmp file {p}", exc_info=True)
 
     async def _transfer_media(self, target_entity, message, target_chat: str = "",
                                source_chat: str = "", job_id: str = None) -> dict:
@@ -295,7 +366,12 @@ class TransferEngine:
                             messages.append(msg)
 
                     if messages and not self.should_skip(messages[0]):
-                        ok = await self.transfer_album(target_entity, messages)
+                        ok = await self.transfer_album(
+                            target_entity, messages,
+                            target_chat=job["target_chat"],
+                            source_chat=job["source_chat"],
+                            job_id=job_id,
+                        )
                         status = "success" if ok else "failed"
                     elif messages and self.should_skip(messages[0]):
                         status = "skipped"
