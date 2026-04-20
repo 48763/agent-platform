@@ -404,11 +404,11 @@ async def test_transfer_album_download_fail_no_media_row(
 
 
 @pytest.mark.asyncio
-async def test_transfer_album_upload_exception_rolls_back_media_rows(
+async def test_transfer_album_upload_exception_marks_failed_not_deletes(
     engine_with_media_db, mock_client, media_db, tmp_path
 ):
-    """If send_file raises, media rows inserted earlier must be deleted so
-    dashboard doesn't show phantom entries."""
+    """If send_file raises, media rows are kept but marked 'failed' so next
+    job can retry. Not deleted — that would lose state across restarts."""
     target_entity = MagicMock()
     msg1 = _make_message(701, text="cap", grouped_id=70)
     msg2 = _make_message(702, grouped_id=70)
@@ -432,7 +432,138 @@ async def test_transfer_album_upload_exception_rolls_back_media_rows(
             )
 
     stats = await media_db.get_stats()
+    # uploaded count stays 0
     assert stats["total_media"] == 0
+    # But the rows persist as 'failed' for retry
+    assert stats["by_status"]["failed"] == 2
+
+
+@pytest.mark.asyncio
+async def test_transfer_single_upload_exception_marks_failed_not_deletes(
+    engine_with_media_db, mock_client, media_db, tmp_path
+):
+    """Single-media path: same policy — exception marks failed, not delete."""
+    target_entity = MagicMock()
+    msg = _make_message(800, text="single", media=True)
+    msg.document = None
+
+    video_path = str(tmp_path / "downloads" / "vid.dat")
+    os.makedirs(os.path.dirname(video_path), exist_ok=True)
+    with open(video_path, "wb") as f:
+        f.write(b"\x00" * 10)
+
+    mock_client.download_media = AsyncMock(return_value=video_path)
+    mock_client.send_file = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with patch("agents.tg_transfer.transfer_engine.compute_sha256", return_value="singlesha"):
+        with patch("agents.tg_transfer.transfer_engine.compute_phash", return_value=None):
+            with pytest.raises(RuntimeError):
+                await engine_with_media_db._transfer_media(
+                    target_entity, msg,
+                    target_chat="@d", source_chat="@s", job_id="jsingle",
+                )
+
+    stats = await media_db.get_stats()
+    assert stats["total_media"] == 0
+    assert stats["by_status"]["failed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_transfer_album_skips_duplicate_file_sends_rest(
+    engine_with_media_db, mock_client, media_db, tmp_path
+):
+    """Option B: if one file in album has sha256 already uploaded to target,
+    remove that file and send the rest of the album."""
+    # Pre-populate: sha 'dup_sha' already uploaded to @dst
+    existing = await media_db.insert_media(
+        sha256="dup_sha", phash=None, file_type="photo",
+        file_size=10, caption="prior", source_chat="@old",
+        source_msg_id=1, target_chat="@dst", job_id="old_job",
+    )
+    await media_db.mark_uploaded(existing, target_msg_id=77)
+
+    target_entity = MagicMock()
+    msg1 = _make_message(901, text="cap", grouped_id=90)
+    msg2 = _make_message(902, grouped_id=90)
+    msg3 = _make_message(903, grouped_id=90)
+
+    p1 = str(tmp_path / "downloads" / "a.jpg")
+    p2 = str(tmp_path / "downloads" / "b.jpg")
+    p3 = str(tmp_path / "downloads" / "c.jpg")
+    os.makedirs(os.path.dirname(p1), exist_ok=True)
+    for p, data in [(p1, b"\x01" * 10), (p2, b"\x02" * 10), (p3, b"\x03" * 10)]:
+        with open(p, "wb") as f:
+            f.write(data)
+    mock_client.download_media = AsyncMock(side_effect=[p1, p2, p3])
+
+    # send_file returns 2 sent msgs (for 2 non-dup files)
+    sent_msgs = [MagicMock(id=801), MagicMock(id=802)]
+    mock_client.send_file = AsyncMock(return_value=sent_msgs)
+
+    # Make msg2's file match the pre-uploaded sha
+    sha_map = {p1: "sha_a", p2: "dup_sha", p3: "sha_c"}
+
+    def fake_sha(path):
+        return sha_map[path]
+
+    with patch("agents.tg_transfer.transfer_engine.compute_sha256", side_effect=fake_sha):
+        with patch("agents.tg_transfer.transfer_engine.compute_phash", return_value=None):
+            ok = await engine_with_media_db.transfer_album(
+                target_entity, [msg1, msg2, msg3],
+                target_chat="@dst", source_chat="@src", job_id="album_dup",
+            )
+
+    assert ok is True
+    # send_file was called with only 2 paths (msg2 removed)
+    call_args = mock_client.send_file.call_args
+    sent_paths = call_args.args[1]
+    assert len(sent_paths) == 2
+    assert p2 not in sent_paths
+
+    # media_db: 1 prior uploaded + 2 newly uploaded = 3 uploaded
+    stats = await media_db.get_stats()
+    assert stats["by_status"]["uploaded"] == 3
+
+
+@pytest.mark.asyncio
+async def test_transfer_album_all_duplicate_no_send_file(
+    engine_with_media_db, mock_client, media_db, tmp_path
+):
+    """If every file in an album is a duplicate, send_file must NOT be called
+    at all (no empty album upload)."""
+    for sha in ["da", "db"]:
+        mid = await media_db.insert_media(
+            sha256=sha, phash=None, file_type="photo",
+            file_size=10, caption=None, source_chat="@old",
+            source_msg_id=0, target_chat="@dst", job_id="old",
+        )
+        await media_db.mark_uploaded(mid, target_msg_id=1)
+
+    target_entity = MagicMock()
+    msg1 = _make_message(1001, text="cap", grouped_id=100)
+    msg2 = _make_message(1002, grouped_id=100)
+
+    p1 = str(tmp_path / "downloads" / "x.jpg")
+    p2 = str(tmp_path / "downloads" / "y.jpg")
+    os.makedirs(os.path.dirname(p1), exist_ok=True)
+    for p, d in [(p1, b"\x01" * 10), (p2, b"\x02" * 10)]:
+        with open(p, "wb") as f:
+            f.write(d)
+    mock_client.download_media = AsyncMock(side_effect=[p1, p2])
+    mock_client.send_file = AsyncMock()
+
+    sha_map = {p1: "da", p2: "db"}
+
+    with patch("agents.tg_transfer.transfer_engine.compute_sha256",
+               side_effect=lambda p: sha_map[p]):
+        with patch("agents.tg_transfer.transfer_engine.compute_phash", return_value=None):
+            ok = await engine_with_media_db.transfer_album(
+                target_entity, [msg1, msg2],
+                target_chat="@dst", source_chat="@src", job_id="all_dup",
+            )
+
+    assert ok is True
+    mock_client.send_file.assert_not_called()
 
 
 @pytest.mark.asyncio

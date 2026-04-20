@@ -122,8 +122,14 @@ class TransferEngine:
 
             file_paths = list(paths)
 
-            # Insert pending media rows per file.
+            # Per-file dedup + upsert. Option B: if a file is already uploaded
+            # to this target (sha256 or phash-similar), drop that file from
+            # the album and send the remaining files.
+            effective_messages: list = []
+            effective_paths: list[str] = []
+
             if self.media_db:
+                all_phashes = None  # lazy-load
                 for msg, path in zip(messages, file_paths):
                     sha256 = compute_sha256(path)
                     file_type = self._detect_file_type(msg)
@@ -138,17 +144,42 @@ class TransferEngine:
                         artefacts.append(frame_path)
                         phash = await compute_phash_video(path, frame_path)
 
+                    # sha256 dedup
+                    if await self.media_db.find_by_sha256(sha256, target_chat):
+                        continue
+                    # phash similarity
+                    if phash:
+                        if all_phashes is None:
+                            all_phashes = await self.media_db.get_all_phashes()
+                        if any(
+                            hamming_distance(phash, row["phash"]) <= self.phash_threshold
+                            for row in all_phashes
+                        ):
+                            continue
+
                     file_size = os.path.getsize(path) if os.path.exists(path) else None
-                    media_id = await self.media_db.insert_media(
+                    media_id = await self.media_db.upsert_pending(
                         sha256=sha256, phash=phash, file_type=file_type,
                         file_size=file_size, caption=msg.text or "",
                         source_chat=source_chat, source_msg_id=msg.id,
                         target_chat=target_chat, job_id=job_id,
                     )
+                    if media_id is None:
+                        # Race: uploaded row slipped in between check and upsert
+                        continue
                     media_ids.append(media_id)
+                    effective_messages.append(msg)
+                    effective_paths.append(path)
+            else:
+                effective_messages = list(messages)
+                effective_paths = list(file_paths)
+
+            # All files were dedup'd → nothing to send, still counts as success
+            if not effective_paths:
+                return True
 
             result = await self.client.send_file(
-                target_entity, file_paths, caption=caption,
+                target_entity, effective_paths, caption=caption,
             )
 
             # Mark uploaded per file. send_file for a list returns a list of
@@ -161,7 +192,7 @@ class TransferEngine:
                     sent_id = getattr(sent, "id", None) if sent else None
                     if sent_id:
                         await self.media_db.mark_uploaded(mid, sent_id)
-                        msg = messages[idx]
+                        msg = effective_messages[idx]
                         tags = extract_tags(msg.text)
                         if tags:
                             await self.media_db.add_tags(mid, tags)
@@ -170,7 +201,7 @@ class TransferEngine:
             if self.media_db and media_ids:
                 for mid in media_ids:
                     try:
-                        await self.media_db.delete_media(mid)
+                        await self.media_db.mark_failed(mid)
                     except Exception:
                         pass
             raise
@@ -230,15 +261,18 @@ class TransferEngine:
                     if similar:
                         return {"ok": False, "dedup": False, "similar": similar}
 
-                # Insert pending media record
+                # Upsert pending media record (revives failed/skipped rows)
                 caption = message.text or ""
                 file_size = os.path.getsize(path) if os.path.exists(path) else None
-                media_id = await self.media_db.insert_media(
+                media_id = await self.media_db.upsert_pending(
                     sha256=sha256, phash=phash, file_type=file_type,
                     file_size=file_size, caption=caption,
                     source_chat=source_chat, source_msg_id=message.id,
                     target_chat=target_chat, job_id=job_id,
                 )
+                if media_id is None:
+                    # Race with another job that just uploaded this content
+                    return {"ok": True, "dedup": True, "similar": None}
 
             # Build upload kwargs
             upload_kwargs = {"caption": message.text}
@@ -282,7 +316,7 @@ class TransferEngine:
         except Exception as e:
             if self.media_db and media_id:
                 try:
-                    await self.media_db.delete_media(media_id)
+                    await self.media_db.mark_failed(media_id)
                 except Exception:
                     pass
             raise

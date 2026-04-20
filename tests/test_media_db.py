@@ -80,6 +80,106 @@ async def test_find_by_sha256_not_found(mdb):
 
 
 @pytest.mark.asyncio
+async def test_find_by_sha256_ignores_non_uploaded(mdb):
+    """Only 'uploaded' rows block re-upload. pending/failed/skipped rows mean
+    the media is 待上傳 (awaiting upload) and should not trigger dedup."""
+    mid = await mdb.insert_media(
+        sha256="retry", phash=None, file_type="photo",
+        file_size=100, caption=None, source_chat="@s",
+        source_msg_id=11, target_chat="@dst", job_id="j1",
+    )
+    # Row exists as 'pending' (default)
+    assert await mdb.find_by_sha256("retry", "@dst") is None
+
+    # 'failed' also doesn't trigger dedup
+    await mdb.mark_failed(mid)
+    assert await mdb.find_by_sha256("retry", "@dst") is None
+
+    # 'skipped' also doesn't trigger dedup
+    await mdb.mark_skipped(mid)
+    assert await mdb.find_by_sha256("retry", "@dst") is None
+
+    # Only 'uploaded' does
+    await mdb.mark_uploaded(mid, target_msg_id=55)
+    assert await mdb.find_by_sha256("retry", "@dst") is not None
+
+
+@pytest.mark.asyncio
+async def test_mark_failed(mdb):
+    mid = await mdb.insert_media(
+        sha256="fail1", phash=None, file_type="photo",
+        file_size=100, caption=None, source_chat="@s",
+        source_msg_id=12, target_chat="@d", job_id="j1",
+    )
+    await mdb.mark_failed(mid)
+    media = await mdb.get_media(mid)
+    assert media["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_upsert_pending_inserts_when_missing(mdb):
+    """New (sha256, target_chat) → insert a fresh pending row."""
+    mid = await mdb.upsert_pending(
+        sha256="new1", phash=None, file_type="photo",
+        file_size=100, caption="caption1", source_chat="@s",
+        source_msg_id=20, target_chat="@d", job_id="j1",
+    )
+    assert mid is not None
+    media = await mdb.get_media(mid)
+    assert media["status"] == "pending"
+    assert media["caption"] == "caption1"
+
+
+@pytest.mark.asyncio
+async def test_upsert_pending_revives_failed_row(mdb):
+    """Existing non-uploaded row (failed/skipped/pending) → update it back to
+    pending and reuse the same media_id so retry continues from same record."""
+    first = await mdb.insert_media(
+        sha256="revive", phash=None, file_type="photo",
+        file_size=100, caption="old", source_chat="@s",
+        source_msg_id=30, target_chat="@d", job_id="j1",
+    )
+    await mdb.mark_failed(first)
+
+    second = await mdb.upsert_pending(
+        sha256="revive", phash="newphash", file_type="photo",
+        file_size=200, caption="new", source_chat="@s",
+        source_msg_id=31, target_chat="@d", job_id="j2",
+    )
+    assert second == first, "should reuse the same media_id"
+    media = await mdb.get_media(first)
+    assert media["status"] == "pending"
+    assert media["caption"] == "new"
+    assert media["file_size"] == 200
+    assert media["phash"] == "newphash"
+    assert media["source_msg_id"] == 31
+    assert media["job_id"] == "j2"
+
+
+@pytest.mark.asyncio
+async def test_upsert_pending_rejects_uploaded_row(mdb):
+    """If an 'uploaded' row already exists, upsert_pending must NOT overwrite
+    it. Returns None so caller can branch to dedup path."""
+    first = await mdb.insert_media(
+        sha256="uploaded_guard", phash=None, file_type="photo",
+        file_size=100, caption="kept", source_chat="@s",
+        source_msg_id=40, target_chat="@d", job_id="j1",
+    )
+    await mdb.mark_uploaded(first, target_msg_id=555)
+
+    result = await mdb.upsert_pending(
+        sha256="uploaded_guard", phash="x", file_type="photo",
+        file_size=999, caption="should not overwrite", source_chat="@s",
+        source_msg_id=41, target_chat="@d", job_id="j2",
+    )
+    assert result is None, "must refuse to overwrite uploaded rows"
+    media = await mdb.get_media(first)
+    assert media["status"] == "uploaded"
+    assert media["caption"] == "kept"
+    assert media["file_size"] == 100
+
+
+@pytest.mark.asyncio
 async def test_find_similar_phash(mdb):
     mid = await mdb.insert_media(
         sha256="x1", phash="0000000000000000", file_type="photo",
@@ -173,6 +273,49 @@ async def test_get_stats(mdb):
     assert stats["total_tags"] == 2
     assert stats["tag_counts"][0] == ("a", 2)
     assert stats["tag_counts"][1] == ("b", 1)
+
+
+@pytest.mark.asyncio
+async def test_get_stats_groups_by_status(mdb):
+    """Dashboard needs per-status breakdown so user sees how many items are
+    still pending/failed/skipped besides uploaded."""
+    # uploaded x2
+    for i, sm in enumerate([300, 301]):
+        mid = await mdb.insert_media(
+            sha256=f"up{i}", phash=None, file_type="photo",
+            file_size=100, caption=None, source_chat="@s",
+            source_msg_id=sm, target_chat="@d", job_id="j",
+        )
+        await mdb.mark_uploaded(mid, target_msg_id=900 + i)
+    # failed x1
+    mid_f = await mdb.insert_media(
+        sha256="fa1", phash=None, file_type="photo",
+        file_size=100, caption=None, source_chat="@s",
+        source_msg_id=310, target_chat="@d", job_id="j",
+    )
+    await mdb.mark_failed(mid_f)
+    # skipped x1
+    mid_s = await mdb.insert_media(
+        sha256="sk1", phash=None, file_type="photo",
+        file_size=100, caption=None, source_chat="@s",
+        source_msg_id=320, target_chat="@d", job_id="j",
+    )
+    await mdb.mark_skipped(mid_s)
+    # pending x1 (default after insert)
+    await mdb.insert_media(
+        sha256="pd1", phash=None, file_type="photo",
+        file_size=100, caption=None, source_chat="@s",
+        source_msg_id=330, target_chat="@d", job_id="j",
+    )
+
+    stats = await mdb.get_stats()
+    # Backward compat: total_media still = uploaded count
+    assert stats["total_media"] == 2
+    # New: by_status breakdown
+    assert stats["by_status"]["uploaded"] == 2
+    assert stats["by_status"]["failed"] == 1
+    assert stats["by_status"]["skipped"] == 1
+    assert stats["by_status"]["pending"] == 1
 
 
 @pytest.mark.asyncio

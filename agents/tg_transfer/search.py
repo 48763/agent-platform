@@ -2,8 +2,14 @@ import math
 
 
 def _make_link(target_chat: str, target_msg_id: int) -> str:
-    """Generate a TG message link."""
+    """Generate a TG message link.
+
+    - Public chat (@name / name): https://t.me/<name>/<msg_id>
+    - Private supergroup (-100XXXXXXXXXX): https://t.me/c/<XXXXXXXXXX>/<msg_id>
+    """
     chat = target_chat.lstrip("@")
+    if chat.startswith("-100") and chat[4:].isdigit():
+        return f"https://t.me/c/{chat[4:]}/{target_msg_id}"
     return f"https://t.me/{chat}/{target_msg_id}"
 
 

@@ -13,6 +13,24 @@ class TestFormatSearchResults:
         assert "t.me" in text
         assert "1/1" in text
 
+    def test_private_chat_link_format(self):
+        """Private supergroup ids like -1001234567890 must produce t.me/c/<id>/<msg>
+        links (strip the '-100' prefix), not t.me/-1001234567890/..."""
+        results = [
+            {"caption": "p", "target_chat": "-1001234567890", "target_msg_id": 42},
+        ]
+        text = format_search_results(results, total=1, page=1, page_size=10)
+        assert "https://t.me/c/1234567890/42" in text
+        assert "-1001234567890" not in text
+
+    def test_public_chat_link_format_unchanged(self):
+        """Public @username links keep t.me/<username>/<msg> form."""
+        results = [
+            {"caption": "p", "target_chat": "@publicchan", "target_msg_id": 7},
+        ]
+        text = format_search_results(results, total=1, page=1, page_size=10)
+        assert "https://t.me/publicchan/7" in text
+
     def test_format_no_results(self):
         text = format_search_results([], total=0, page=1, page_size=10)
         assert "找不到" in text

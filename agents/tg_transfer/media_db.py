@@ -95,6 +95,46 @@ class MediaDB:
         )
         await self._db.commit()
 
+    async def mark_failed(self, media_id: int):
+        await self._db.execute(
+            "UPDATE media SET status = 'failed' WHERE media_id = ?", (media_id,)
+        )
+        await self._db.commit()
+
+    async def upsert_pending(
+        self, sha256: str, phash: str | None, file_type: str,
+        file_size: int | None, caption: str | None, source_chat: str,
+        source_msg_id: int, target_chat: str, job_id: str | None = None,
+    ) -> int | None:
+        """Insert a new pending row, OR revive an existing non-uploaded row
+        (failed/skipped/pending) by updating it back to pending.
+
+        Returns the media_id. If an 'uploaded' row already exists for
+        (sha256, target_chat), returns None so the caller can branch to the
+        dedup path without overwriting the uploaded record.
+        """
+        async with self._db.execute(
+            "INSERT INTO media (sha256, phash, file_type, file_size, caption, "
+            "source_chat, source_msg_id, target_chat, job_id, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending') "
+            "ON CONFLICT(sha256, target_chat) DO UPDATE SET "
+            "  status='pending', "
+            "  phash=excluded.phash, "
+            "  file_type=excluded.file_type, "
+            "  file_size=excluded.file_size, "
+            "  caption=excluded.caption, "
+            "  source_chat=excluded.source_chat, "
+            "  source_msg_id=excluded.source_msg_id, "
+            "  job_id=excluded.job_id "
+            "WHERE media.status != 'uploaded' "
+            "RETURNING media_id",
+            (sha256, phash, file_type, file_size, caption, source_chat,
+             source_msg_id, target_chat, job_id),
+        ) as cur:
+            row = await cur.fetchone()
+        await self._db.commit()
+        return row["media_id"] if row else None
+
     async def delete_media(self, media_id: int):
         await self._db.execute("DELETE FROM media WHERE media_id = ?", (media_id,))
         await self._db.commit()
@@ -102,9 +142,12 @@ class MediaDB:
     # -- Dedup --
 
     async def find_by_sha256(self, sha256: str, target_chat: str) -> Optional[dict]:
+        """Return an uploaded media row for this (sha256, target_chat), if any.
+        Only 'uploaded' status blocks re-upload; other statuses mean 待上傳
+        and should allow retry."""
         async with self._db.execute(
             "SELECT * FROM media WHERE sha256 = ? AND target_chat = ? "
-            "AND status IN ('uploaded', 'pending') ORDER BY media_id DESC LIMIT 1",
+            "AND status = 'uploaded' ORDER BY media_id DESC LIMIT 1",
             (sha256, target_chat),
         ) as cur:
             row = await cur.fetchone()
@@ -164,10 +207,13 @@ class MediaDB:
     # -- Stats --
 
     async def get_stats(self) -> dict:
+        by_status = {"uploaded": 0, "pending": 0, "failed": 0, "skipped": 0}
         async with self._db.execute(
-            "SELECT COUNT(*) as cnt FROM media WHERE status = 'uploaded'"
+            "SELECT status, COUNT(*) as cnt FROM media GROUP BY status"
         ) as cur:
-            total_media = (await cur.fetchone())["cnt"]
+            for row in await cur.fetchall():
+                by_status[row["status"]] = row["cnt"]
+        total_media = by_status.get("uploaded", 0)
         async with self._db.execute("SELECT COUNT(*) as cnt FROM tags") as cur:
             total_tags = (await cur.fetchone())["cnt"]
         async with self._db.execute(
@@ -177,7 +223,12 @@ class MediaDB:
             "GROUP BY t.name ORDER BY cnt DESC"
         ) as cur:
             tag_counts = [(row["name"], row["cnt"]) for row in await cur.fetchall()]
-        return {"total_media": total_media, "total_tags": total_tags, "tag_counts": tag_counts}
+        return {
+            "total_media": total_media,
+            "total_tags": total_tags,
+            "tag_counts": tag_counts,
+            "by_status": by_status,
+        }
 
     # -- Liveness --
 
