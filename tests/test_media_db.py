@@ -734,3 +734,64 @@ class TestFindByThumbPhash:
         hits = await mdb.find_by_thumb_phash("aaaa", "@t1")
         assert len(hits) == 1
         assert hits[0]["target_chat"] == "@t1"
+
+
+class TestPhase4Dedup:
+    @pytest.mark.asyncio
+    async def test_upgrade_thumb_to_full(self, mdb):
+        media_id = await mdb.insert_thumb_record(
+            thumb_phash="aaaa", file_type="photo", file_size=1,
+            caption="c", duration=None,
+            target_chat="@t1", target_msg_id=1,
+        )
+        before = await mdb.get_media(media_id)
+        assert before["trust"] == "thumb_only"
+        assert before["verified_by"] is None
+
+        await mdb.upgrade_thumb_to_full(media_id, verified_by="metadata")
+
+        after = await mdb.get_media(media_id)
+        assert after["trust"] == "full"
+        assert after["verified_by"] == "metadata"
+        # sha256/phash intentionally untouched — we never downloaded the file
+        assert after["sha256"] is None
+        assert after["phash"] is None
+
+    @pytest.mark.asyncio
+    async def test_pending_dedup_insert_and_list(self, mdb):
+        row_id = await mdb.insert_pending_dedup(
+            job_id="job-1", source_chat="@src", source_msg_id=42,
+            candidate_target_msg_ids=[100, 101, 102],
+            reason="thumb_match_metadata_mismatch",
+        )
+        assert row_id > 0
+
+        rows = await mdb.list_pending_dedup_by_job("job-1")
+        assert len(rows) == 1
+        assert rows[0]["source_msg_id"] == 42
+        assert rows[0]["candidate_target_msg_ids"] == [100, 101, 102]
+        assert rows[0]["reason"] == "thumb_match_metadata_mismatch"
+
+    @pytest.mark.asyncio
+    async def test_pending_dedup_scoped_by_job(self, mdb):
+        await mdb.insert_pending_dedup(
+            job_id="job-a", source_chat="@src", source_msg_id=1,
+            candidate_target_msg_ids=[10], reason="r",
+        )
+        await mdb.insert_pending_dedup(
+            job_id="job-b", source_chat="@src", source_msg_id=2,
+            candidate_target_msg_ids=[20], reason="r",
+        )
+        rows = await mdb.list_pending_dedup_by_job("job-a")
+        assert len(rows) == 1
+        assert rows[0]["source_msg_id"] == 1
+
+    @pytest.mark.asyncio
+    async def test_pending_dedup_delete(self, mdb):
+        row_id = await mdb.insert_pending_dedup(
+            job_id="job-1", source_chat="@src", source_msg_id=42,
+            candidate_target_msg_ids=[100], reason="r",
+        )
+        await mdb.delete_pending_dedup(row_id)
+        rows = await mdb.list_pending_dedup_by_job("job-1")
+        assert rows == []

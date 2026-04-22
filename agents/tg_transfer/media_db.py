@@ -1,3 +1,5 @@
+import json
+
 import aiosqlite
 from typing import Optional
 
@@ -35,6 +37,20 @@ CREATE TABLE IF NOT EXISTS media_tags (
     FOREIGN KEY (media_id) REFERENCES media(media_id) ON DELETE CASCADE,
     FOREIGN KEY (tag_id) REFERENCES tags(tag_id) ON DELETE CASCADE
 );
+
+-- Phase 4 ambiguous queue: thumb_phash hit target but metadata disagreed,
+-- so we parked the source message here for user to resolve at end of batch
+-- (Phase 5). candidate_target_msg_ids is a JSON array of possible matches
+-- from the target chat.
+CREATE TABLE IF NOT EXISTS pending_dedup (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id                     TEXT,
+    source_chat                TEXT NOT NULL,
+    source_msg_id              INTEGER NOT NULL,
+    candidate_target_msg_ids   TEXT NOT NULL,
+    reason                     TEXT,
+    created_at                 TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 # Indexes run AFTER _migrate() so a legacy `media` table (missing
@@ -46,6 +62,7 @@ CREATE INDEX IF NOT EXISTS idx_media_phash ON media(phash);
 CREATE INDEX IF NOT EXISTS idx_media_thumb_phash ON media(thumb_phash);
 CREATE INDEX IF NOT EXISTS idx_media_caption ON media(caption);
 CREATE INDEX IF NOT EXISTS idx_media_status ON media(status);
+CREATE INDEX IF NOT EXISTS idx_pending_dedup_job ON pending_dedup(job_id);
 """
 
 
@@ -289,6 +306,60 @@ class MediaDB:
             (thumb_phash, target_chat),
         ) as cur:
             return [dict(row) for row in await cur.fetchall()]
+
+    async def upgrade_thumb_to_full(
+        self, media_id: int, verified_by: str,
+    ):
+        """Promote a thumb_only row to trust='full' after cross-validating via
+        metadata. We do NOT backfill sha256/phash — the caller never downloaded
+        the file, so those stay unknown. `verified_by` records which signal
+        confirmed the identity (e.g. 'metadata', 'phash', 'sha256').
+        """
+        await self._db.execute(
+            "UPDATE media SET trust = 'full', verified_by = ? "
+            "WHERE media_id = ?",
+            (verified_by, media_id),
+        )
+        await self._db.commit()
+
+    async def insert_pending_dedup(
+        self, job_id: str | None, source_chat: str, source_msg_id: int,
+        candidate_target_msg_ids: list[int], reason: str,
+    ) -> int:
+        """Queue an ambiguous source message for Phase 5 user resolution.
+        thumb_phash hit candidates in the target chat but at least one piece of
+        metadata disagreed — we refuse to auto-skip OR auto-upload and let the
+        user arbitrate at batch-end."""
+        async with self._db.execute(
+            "INSERT INTO pending_dedup (job_id, source_chat, source_msg_id, "
+            "candidate_target_msg_ids, reason) VALUES (?, ?, ?, ?, ?) "
+            "RETURNING id",
+            (job_id, source_chat, source_msg_id,
+             json.dumps(candidate_target_msg_ids), reason),
+        ) as cur:
+            row = await cur.fetchone()
+        await self._db.commit()
+        return row["id"]
+
+    async def list_pending_dedup_by_job(self, job_id: str) -> list[dict]:
+        """Return queued ambiguous rows for a job, with candidate_target_msg_ids
+        parsed back into a Python list."""
+        async with self._db.execute(
+            "SELECT * FROM pending_dedup WHERE job_id = ? ORDER BY id ASC",
+            (job_id,),
+        ) as cur:
+            rows = [dict(row) for row in await cur.fetchall()]
+        for r in rows:
+            r["candidate_target_msg_ids"] = json.loads(
+                r["candidate_target_msg_ids"]
+            )
+        return rows
+
+    async def delete_pending_dedup(self, row_id: int):
+        await self._db.execute(
+            "DELETE FROM pending_dedup WHERE id = ?", (row_id,)
+        )
+        await self._db.commit()
 
     async def delete_media(self, media_id: int):
         await self._db.execute("DELETE FROM media WHERE media_id = ?", (media_id,))

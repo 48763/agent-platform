@@ -6,7 +6,10 @@ from typing import Callable, Optional, Any
 from telethon import TelegramClient
 from telethon.tl.types import DocumentAttributeVideo
 from agents.tg_transfer.db import TransferDB
-from agents.tg_transfer.hasher import compute_sha256, compute_phash, compute_phash_video, hamming_distance
+from agents.tg_transfer.hasher import (
+    compute_sha256, compute_phash, compute_phash_video, hamming_distance,
+    download_thumb_and_phash,
+)
 from agents.tg_transfer.media_db import MediaDB
 from agents.tg_transfer.tag_extractor import extract_tags
 from agents.tg_transfer.media_utils import ffprobe_metadata
@@ -436,6 +439,21 @@ class TransferEngine:
                     "ok": False, "dedup": False, "similar": None,
                     "over_limit": True,
                 }
+        # Phase 4: cross-source thumb dedup. Only a tiny thumb (not the full
+        # file) is downloaded, so this is a pure saving when the target
+        # already has the content.
+        pre = await self._pre_dedup_by_thumb(
+            message, target_chat=target_chat, source_chat=source_chat,
+            job_id=job_id,
+        )
+        if pre.get("hit"):
+            if pre.get("dedup"):
+                return {"ok": True, "dedup": True, "similar": None}
+            if pre.get("ambiguous"):
+                return {
+                    "ok": False, "dedup": False, "similar": None,
+                    "ambiguous": True,
+                }
         # Flat layout: per-message filenames share one directory to keep
         # filesystem metadata churn (mkdir/rmtree per message) minimal.
         base = f"{message.id}_{uuid.uuid4().hex[:8]}"
@@ -574,6 +592,87 @@ class TransferEngine:
                 except Exception:
                     logger.debug(f"Failed to unlink tmp file {p}", exc_info=True)
 
+    async def _pre_dedup_by_thumb(
+        self, message, target_chat: str, source_chat: str, job_id: str | None,
+    ) -> dict:
+        """Cross-source dedup before any full-file download.
+
+        Downloads only the TG-attached thumbnail, computes its phash, and
+        compares against the target-chat thumb index built by /index_target.
+
+        Return shape (mirrors the rest of transfer_engine's result dicts):
+          {"hit": False}                       → no thumb candidate; fall
+                                                 through to the normal
+                                                 download → sha256/phash path.
+          {"hit": True, "dedup": True}         → strict match: caption,
+                                                 file_size, duration all
+                                                 agreed with a candidate row,
+                                                 which we just upgraded to
+                                                 trust='full'. Caller marks
+                                                 message as skipped.
+          {"hit": True, "ambiguous": True}     → thumb_phash hit but metadata
+                                                 disagreed. Row queued in
+                                                 pending_dedup for Phase 5
+                                                 user resolution.
+
+        Only photos and videos carry useful thumbnails in our scan index, so
+        documents/voice/sticker short-circuit with `hit=False` immediately.
+        """
+        if not self.media_db:
+            return {"hit": False}
+
+        file_type = self._detect_file_type(message)
+        # Docs/audio have no reliable thumb index from /index_target → can't
+        # do thumb dedup. Fall through to normal path (which at least still
+        # does sha256 dedup after download).
+        if file_type not in ("photo", "video"):
+            return {"hit": False}
+
+        thumb_phash = await download_thumb_and_phash(self.client, message)
+        if not thumb_phash:
+            return {"hit": False}
+
+        candidates = await self.media_db.find_by_thumb_phash(
+            thumb_phash, target_chat,
+        )
+        if not candidates:
+            return {"hit": False}
+
+        # Strict-match criteria per spec: caption + file_size + duration must
+        # ALL agree with a candidate. Thumb collisions are real (re-encoded
+        # frames, similar photos), so we refuse to auto-skip on thumb alone.
+        src_caption = getattr(message, "message", None) or getattr(
+            message, "text", None,
+        )
+        src_file = getattr(message, "file", None)
+        src_size = getattr(src_file, "size", None) if src_file else None
+        src_duration = (
+            getattr(src_file, "duration", None) if src_file else None
+        )
+
+        for cand in candidates:
+            if (cand.get("caption") == src_caption
+                    and cand.get("file_size") == src_size
+                    and cand.get("duration") == src_duration):
+                # Auto-skip: upgrade the candidate from thumb_only → full with
+                # verified_by='metadata'. We deliberately leave sha256/phash
+                # NULL — we never downloaded the file.
+                await self.media_db.upgrade_thumb_to_full(
+                    cand["media_id"], verified_by="metadata",
+                )
+                return {"hit": True, "dedup": True}
+
+        # Thumb matched but at least one field disagreed. Queue for user
+        # arbitration at end of batch (Phase 5).
+        await self.media_db.insert_pending_dedup(
+            job_id=job_id, source_chat=source_chat, source_msg_id=int(message.id),
+            candidate_target_msg_ids=[
+                c["target_msg_id"] for c in candidates if c.get("target_msg_id")
+            ],
+            reason="thumb_match_metadata_mismatch",
+        )
+        return {"hit": True, "ambiguous": True}
+
     async def _download_tg_thumb(self, message, thumb_path: str) -> str | None:
         """Download the largest available TG-provided thumbnail for a message
         to the given path. Returns None if the message has no thumbs or the
@@ -701,6 +800,14 @@ class TransferEngine:
                         )
                         if result["dedup"]:
                             await self.db.mark_message(job_id, message_id, "skipped")
+                        elif result.get("ambiguous"):
+                            # Phase 4: thumb hit target but metadata differed.
+                            # Parked in pending_dedup; Phase 5 will surface a
+                            # batch-end summary asking the user to arbitrate.
+                            # Not 'pending', so get_next_pending won't retry.
+                            await self.db.mark_message(
+                                job_id, message_id, "ambiguous",
+                            )
                         elif result.get("over_limit"):
                             # Exceeded size_limit_mb → skip, don't fail/retry.
                             await self.db.mark_message(

@@ -1504,4 +1504,156 @@ class TestUploadFilenameExtension:
         msg.file = MagicMock(ext=None)
         result = _derive_upload_ext(msg)
         assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: pre_dedup_by_thumb
+# ---------------------------------------------------------------------------
+
+def _make_media_message(msg_id, text, file_type, file_size, duration=None):
+    """Shape a Telethon-like message for _pre_dedup_by_thumb input."""
+    msg = MagicMock()
+    msg.id = msg_id
+    msg.text = text
+    msg.message = text
+    msg.media = MagicMock()
+    msg.photo = MagicMock() if file_type == "photo" else None
+    msg.video = MagicMock() if file_type == "video" else None
+    msg.document = None
+    msg.sticker = None
+    msg.voice = None
+    msg.file = MagicMock(size=file_size, duration=duration)
+    return msg
+
+
+class TestPreDedupByThumb:
+    @pytest.mark.asyncio
+    async def test_no_media_db_returns_hit_false(self, engine):
+        """Without a media_db wired, thumb dedup is a no-op."""
+        msg = _make_media_message(1, "cap", "photo", 1234)
+        result = await engine._pre_dedup_by_thumb(
+            msg, target_chat="@t", source_chat="@s", job_id="j",
+        )
+        assert result == {"hit": False}
+
+    @pytest.mark.asyncio
+    async def test_document_type_skips(self, engine_with_media_db):
+        """document/voice have no usable thumb index — short-circuit."""
+        msg = _make_media_message(1, "cap", "photo", 1234)
+        msg.photo = None  # downgrade to document
+        msg.document = MagicMock()
+        result = await engine_with_media_db._pre_dedup_by_thumb(
+            msg, target_chat="@t", source_chat="@s", job_id="j",
+        )
+        assert result == {"hit": False}
+
+    @pytest.mark.asyncio
+    async def test_no_thumb_phash_returns_hit_false(self, engine_with_media_db):
+        """If the thumb can't be hashed (no imagehash, decode error, etc.) we
+        must fall through — not crash."""
+        msg = _make_media_message(1, "cap", "photo", 1234)
+        with patch(
+            "agents.tg_transfer.transfer_engine.download_thumb_and_phash",
+            new_callable=AsyncMock, return_value=None,
+        ):
+            result = await engine_with_media_db._pre_dedup_by_thumb(
+                msg, target_chat="@t", source_chat="@s", job_id="j",
+            )
+        assert result == {"hit": False}
+
+    @pytest.mark.asyncio
+    async def test_no_candidates_returns_hit_false(self, engine_with_media_db):
+        """Thumb hashed fine but the target index has no match — fall through."""
+        msg = _make_media_message(1, "cap", "photo", 1234)
+        with patch(
+            "agents.tg_transfer.transfer_engine.download_thumb_and_phash",
+            new_callable=AsyncMock, return_value="abcd",
+        ):
+            result = await engine_with_media_db._pre_dedup_by_thumb(
+                msg, target_chat="@t", source_chat="@s", job_id="j",
+            )
+        assert result == {"hit": False}
+
+    @pytest.mark.asyncio
+    async def test_strict_match_auto_dedups_and_upgrades(
+        self, engine_with_media_db, media_db,
+    ):
+        """All four fields match (thumb + caption + size + duration) → auto
+        skip upload, promote candidate row from thumb_only to full."""
+        cand_id = await media_db.insert_thumb_record(
+            thumb_phash="abcd", file_type="photo", file_size=1234,
+            caption="cap", duration=None,
+            target_chat="@t", target_msg_id=999,
+        )
+        msg = _make_media_message(1, "cap", "photo", 1234)
+
+        with patch(
+            "agents.tg_transfer.transfer_engine.download_thumb_and_phash",
+            new_callable=AsyncMock, return_value="abcd",
+        ):
+            result = await engine_with_media_db._pre_dedup_by_thumb(
+                msg, target_chat="@t", source_chat="@s", job_id="j1",
+            )
+
+        assert result == {"hit": True, "dedup": True}
+        row = await media_db.get_media(cand_id)
+        assert row["trust"] == "full"
+        assert row["verified_by"] == "metadata"
+        # sha256/phash must stay NULL — we never downloaded the file.
+        assert row["sha256"] is None
+        assert row["phash"] is None
+        # No ambiguous row queued.
+        assert await media_db.list_pending_dedup_by_job("j1") == []
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_when_caption_differs(
+        self, engine_with_media_db, media_db,
+    ):
+        """Thumb matches but caption differs → enqueue for user resolution."""
+        await media_db.insert_thumb_record(
+            thumb_phash="abcd", file_type="photo", file_size=1234,
+            caption="different caption", duration=None,
+            target_chat="@t", target_msg_id=999,
+        )
+        msg = _make_media_message(1, "my caption", "photo", 1234)
+
+        with patch(
+            "agents.tg_transfer.transfer_engine.download_thumb_and_phash",
+            new_callable=AsyncMock, return_value="abcd",
+        ):
+            result = await engine_with_media_db._pre_dedup_by_thumb(
+                msg, target_chat="@t", source_chat="@s", job_id="j1",
+            )
+
+        assert result == {"hit": True, "ambiguous": True}
+        pending = await media_db.list_pending_dedup_by_job("j1")
+        assert len(pending) == 1
+        assert pending[0]["source_msg_id"] == 1
+        assert pending[0]["candidate_target_msg_ids"] == [999]
+        assert pending[0]["reason"] == "thumb_match_metadata_mismatch"
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_when_file_size_differs(
+        self, engine_with_media_db, media_db,
+    ):
+        """Same thumb + caption but different file_size — still ambiguous,
+        because a re-encode would flip size while keeping caption identical."""
+        await media_db.insert_thumb_record(
+            thumb_phash="abcd", file_type="photo", file_size=999,
+            caption="cap", duration=None,
+            target_chat="@t", target_msg_id=888,
+        )
+        msg = _make_media_message(1, "cap", "photo", 1234)
+
+        with patch(
+            "agents.tg_transfer.transfer_engine.download_thumb_and_phash",
+            new_callable=AsyncMock, return_value="abcd",
+        ):
+            result = await engine_with_media_db._pre_dedup_by_thumb(
+                msg, target_chat="@t", source_chat="@s", job_id="j1",
+            )
+
+        assert result == {"hit": True, "ambiguous": True}
+        pending = await media_db.list_pending_dedup_by_job("j1")
+        assert len(pending) == 1
         assert ".dat" not in result
