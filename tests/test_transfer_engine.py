@@ -247,10 +247,13 @@ async def test_transfer_media_video_passes_tg_thumb(engine, mock_client, tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_transfer_media_video_no_thumb_when_message_has_none(
+async def test_transfer_media_video_no_thumb_when_all_sources_fail(
     engine, mock_client, tmp_path
 ):
-    """No thumbs on message → don't pass thumb= (and don't fail)."""
+    """No TG thumb on message AND ffmpeg extraction also fails → don't pass
+    thumb= (and don't fail the transfer). Videos always attempt the local
+    extraction fallback first; only when both sources come back empty does
+    the upload proceed without a thumb."""
     target_entity = MagicMock()
     msg = _make_video_message(221, text="no thumb")
     msg.document = MagicMock()
@@ -270,11 +273,68 @@ async def test_transfer_media_video_no_thumb_when_message_has_none(
         mock_ffprobe.return_value = {"duration": 5, "width": 640, "height": 480}
         with patch("agents.tg_transfer.transfer_engine.compute_sha256", return_value="no_thumb"):
             with patch("agents.tg_transfer.transfer_engine.compute_phash_video", new_callable=AsyncMock, return_value=None):
-                result = await engine.transfer_single(MagicMock(), target_entity, msg)
+                with patch(
+                    "agents.tg_transfer.transfer_engine.extract_video_thumb",
+                    new_callable=AsyncMock, return_value=None,
+                ):
+                    result = await engine.transfer_single(MagicMock(), target_entity, msg)
 
     assert result["ok"] is True
     call_kwargs = mock_client.send_file.call_args
     assert "thumb" not in call_kwargs.kwargs or call_kwargs.kwargs.get("thumb") is None
+
+
+@pytest.mark.asyncio
+async def test_transfer_media_video_extracts_local_thumb_when_tg_has_none(
+    engine, mock_client, tmp_path
+):
+    """Source is a `send as file` video without a TG-attached thumb →
+    fall back to ffmpeg-extracted JPEG frame so the feed preview still
+    renders instead of a blank document tile.
+
+    Regression for: 影片沒預覽 + 0:00 + 大小硬塞在視窗. The three symptoms
+    show together when a video uploads without DocumentAttributeVideo AND
+    without a thumb — fixing the thumb path is one half of the repair
+    (ffprobe_metadata now also hardened; see media_utils tests)."""
+    target_entity = MagicMock()
+    msg = _make_video_message(222, text="no TG thumb but local ok")
+    msg.document = MagicMock()
+    msg.document.thumbs = None  # TG-side has nothing
+
+    video_path = str(tmp_path / "downloads" / "222" / "video.mp4")
+    os.makedirs(os.path.dirname(video_path), exist_ok=True)
+    with open(video_path, "wb") as f:
+        f.write(b"\x00" * 10)
+    mock_client.download_media = AsyncMock(return_value=video_path)
+
+    sent = MagicMock()
+    sent.id = 1003
+    mock_client.send_file = AsyncMock(return_value=sent)
+
+    # Simulate ffmpeg writing a real thumb file to whatever path the
+    # engine picked — copy the arg into a returned path so assertions
+    # downstream can compare.
+    async def fake_extract(src, dest, **kwargs):
+        with open(dest, "wb") as f:
+            f.write(b"\xff\xd8\xff\xd9")  # tiny valid JPEG-ish
+        return dest
+
+    with patch("agents.tg_transfer.transfer_engine.ffprobe_metadata", new_callable=AsyncMock) as mock_ffprobe:
+        mock_ffprobe.return_value = {"duration": 5, "width": 640, "height": 480}
+        with patch("agents.tg_transfer.transfer_engine.compute_sha256", return_value="local_thumb"):
+            with patch("agents.tg_transfer.transfer_engine.compute_phash_video", new_callable=AsyncMock, return_value=None):
+                with patch(
+                    "agents.tg_transfer.transfer_engine.extract_video_thumb",
+                    new_callable=AsyncMock, side_effect=fake_extract,
+                ) as mock_extract:
+                    result = await engine.transfer_single(MagicMock(), target_entity, msg)
+
+    assert result["ok"] is True
+    mock_extract.assert_awaited_once()
+    call_kwargs = mock_client.send_file.call_args
+    thumb_arg = call_kwargs.kwargs.get("thumb")
+    assert thumb_arg, "Expected local thumb path to be forwarded to send_file"
+    assert thumb_arg.endswith(".thumb.jpg")
 
 
 @pytest.mark.asyncio

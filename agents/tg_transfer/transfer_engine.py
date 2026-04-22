@@ -12,7 +12,7 @@ from agents.tg_transfer.hasher import (
 )
 from agents.tg_transfer.media_db import MediaDB
 from agents.tg_transfer.tag_extractor import extract_tags
-from agents.tg_transfer.media_utils import ffprobe_metadata
+from agents.tg_transfer.media_utils import ffprobe_metadata, extract_video_thumb
 from agents.tg_transfer.byte_budget import ByteBudget
 
 logger = logging.getLogger(__name__)
@@ -392,6 +392,12 @@ class TransferEngine:
                     )
                     artefacts.append(thumb_dest)
                     thumb = await self._download_tg_thumb(msg, thumb_dest)
+                    # Same fallback as single-transfer path: if the source
+                    # message has no TG thumb (e.g. "send as file" video),
+                    # extract a frame locally so the album preview still
+                    # renders with a real poster.
+                    if not thumb:
+                        thumb = await extract_video_thumb(path, thumb_dest)
                 per_file_attrs.append(attrs)
                 per_file_thumbs.append(thumb)
 
@@ -565,8 +571,15 @@ class TransferEngine:
                     )]
                     upload_kwargs["supports_streaming"] = True
 
-            # Attach TG original thumbnail (largest variant) so preview shows
+            # Attach TG original thumbnail (largest variant) so preview shows.
+            # When the source is a "send as file" video it arrives with no TG
+            # thumb attached — fall back to an ffmpeg-extracted frame so the
+            # in-feed preview still renders instead of appearing as a blank
+            # document tile. Photos keep TG-only behaviour (they always have
+            # thumbs) so we don't pay ffmpeg cost unnecessarily.
             thumb_path = await self._download_tg_thumb(message, thumb_path_target)
+            if not thumb_path and file_type == "video":
+                thumb_path = await extract_video_thumb(path, thumb_path_target)
             if thumb_path:
                 upload_kwargs["thumb"] = thumb_path
                 if thumb_path != thumb_path_target:
