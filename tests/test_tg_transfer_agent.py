@@ -328,8 +328,12 @@ class TestResumeOnReconnect:
         agent._current_chat_id = {}
         agent._awaiting_target = {}
         agent._search_state = {}
+        agent.hub_url = "http://hub.test"
         # ws_send_progress is inherited from BaseAgent; stub it out.
         agent.ws_send_progress = AsyncMock()
+        # Default: hub unreachable → no pre-filter (preserves legacy behavior
+        # for tests that don't exercise the closed-task pre-filter path).
+        agent._fetch_hub_task_statuses = AsyncMock(return_value={})
         return agent
 
     @pytest.mark.asyncio
@@ -396,6 +400,79 @@ class TestResumeOnReconnect:
             await agent._resume_interrupted_jobs(first_connect=False)
 
         assert len(spawned) == 1
+
+    @pytest.mark.asyncio
+    async def test_closed_task_skipped_and_job_cancelled(self):
+        """If hub reports the task as 'closed' (user closed it out-of-band),
+        resume must skip re-spawn AND mark the job cancelled in DB so it stops
+        showing up as 'running' forever. Without this, the agent would briefly
+        download bytes before hub's CANCEL round-trip stopped it."""
+        agent = self._build_agent()
+        agent.db.get_resumable_jobs = AsyncMock(return_value=[{
+            "job_id": "j-closed", "status": "running",
+            "source_chat": "src", "target_chat": "tgt",
+            "task_id": "t-closed", "chat_id": 100,
+        }])
+        agent.db.update_job_status = AsyncMock()
+        agent._fetch_hub_task_statuses = AsyncMock(return_value={
+            "t-closed": "closed",
+        })
+        agent._spawn_batch_bg = MagicMock()
+
+        await agent._resume_interrupted_jobs(first_connect=True)
+
+        agent._spawn_batch_bg.assert_not_called()
+        agent.ws_send_progress.assert_not_called()
+        agent.db.update_job_status.assert_awaited_once_with("j-closed", "cancelled")
+
+    @pytest.mark.asyncio
+    async def test_missing_task_skipped_and_job_cancelled(self):
+        """If hub has no record of the task (e.g. dashboard deletion), treat
+        as closed and cancel the residual running job."""
+        agent = self._build_agent()
+        agent.db.get_resumable_jobs = AsyncMock(return_value=[{
+            "job_id": "j-missing", "status": "running",
+            "source_chat": "src", "target_chat": "tgt",
+            "task_id": "t-missing", "chat_id": 100,
+        }])
+        agent.db.update_job_status = AsyncMock()
+        agent._fetch_hub_task_statuses = AsyncMock(return_value={
+            "t-missing": "missing",
+        })
+        agent._spawn_batch_bg = MagicMock()
+
+        await agent._resume_interrupted_jobs(first_connect=True)
+
+        agent._spawn_batch_bg.assert_not_called()
+        agent.db.update_job_status.assert_awaited_once_with("j-missing", "cancelled")
+
+    @pytest.mark.asyncio
+    async def test_hub_unreachable_falls_back_to_resume(self):
+        """Pre-filter is an optimization, NOT a correctness gate. If hub is
+        unreachable (empty statuses map) we must still try to resume — agent
+        independence trumps small cancel-latency cost."""
+        agent = self._build_agent()
+        agent.db.get_resumable_jobs = AsyncMock(return_value=[{
+            "job_id": "j-unk", "status": "running",
+            "source_chat": "src", "target_chat": "tgt",
+            "task_id": "t-unk", "chat_id": 100,
+        }])
+        agent.db.update_job_status = AsyncMock()
+        # empty = hub unreachable
+        agent._fetch_hub_task_statuses = AsyncMock(return_value={})
+        spawned = []
+        agent._spawn_batch_bg = MagicMock(
+            side_effect=lambda *a, **kw: spawned.append(a) or MagicMock()
+        )
+
+        with patch(
+            "agents.tg_transfer.__main__.resolve_chat", new_callable=AsyncMock,
+        ) as mock_resolve:
+            mock_resolve.return_value = MagicMock()
+            await agent._resume_interrupted_jobs(first_connect=True)
+
+        assert len(spawned) == 1
+        agent.db.update_job_status.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_paused_job_reminder_first_connect_only(self):

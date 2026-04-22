@@ -39,6 +39,29 @@ async def test_list_agents(aiohttp_client, tmp_db):
 
 
 @pytest.mark.asyncio
+async def test_task_statuses_endpoint(aiohttp_client, tmp_db):
+    """Agent polls this after WS reconnect to filter out closed tasks before
+    re-spawning resume jobs. Missing task_ids come back as 'missing' so the
+    agent can treat them the same as closed (don't resume)."""
+    app = create_hub_app(db_path=tmp_db)
+    client = await aiohttp_client(app)
+
+    tm: TaskManager = app["task_manager"]
+    t_open = tm.create_task(agent_name="tg", chat_id=1, content="a")
+    t_closed = tm.create_task(agent_name="tg", chat_id=1, content="b")
+    tm.close_task(t_closed["task_id"])
+
+    resp = await client.post("/task_statuses", json={
+        "task_ids": [t_open["task_id"], t_closed["task_id"], "nope"],
+    })
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["statuses"][t_open["task_id"]] == "working"
+    assert data["statuses"][t_closed["task_id"]] == "closed"
+    assert data["statuses"]["nope"] == "missing"
+
+
+@pytest.mark.asyncio
 async def test_progress_reopens_done_task(tmp_db):
     """An agent progress message for a 'done' task means the agent is actually
     working on it again (e.g. job resume after startup cleanup). Hub should

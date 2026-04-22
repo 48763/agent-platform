@@ -115,14 +115,47 @@ class TGTransferAgent(BaseAgent):
         self._bg_tasks[task_id] = bg
         return bg
 
+    async def _fetch_hub_task_statuses(self, task_ids: list[str]) -> dict[str, str]:
+        """Ask hub for the current status of each task_id.
+
+        On any failure (hub down, network hiccup), return {} — caller falls back
+        to the old behavior of resuming and letting a PROGRESS→CANCEL round-trip
+        stop the job. The pre-filter is an optimization, not a correctness gate.
+        """
+        if not task_ids:
+            return {}
+        try:
+            from aiohttp import ClientSession
+            async with ClientSession() as session:
+                async with session.post(
+                    f"{self.hub_url}/task_statuses",
+                    json={"task_ids": task_ids},
+                    timeout=5,
+                ) as resp:
+                    if resp.status != 200:
+                        return {}
+                    data = await resp.json()
+                    return data.get("statuses") or {}
+        except Exception as e:
+            logger.warning(f"Hub task_statuses query failed: {e}")
+            return {}
+
     async def _resume_interrupted_jobs(self, first_connect: bool = True):
         """Re-attach running/paused jobs to their original TG task.
 
         - Running jobs: re-spawn if no live background task is tracking them.
         - Paused jobs: always keep the in-memory binding (so retry/skip replies
           route correctly); only send the reminder message on the first connect.
+
+        Before spawning anything, ask the hub for each task's current status.
+        Tasks the user has already closed/archived (or that hub has no record
+        of) get their job marked `cancelled` and are skipped — otherwise we'd
+        briefly download bytes for a closed task before the hub's CANCEL round-
+        trip stopped us.
         """
         jobs = await self.db.get_resumable_jobs()
+        task_ids = [j["task_id"] for j in jobs if j.get("task_id")]
+        hub_statuses = await self._fetch_hub_task_statuses(task_ids)
         for job in jobs:
             task_id = job.get("task_id")
             chat_id = job.get("chat_id")
@@ -130,6 +163,17 @@ class TGTransferAgent(BaseAgent):
                 logger.warning(
                     f"Job {job['job_id']} has no task_id/chat_id binding, cannot resume"
                 )
+                continue
+
+            hub_status = hub_statuses.get(task_id)
+            # Only pre-filter when we actually got an answer from the hub —
+            # empty hub_statuses (hub unreachable) must NOT trigger cancels.
+            if hub_status in ("closed", "archived", "missing"):
+                logger.info(
+                    f"Skipping resume of job {job['job_id']}: "
+                    f"hub task {task_id} status={hub_status}"
+                )
+                await self.db.update_job_status(job["job_id"], "cancelled")
                 continue
 
             if job["status"] == "running":

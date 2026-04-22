@@ -82,6 +82,7 @@ def create_hub_app(
     app.router.add_get("/agents", handle_list_agents)
     app.router.add_post("/dispatch", handle_dispatch)
     app.router.add_post("/set_message_id", handle_set_message_id)
+    app.router.add_post("/task_statuses", handle_task_statuses)
     app.router.add_get("/", handle_dashboard)
     app.router.add_get("/dashboard/tasks", handle_dashboard_tasks)
     app.router.add_post("/dashboard/task/{task_id}/close", handle_task_close)
@@ -139,6 +140,26 @@ async def handle_register_error(request: web.Request) -> web.Response:
 async def handle_list_agents(request: web.Request) -> web.Response:
     agents = request.app["registry"].list_online()
     return web.json_response({"agents": [a.to_dict() for a in agents]})
+
+
+async def handle_task_statuses(request: web.Request) -> web.Response:
+    """Return current statuses for a list of task_ids.
+
+    Used by agents on WS (re)connect to filter out tasks the user has already
+    closed out-of-band before re-spawning resume jobs. Without this, a closed
+    task will still briefly re-run (downloading bytes) until the hub's
+    progress-handler round-trips a CANCEL back. Missing task_ids are returned
+    as status='missing' so the agent can treat hub-gone-cold tasks the same as
+    closed ones (don't resume).
+    """
+    data = await request.json()
+    task_ids = data.get("task_ids") or []
+    task_manager: TaskManager = request.app["task_manager"]
+    statuses: dict[str, str] = {}
+    for tid in task_ids:
+        t = task_manager.get_task(tid)
+        statuses[tid] = t["status"] if t else "missing"
+    return web.json_response({"statuses": statuses})
 
 
 async def handle_set_message_id(request: web.Request) -> web.Response:
