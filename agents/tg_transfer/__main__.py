@@ -306,6 +306,15 @@ class TGTransferAgent(BaseAgent):
         """User replied with a target chat after we asked for one."""
         pending = self._awaiting_target.pop(task.task_id)
         target_chat = task.content.strip()
+        try:
+            await resolve_chat(self.tg_client, target_chat)
+        except Exception:
+            # Put state back so user can retry
+            self._awaiting_target[task.task_id] = pending
+            return AgentResult(
+                status=TaskStatus.NEED_INPUT,
+                message=f"找不到「{target_chat}」，請確認名稱後重新輸入",
+            )
         await self.db.set_config("default_target_chat", target_chat)
         return await self._handle_single(task, pending["chat"], pending["message_id"])
 
@@ -563,6 +572,9 @@ class TGTransferAgent(BaseAgent):
                 await self.db.set_auto_skip(job_id, True)
                 await self._skip_current_failed(job_id)
                 return await self._resume_batch(task.task_id, job_id, job)
+
+        if job["status"] == "running":
+            return AgentResult(status=TaskStatus.DONE, message="搬移進行中，請等待完成")
 
         return AgentResult(status=TaskStatus.NEED_INPUT, message="請選擇：重試 / 跳過 / 一律跳過")
 

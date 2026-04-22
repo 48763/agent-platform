@@ -1,5 +1,6 @@
 # hub/ws_handler.py
 """WebSocket endpoint handlers for agent and gateway connections."""
+import asyncio
 import logging
 import os
 import time
@@ -51,7 +52,8 @@ async def handle_agent_ws(request: web.Request) -> web.WebSocketResponse:
     finally:
         registry.remove_ws(name)
         logger.info("Agent WS disconnected: %s", name)
-        await _close_agent_tasks(task_manager, name, request.app)
+        # Grace period: wait before closing tasks — agent might just be restarting.
+        await _delayed_close_agent_tasks(registry, task_manager, name, request.app)
 
     return ws
 
@@ -183,9 +185,23 @@ async def _send_to_gateway(app: web.Application, chat_id: int, message_str: str)
     logger.warning("No gateway connected for chat_id=%s", chat_id)
 
 
+_AGENT_DISCONNECT_GRACE_SECONDS = 30
+
+
+async def _delayed_close_agent_tasks(
+    registry, task_manager: TaskManager, agent_name: str, app: web.Application,
+):
+    """Wait a grace period before closing tasks — agent might just be restarting.
+    If agent reconnects within the window, skip the close entirely."""
+    await asyncio.sleep(_AGENT_DISCONNECT_GRACE_SECONDS)
+    if registry.has_ws(agent_name):
+        logger.info("Agent %s reconnected within grace period, skipping task close", agent_name)
+        return
+    await _close_agent_tasks(task_manager, agent_name, app)
+
+
 async def _close_agent_tasks(task_manager: TaskManager, agent_name: str, app: web.Application):
-    """On agent disconnect, mark all its active tasks as error and notify gateway."""
-    import sqlite3
+    """Mark all active tasks for agent as error and notify gateway."""
     rows = task_manager._conn.execute(
         "SELECT * FROM tasks WHERE agent_name = ? AND status IN ('working', 'waiting_input', 'waiting_approval')",
         (agent_name,),

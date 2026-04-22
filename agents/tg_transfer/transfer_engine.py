@@ -632,10 +632,12 @@ class TransferEngine:
                 # Handle album group
                 if grouped_id:
                     group_rows = await self.db.get_grouped_messages(job_id, grouped_id)
-                    # Only process when we hit the first pending in the group
-                    if group_rows[0]["message_id"] != message_id:
-                        # Already handled as part of group
-                        await self.db.mark_message(job_id, message_id, "success")
+                    # Only process when we hit the first PENDING in the group
+                    pending_in_group = [r for r in group_rows if r["status"] == "pending"]
+                    if not pending_in_group or pending_in_group[0]["message_id"] != message_id:
+                        # Already handled as part of group (or no pending left)
+                        if not pending_in_group:
+                            await self.db.mark_message(job_id, message_id, "success")
                         processed += 1
                         continue
 
