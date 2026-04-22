@@ -75,6 +75,22 @@ class TransferEngine:
     def cancel_job(self, job_id: str):
         self._cancelled.add(job_id)
 
+    def _download_request_size(self) -> int:
+        """Download chunk size. Premium accounts can safely pull 1 MiB chunks
+        (Telegram's per-request max) for ~2x throughput; non-premium stays at
+        512 KiB to match Telethon's usual default for large files."""
+        if getattr(self.client, "premium_account", False):
+            return 1024 * 1024
+        return 512 * 1024
+
+    def _upload_part_kb(self) -> int:
+        """Upload part size. Premium: 512 KB (Telegram's max, matches premium
+        upload throughput); non-premium: 256 KB (stays below stricter
+        non-premium flood thresholds)."""
+        if getattr(self.client, "premium_account", False):
+            return 512
+        return 256
+
     async def _size_limit_bytes(self) -> int:
         """Current per-message byte cap. Read from DB on every call so the
         user can change it live while a batch is running. 0 = no limit."""
@@ -157,7 +173,9 @@ class TransferEngine:
         async def _stream():
             nonlocal downloaded, since_flush
             with open(dest, mode) as f:
-                async for chunk in self.client.iter_download(message, offset=offset):
+                async for chunk in self.client.iter_download(
+                    message, offset=offset, request_size=self._download_request_size(),
+                ):
                     f.write(chunk)
                     downloaded += len(chunk)
                     since_flush += len(chunk)
@@ -380,7 +398,9 @@ class TransferEngine:
                 upload_kwargs["thumb"] = per_file_thumbs
 
             result = await self.client.send_file(
-                target_entity, effective_paths, **upload_kwargs,
+                target_entity, effective_paths,
+                part_size_kb=self._upload_part_kb(),
+                **upload_kwargs,
             )
 
             # Mark uploaded per file. send_file for a list returns a list of
@@ -545,7 +565,9 @@ class TransferEngine:
 
             # Upload
             result = await self.client.send_file(
-                target_entity, path, **upload_kwargs
+                target_entity, path,
+                part_size_kb=self._upload_part_kb(),
+                **upload_kwargs,
             )
 
             # Record success

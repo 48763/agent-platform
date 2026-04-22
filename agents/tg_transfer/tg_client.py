@@ -22,5 +22,16 @@ async def create_client(session_path: str) -> TelegramClient:
 
     client = TelegramClient(session_path, int(api_id_str), api_hash)
     await client.start()
-    logger.info("Telethon client connected")
+    # Premium flag drives chunk-size tuning for faster up/download.
+    # Attach to client so downstream components (TransferEngine) can branch
+    # without needing to call get_me() again.
+    try:
+        me = await client.get_me()
+        client.premium_account = bool(getattr(me, "premium", False))
+    except Exception as e:
+        logger.warning(f"Premium check failed, assuming non-premium: {e}")
+        client.premium_account = False
+    logger.info(
+        f"Telethon client connected (premium={client.premium_account})"
+    )
     return client

@@ -345,7 +345,7 @@ async def test_transfer_album_writes_media_db_per_file(
     msg3 = _make_message(503, grouped_id=50)
 
     # Stream per-file chunks via iter_download (new resumable path)
-    def _make_iter(msg, offset=0):
+    def _make_iter(msg, offset=0, **kwargs):
         async def gen():
             yield bytes([msg.id % 256]) * 10
         return gen()
@@ -382,7 +382,7 @@ async def test_transfer_album_download_fail_no_media_row(
     msg2 = _make_message(602, grouped_id=60)
 
     # msg1 streams OK, msg2 download raises → transfer_album returns False.
-    def _make_iter(msg, offset=0):
+    def _make_iter(msg, offset=0, **kwargs):
         if msg.id == 602:
             async def bad():
                 raise RuntimeError("stream failed")
@@ -413,7 +413,7 @@ async def test_transfer_album_upload_exception_marks_failed_not_deletes(
     msg1 = _make_message(701, text="cap", grouped_id=70)
     msg2 = _make_message(702, grouped_id=70)
 
-    def _make_iter(msg, offset=0):
+    def _make_iter(msg, offset=0, **kwargs):
         async def gen():
             yield bytes([msg.id % 256]) * 10
         return gen()
@@ -486,7 +486,7 @@ async def test_transfer_album_skips_duplicate_file_sends_rest(
 
     # Stream per-file bytes via iter_download (resumable path keyed by msg).
     # Each msg yields distinct content so artefacts are unambiguous on disk.
-    def _make_iter(msg, offset=0):
+    def _make_iter(msg, offset=0, **kwargs):
         async def gen():
             yield bytes([msg.id % 256]) * 10
         return gen()
@@ -537,7 +537,7 @@ async def test_transfer_album_all_duplicate_no_send_file(
     msg1 = _make_message(1001, text="cap", grouped_id=100)
     msg2 = _make_message(1002, grouped_id=100)
 
-    def _make_iter(msg, offset=0):
+    def _make_iter(msg, offset=0, **kwargs):
         async def gen():
             yield bytes([msg.id % 256]) * 10
         return gen()
@@ -713,7 +713,7 @@ async def test_transfer_album_streams_via_iter_download(
 
     # Track which messages iter_download was called with.
     iter_calls = []
-    def make_iter_download(msg, offset=0):
+    def make_iter_download(msg, offset=0, **kwargs):
         iter_calls.append((msg.id, offset))
         async def gen():
             yield b"\xAB" * 8
@@ -758,7 +758,7 @@ async def test_transfer_album_resumes_one_file_from_partial(
     await db.set_partial(job_id, 901, partial, 123)
 
     iter_calls = {}
-    def make_iter_download(msg, offset=0):
+    def make_iter_download(msg, offset=0, **kwargs):
         iter_calls[msg.id] = offset
         async def gen():
             yield b"R" * 7
@@ -792,7 +792,7 @@ async def test_transfer_album_clears_partial_state_on_success(
     job_id = await db.create_job("@src", "@dst", "batch")
     await db.add_messages(job_id, [1001, 1002], grouped_ids={1001: 100, 1002: 100})
 
-    def make_iter_download(msg, offset=0):
+    def make_iter_download(msg, offset=0, **kwargs):
         async def gen():
             yield b"X" * 4
         return gen()
@@ -870,7 +870,7 @@ async def test_byte_budget_blocks_second_download_until_first_releases(
     second_started = asyncio.Event()
     started_order: list[int] = []
 
-    def fake_iter_download(msg, offset=0):
+    def fake_iter_download(msg, offset=0, **kwargs):
         started_order.append(msg.id)
 
         async def gen():
@@ -925,7 +925,7 @@ async def test_byte_budget_released_on_exception(
     job_id = await db.create_job("@s", "@d", "batch")
     await db.add_messages(job_id, [920])
 
-    def fake_iter(msg, offset=0):
+    def fake_iter(msg, offset=0, **kwargs):
         async def gen():
             raise RuntimeError("stream error")
             yield b""  # unreachable
@@ -1139,7 +1139,7 @@ async def test_download_aborts_when_threshold_lowered_mid_stream(
 
     # iter_download emits in 100-byte chunks. Between chunks, we lower the
     # limit to something the running download already exceeds.
-    async def fake_iter_download(message, offset=0):
+    async def fake_iter_download(message, offset=0, **kwargs):
         yield b"a" * 100
         # Mid-stream: user lowers threshold to 0 MB ... no wait, needs to be
         # smaller than downloaded_bytes, which in bytes is 100. Limit is in MB
@@ -1255,7 +1255,7 @@ async def test_transfer_album_under_sum_limit_proceeds(
     for m, sz in [(msg1, 50), (msg2, 50)]:  # 100 MB < 200
         m.file = MagicMock(size=sz * 1024 * 1024)
 
-    def _make_iter(msg, offset=0):
+    def _make_iter(msg, offset=0, **kwargs):
         async def gen():
             yield bytes([msg.id % 256]) * 10
         return gen()
@@ -1319,7 +1319,7 @@ async def test_transfer_album_no_limit_set_is_no_op(
     for m in (msg1, msg2):
         m.file = MagicMock(size=5 * 1024 * 1024 * 1024)
 
-    def _make_iter(msg, offset=0):
+    def _make_iter(msg, offset=0, **kwargs):
         async def gen():
             yield b"\x00" * 5
         return gen()
@@ -1463,7 +1463,7 @@ class TestUploadFilenameExtension:
         for m in (msg1, msg2):
             m.file = MagicMock(ext=".jpg", name=None)
 
-        def _make_iter(msg, offset=0):
+        def _make_iter(msg, offset=0, **kwargs):
             async def gen():
                 yield b"\x89PNG"
             return gen()
@@ -1657,3 +1657,27 @@ class TestPreDedupByThumb:
         pending = await media_db.list_pending_dedup_by_job("j1")
         assert len(pending) == 1
         assert ".dat" not in result
+
+
+class TestPremiumChunkTuning:
+    """Premium accounts get larger chunks for faster up/download. The flag is
+    read from the client on each call so it works even if detection moves or
+    gets re-probed later — getattr with a False default keeps non-premium and
+    missing-attribute cases identical."""
+
+    def test_non_premium_defaults(self, engine, mock_client):
+        # client has no premium_account attr at all → treated as non-premium.
+        if hasattr(mock_client, "premium_account"):
+            del mock_client.premium_account
+        assert engine._download_request_size() == 512 * 1024
+        assert engine._upload_part_kb() == 256
+
+    def test_premium_uses_max_chunks(self, engine, mock_client):
+        mock_client.premium_account = True
+        assert engine._download_request_size() == 1024 * 1024
+        assert engine._upload_part_kb() == 512
+
+    def test_explicit_false_matches_non_premium(self, engine, mock_client):
+        mock_client.premium_account = False
+        assert engine._download_request_size() == 512 * 1024
+        assert engine._upload_part_kb() == 256
