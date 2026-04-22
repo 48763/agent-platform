@@ -22,6 +22,9 @@ from agents.tg_transfer.media_db import MediaDB
 from agents.tg_transfer.indexer import TargetIndexer
 from agents.tg_transfer.byte_budget import ByteBudget
 from agents.tg_transfer.search import format_search_results, format_similar_results
+from agents.tg_transfer.ambiguous import (
+    format_ambiguous_summary, parse_ambiguous_reply,
+)
 from agents.tg_transfer.hasher import compute_phash, hamming_distance, PHASH_AVAILABLE
 from agents.tg_transfer.liveness_checker import run_liveness_loop
 from agents.tg_transfer.dashboard import create_tg_dashboard_handler
@@ -642,6 +645,9 @@ class TGTransferAgent(BaseAgent):
                 await self._skip_current_failed(job_id)
                 return await self._resume_batch(task.task_id, job_id, job)
 
+        if job["status"] == "awaiting_dedup":
+            return await self._handle_dedup_response(task, job_id, job)
+
         if job["status"] == "running":
             return AgentResult(status=TaskStatus.DONE, message="搬移進行中，請等待完成")
 
@@ -724,6 +730,7 @@ class TGTransferAgent(BaseAgent):
         async def report_fn(text):
             await self.ws_send_progress(task_id, chat_id, text)
 
+        keep_pending_binding = False
         try:
             status = await self.engine.run_batch(job_id, source_entity, target_entity, report_fn)
             progress = await self.db.get_progress(job_id)
@@ -743,15 +750,36 @@ class TGTransferAgent(BaseAgent):
                             f"跳過：{progress['skipped']} 則",
                 ))
             else:
-                await self.ws_send_result(task_id, AgentResult(
-                    status=TaskStatus.DONE,
-                    message=f"搬移完成\n"
-                            f"來源：{job['source_chat']}\n"
-                            f"目標：{job['target_chat']}\n"
-                            f"成功：{progress['success']} 則\n"
-                            f"跳過：{progress['skipped']} 則\n"
-                            f"失敗：{progress['failed']} 則",
-                ))
+                # Phase 5: before declaring done, surface any pending_dedup rows
+                # parked by Phase 4. The user arbitrates which ambiguous source
+                # messages are the same as target candidates (skip) vs. truly
+                # different (upload). Job stays bound to the task so the reply
+                # routes back here.
+                pending = await self.media_db.list_pending_dedup_by_job(job_id)
+                if pending:
+                    await self.db.update_job_status(job_id, "awaiting_dedup")
+                    summary = format_ambiguous_summary(pending)
+                    await self.ws_send_result(task_id, AgentResult(
+                        status=TaskStatus.NEED_INPUT,
+                        message=(
+                            f"搬移完成（待確認 {len(pending)} 則歧異）\n"
+                            f"成功：{progress['success']} 則｜"
+                            f"跳過：{progress['skipped']} 則｜"
+                            f"失敗：{progress['failed']} 則\n\n"
+                            + summary
+                        ),
+                    ))
+                    keep_pending_binding = True
+                else:
+                    await self.ws_send_result(task_id, AgentResult(
+                        status=TaskStatus.DONE,
+                        message=f"搬移完成\n"
+                                f"來源：{job['source_chat']}\n"
+                                f"目標：{job['target_chat']}\n"
+                                f"成功：{progress['success']} 則\n"
+                                f"跳過：{progress['skipped']} 則\n"
+                                f"失敗：{progress['failed']} 則",
+                    ))
         except Exception as e:
             logger.error(f"Batch transfer error: {e}", exc_info=True)
             await self.ws_send_result(task_id, AgentResult(
@@ -759,8 +787,111 @@ class TGTransferAgent(BaseAgent):
                 message=f"搬移失敗：{e}",
             ))
         finally:
-            self._pending_jobs.pop(task_id, None)
+            if not keep_pending_binding:
+                self._pending_jobs.pop(task_id, None)
             self._bg_tasks.pop(task_id, None)
+
+    async def _handle_dedup_response(self, task, job_id: str, job: dict) -> AgentResult:
+        """Phase 5: apply user's arbitration on ambiguous-dedup queue.
+
+        Reply grammar handled in `parse_ambiguous_reply`:
+          - "same 1a, 2b" → source [1] is a duplicate of target candidate a,
+            source [2] is target candidate b. Rows mentioned → drop from queue
+            without uploading. Rows NOT mentioned → upload (user said they're
+            different).
+          - "skip" → drop all queued rows; upload nothing.
+          - unparseable → re-prompt (don't default to upload, to avoid
+            surprising the user with a bulk upload from a typo).
+        """
+        task_id = task.task_id
+        chat_id = self._current_chat_id.get(task_id, job.get("chat_id", 0))
+        parsed = parse_ambiguous_reply(task.content)
+        if parsed is None:
+            return AgentResult(
+                status=TaskStatus.NEED_INPUT,
+                message=(
+                    "無法解析你的回覆。格式：「same 1a, 2b」表示 [1] 跟 a 相同、"
+                    "[2] 跟 b 相同；未提到的會上傳。全部略過請回覆「skip」。"
+                ),
+            )
+
+        pending = await self.media_db.list_pending_dedup_by_job(job_id)
+        if not pending:
+            # Nothing to resolve — likely a stale reply after another path
+            # drained the queue. Close out the job cleanly.
+            self._pending_jobs.pop(task_id, None)
+            await self.db.update_job_status(job_id, "completed")
+            return AgentResult(
+                status=TaskStatus.DONE, message="沒有待確認的項目",
+            )
+
+        to_upload: list[int] = []
+        resolved_same = 0
+
+        if parsed == "skip":
+            # User opts out of all uploads — just clear the queue.
+            for row in pending:
+                await self.media_db.delete_pending_dedup(row["id"])
+            resolved_same = len(pending)
+        else:
+            # parsed is dict {source_idx: target_letter}
+            for idx, row in enumerate(pending, start=1):
+                if idx in parsed:
+                    # Mentioned → user says this one matches a target
+                    # candidate. Drop the queue row; don't upload.
+                    await self.media_db.delete_pending_dedup(row["id"])
+                    resolved_same += 1
+                else:
+                    # Unmentioned → user implicitly says "different, upload".
+                    to_upload.append(int(row["source_msg_id"]))
+                    await self.media_db.delete_pending_dedup(row["id"])
+
+        uploaded = 0
+        upload_failed = 0
+        if to_upload:
+            source_entity = await resolve_chat(self.tg_client, job["source_chat"])
+            target_entity = await resolve_chat(self.tg_client, job["target_chat"])
+            for msg_id in to_upload:
+                try:
+                    msg = await self.tg_client.get_messages(source_entity, ids=msg_id)
+                    if msg is None:
+                        upload_failed += 1
+                        continue
+                    result = await self.engine.transfer_single(
+                        source_entity, target_entity, msg,
+                        target_chat=job["target_chat"],
+                        source_chat=job["source_chat"],
+                        job_id=job_id,
+                        skip_pre_dedup=True,
+                    )
+                    if result.get("ok"):
+                        uploaded += 1
+                        # Flip the original 'ambiguous' job_messages row to
+                        # success so progress counts stay consistent.
+                        await self.db.mark_message(
+                            job_id, msg_id, "success",
+                        )
+                    else:
+                        upload_failed += 1
+                except Exception as e:
+                    logger.error(
+                        f"Dedup upload failed for msg {msg_id}: {e}",
+                        exc_info=True,
+                    )
+                    upload_failed += 1
+
+        self._pending_jobs.pop(task_id, None)
+        await self.db.update_job_status(job_id, "completed")
+
+        summary_parts = [f"已確認 {resolved_same} 則為相同"]
+        if uploaded:
+            summary_parts.append(f"已上傳 {uploaded} 則")
+        if upload_failed:
+            summary_parts.append(f"上傳失敗 {upload_failed} 則")
+        return AgentResult(
+            status=TaskStatus.DONE,
+            message="｜".join(summary_parts),
+        )
 
     async def _resume_batch(self, task_id: str, job_id: str, job: dict):
         """Resume a paused batch job (non-blocking)."""

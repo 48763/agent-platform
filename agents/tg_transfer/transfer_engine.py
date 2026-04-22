@@ -223,12 +223,19 @@ class TransferEngine:
 
     async def transfer_single(self, source_entity, target_entity, message,
                                target_chat: str = "", source_chat: str = "",
-                               job_id: str = None) -> dict:
-        """Transfer a single message. Returns {"ok": bool, "dedup": bool, "similar": list | None}."""
+                               job_id: str = None,
+                               skip_pre_dedup: bool = False) -> dict:
+        """Transfer a single message. Returns {"ok": bool, "dedup": bool, "similar": list | None}.
+
+        `skip_pre_dedup`: bypass Phase 4 thumb-phash check. Used by the Phase 5
+        dedup resolver when the user explicitly marks an ambiguous source as
+        "different" — otherwise we'd just re-park it in pending_dedup forever.
+        """
         if message.media and not self.should_skip(message):
             return await self._transfer_media(
                 target_entity, message, target_chat=target_chat,
                 source_chat=source_chat, job_id=job_id,
+                skip_pre_dedup=skip_pre_dedup,
             )
         elif message.text and not message.media:
             await self.client.send_message(target_entity, message.text)
@@ -440,7 +447,8 @@ class TransferEngine:
                     logger.debug(f"Failed to unlink tmp file {p}", exc_info=True)
 
     async def _transfer_media(self, target_entity, message, target_chat: str = "",
-                               source_chat: str = "", job_id: str = None) -> dict:
+                               source_chat: str = "", job_id: str = None,
+                               skip_pre_dedup: bool = False) -> dict:
         """Download and re-upload a single media message.
         Returns: {"ok": bool, "dedup": bool, "similar": list | None}
         """
@@ -457,11 +465,16 @@ class TransferEngine:
                 }
         # Phase 4: cross-source thumb dedup. Only a tiny thumb (not the full
         # file) is downloaded, so this is a pure saving when the target
-        # already has the content.
-        pre = await self._pre_dedup_by_thumb(
-            message, target_chat=target_chat, source_chat=source_chat,
-            job_id=job_id,
-        )
+        # already has the content. Phase 5 "different" resolutions bypass this
+        # step — otherwise the user-arbitrated upload would re-park itself in
+        # pending_dedup on the same thumb collision.
+        if skip_pre_dedup:
+            pre = {"hit": False}
+        else:
+            pre = await self._pre_dedup_by_thumb(
+                message, target_chat=target_chat, source_chat=source_chat,
+                job_id=job_id,
+            )
         if pre.get("hit"):
             if pre.get("dedup"):
                 return {"ok": True, "dedup": True, "similar": None}

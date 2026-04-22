@@ -494,3 +494,130 @@ class TestResumeOnReconnect:
         await agent._resume_interrupted_jobs(first_connect=False)
         agent.ws_send_progress.assert_not_called()
         assert agent._pending_jobs["t2"] == "j2"
+
+
+class TestHandleDedupResponse:
+    """Phase 5: user arbitrates ambiguous pending_dedup queue after batch end."""
+
+    def _build_agent(self):
+        from agents.tg_transfer.__main__ import TGTransferAgent
+        agent = TGTransferAgent.__new__(TGTransferAgent)
+        agent.db = AsyncMock()
+        agent.media_db = AsyncMock()
+        agent.tg_client = AsyncMock()
+        agent.engine = AsyncMock()
+        agent._pending_jobs = {}
+        agent._bg_tasks = {}
+        agent._current_chat_id = {}
+        agent._awaiting_target = {}
+        agent._search_state = {}
+        agent.hub_url = "http://hub.test"
+        return agent
+
+    @pytest.mark.asyncio
+    async def test_skip_clears_queue_no_uploads(self):
+        agent = self._build_agent()
+        job = {"job_id": "j1", "source_chat": "src", "target_chat": "tgt",
+               "task_id": "t1", "chat_id": 100, "status": "awaiting_dedup"}
+        agent.media_db.list_pending_dedup_by_job = AsyncMock(return_value=[
+            {"id": 1, "source_msg_id": 101, "candidate_target_msg_ids": [501]},
+            {"id": 2, "source_msg_id": 102, "candidate_target_msg_ids": [502]},
+        ])
+        agent.media_db.delete_pending_dedup = AsyncMock()
+        agent._pending_jobs["t1"] = "j1"
+
+        task = TaskRequest(task_id="t1", content="skip")
+        result = await agent._handle_dedup_response(task, "j1", job)
+
+        assert result.status == TaskStatus.DONE
+        # Both rows deleted, neither uploaded.
+        assert agent.media_db.delete_pending_dedup.await_count == 2
+        agent.engine.transfer_single.assert_not_called()
+        # Binding released.
+        assert "t1" not in agent._pending_jobs
+
+    @pytest.mark.asyncio
+    async def test_same_marks_resolved_without_upload(self):
+        """User says [1] matches target candidate 'a' → that row is dropped
+        and NOT uploaded. There's nothing else in the queue, so no uploads
+        happen at all."""
+        agent = self._build_agent()
+        job = {"job_id": "j1", "source_chat": "src", "target_chat": "tgt",
+               "task_id": "t1", "chat_id": 100, "status": "awaiting_dedup"}
+        agent.media_db.list_pending_dedup_by_job = AsyncMock(return_value=[
+            {"id": 1, "source_msg_id": 101, "candidate_target_msg_ids": [501]},
+        ])
+        agent.media_db.delete_pending_dedup = AsyncMock()
+        agent._pending_jobs["t1"] = "j1"
+
+        task = TaskRequest(task_id="t1", content="same 1a")
+        result = await agent._handle_dedup_response(task, "j1", job)
+
+        assert result.status == TaskStatus.DONE
+        agent.engine.transfer_single.assert_not_called()
+        agent.media_db.delete_pending_dedup.assert_awaited_once_with(1)
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_rows_get_uploaded(self):
+        """User says [1] is same, [2] is unmentioned → [2] must upload.
+        Upload path MUST pass skip_pre_dedup=True — otherwise the same thumb
+        collision would re-park the message in pending_dedup forever."""
+        agent = self._build_agent()
+        job = {"job_id": "j1", "source_chat": "src", "target_chat": "tgt",
+               "task_id": "t1", "chat_id": 100, "status": "awaiting_dedup"}
+        agent.media_db.list_pending_dedup_by_job = AsyncMock(return_value=[
+            {"id": 1, "source_msg_id": 101, "candidate_target_msg_ids": [501]},
+            {"id": 2, "source_msg_id": 102, "candidate_target_msg_ids": [502]},
+        ])
+        agent.media_db.delete_pending_dedup = AsyncMock()
+        agent.engine.transfer_single = AsyncMock(return_value={
+            "ok": True, "dedup": False, "similar": None,
+        })
+        agent.tg_client.get_messages = AsyncMock(return_value=MagicMock())
+        agent._pending_jobs["t1"] = "j1"
+
+        task = TaskRequest(task_id="t1", content="same 1a")
+        with patch("agents.tg_transfer.__main__.resolve_chat",
+                   new_callable=AsyncMock) as mock_resolve:
+            mock_resolve.return_value = MagicMock()
+            result = await agent._handle_dedup_response(task, "j1", job)
+
+        assert result.status == TaskStatus.DONE
+        # Only msg 102 (the unmentioned one) should be uploaded.
+        assert agent.engine.transfer_single.await_count == 1
+        call = agent.engine.transfer_single.await_args_list[0]
+        assert call.kwargs.get("skip_pre_dedup") is True
+        # Both queue rows dropped regardless (1 resolved, 2 uploaded).
+        assert agent.media_db.delete_pending_dedup.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_unparseable_reply_reprompts(self):
+        """Garbled replies (typos) must NOT default to 'all different, upload
+        everything' — that could spend a lot of bandwidth on a mistake."""
+        agent = self._build_agent()
+        job = {"job_id": "j1", "source_chat": "src", "target_chat": "tgt",
+               "task_id": "t1", "chat_id": 100, "status": "awaiting_dedup"}
+
+        task = TaskRequest(task_id="t1", content="uhhh what")
+        result = await agent._handle_dedup_response(task, "j1", job)
+
+        assert result.status == TaskStatus.NEED_INPUT
+        agent.engine.transfer_single.assert_not_called()
+        # Don't drop the queue on unparseable input — user can retry.
+        agent.media_db.delete_pending_dedup.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_queue_closes_cleanly(self):
+        """Stale reply after the queue was drained (e.g. by another reply)
+        should just confirm 'nothing to do' rather than crash."""
+        agent = self._build_agent()
+        job = {"job_id": "j1", "source_chat": "src", "target_chat": "tgt",
+               "task_id": "t1", "chat_id": 100, "status": "awaiting_dedup"}
+        agent.media_db.list_pending_dedup_by_job = AsyncMock(return_value=[])
+        agent._pending_jobs["t1"] = "j1"
+
+        task = TaskRequest(task_id="t1", content="same 1a")
+        result = await agent._handle_dedup_response(task, "j1", job)
+
+        assert result.status == TaskStatus.DONE
+        assert "t1" not in agent._pending_jobs
