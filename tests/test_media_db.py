@@ -795,3 +795,84 @@ class TestPhase4Dedup:
         await mdb.delete_pending_dedup(row_id)
         rows = await mdb.list_pending_dedup_by_job("job-1")
         assert rows == []
+
+
+class TestDeferredDedup:
+    """Phase 6: deferred queue stores source-chat metadata recorded by
+    `/batch --skip-dedup`. `/process_deferred` later drains the queue and
+    routes each row to upload / dedup / pending_dedup."""
+
+    @pytest.mark.asyncio
+    async def test_insert_and_list(self, mdb):
+        await mdb.insert_deferred_dedup(
+            source_chat="@src", source_msg_id=10, target_chat="@tgt",
+            thumb_phash="abc", file_type="photo", file_size=1234,
+            caption="hi", duration=None, grouped_id=None,
+        )
+        rows = await mdb.list_deferred_dedup()
+        assert len(rows) == 1
+        assert rows[0]["source_msg_id"] == 10
+        assert rows[0]["thumb_phash"] == "abc"
+        assert rows[0]["caption"] == "hi"
+
+    @pytest.mark.asyncio
+    async def test_insert_replace_on_conflict(self, mdb):
+        """Re-running a defer-scan over the same (src, msg, target) should
+        refresh the row in place, not create a duplicate."""
+        await mdb.insert_deferred_dedup(
+            source_chat="@src", source_msg_id=10, target_chat="@tgt",
+            thumb_phash="old", file_type="photo", file_size=100,
+            caption="v1", duration=None, grouped_id=None,
+        )
+        await mdb.insert_deferred_dedup(
+            source_chat="@src", source_msg_id=10, target_chat="@tgt",
+            thumb_phash="new", file_type="photo", file_size=100,
+            caption="v2", duration=None, grouped_id=None,
+        )
+        rows = await mdb.list_deferred_dedup()
+        assert len(rows) == 1
+        assert rows[0]["thumb_phash"] == "new"
+        assert rows[0]["caption"] == "v2"
+
+    @pytest.mark.asyncio
+    async def test_list_scoped_by_source_and_target(self, mdb):
+        await mdb.insert_deferred_dedup(
+            source_chat="@a", source_msg_id=1, target_chat="@x",
+            thumb_phash=None, file_type="document", file_size=None,
+            caption=None, duration=None, grouped_id=None,
+        )
+        await mdb.insert_deferred_dedup(
+            source_chat="@a", source_msg_id=2, target_chat="@y",
+            thumb_phash=None, file_type="document", file_size=None,
+            caption=None, duration=None, grouped_id=None,
+        )
+        await mdb.insert_deferred_dedup(
+            source_chat="@b", source_msg_id=3, target_chat="@x",
+            thumb_phash=None, file_type="document", file_size=None,
+            caption=None, duration=None, grouped_id=None,
+        )
+        scoped = await mdb.list_deferred_dedup(
+            source_chat="@a", target_chat="@x",
+        )
+        assert len(scoped) == 1
+        assert scoped[0]["source_msg_id"] == 1
+
+    @pytest.mark.asyncio
+    async def test_count(self, mdb):
+        assert await mdb.count_deferred_dedup() == 0
+        await mdb.insert_deferred_dedup(
+            source_chat="@s", source_msg_id=1, target_chat="@t",
+            thumb_phash=None, file_type="photo", file_size=None,
+            caption=None, duration=None, grouped_id=None,
+        )
+        assert await mdb.count_deferred_dedup() == 1
+
+    @pytest.mark.asyncio
+    async def test_delete(self, mdb):
+        row_id = await mdb.insert_deferred_dedup(
+            source_chat="@s", source_msg_id=1, target_chat="@t",
+            thumb_phash=None, file_type="photo", file_size=None,
+            caption=None, duration=None, grouped_id=None,
+        )
+        await mdb.delete_deferred_dedup(row_id)
+        assert await mdb.count_deferred_dedup() == 0

@@ -51,6 +51,27 @@ CREATE TABLE IF NOT EXISTS pending_dedup (
     reason                     TEXT,
     created_at                 TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Phase 6 deferred queue: `/batch --skip-dedup` scans the source chat and
+-- records thumb_phash + metadata here WITHOUT comparing to target or
+-- uploading. Later `/process_deferred` drains this table: for each row, do
+-- the Phase-4 thumb lookup against target index, then upload / skip / park
+-- in pending_dedup accordingly. Trade-off: scan is cheap (thumbnails only),
+-- but you need to run process_deferred before duplicates actually land.
+CREATE TABLE IF NOT EXISTS deferred_dedup (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_chat     TEXT NOT NULL,
+    source_msg_id   INTEGER NOT NULL,
+    target_chat     TEXT NOT NULL,
+    thumb_phash     TEXT,
+    file_type       TEXT,
+    file_size       INTEGER,
+    caption         TEXT,
+    duration        INTEGER,
+    grouped_id      INTEGER,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (source_chat, source_msg_id, target_chat)
+);
 """
 
 # Indexes run AFTER _migrate() so a legacy `media` table (missing
@@ -63,6 +84,10 @@ CREATE INDEX IF NOT EXISTS idx_media_thumb_phash ON media(thumb_phash);
 CREATE INDEX IF NOT EXISTS idx_media_caption ON media(caption);
 CREATE INDEX IF NOT EXISTS idx_media_status ON media(status);
 CREATE INDEX IF NOT EXISTS idx_pending_dedup_job ON pending_dedup(job_id);
+CREATE INDEX IF NOT EXISTS idx_deferred_dedup_target
+    ON deferred_dedup(target_chat);
+CREATE INDEX IF NOT EXISTS idx_deferred_dedup_thumb
+    ON deferred_dedup(thumb_phash);
 """
 
 
@@ -358,6 +383,67 @@ class MediaDB:
     async def delete_pending_dedup(self, row_id: int):
         await self._db.execute(
             "DELETE FROM pending_dedup WHERE id = ?", (row_id,)
+        )
+        await self._db.commit()
+
+    # -- Phase 6 deferred queue --
+
+    async def insert_deferred_dedup(
+        self, source_chat: str, source_msg_id: int, target_chat: str,
+        thumb_phash: str | None, file_type: str | None,
+        file_size: int | None, caption: str | None,
+        duration: int | None, grouped_id: int | None,
+    ) -> int:
+        """Record one source message's metadata for later dedup comparison.
+
+        Uses INSERT OR REPLACE on (source_chat, source_msg_id, target_chat)
+        so re-running a scan over the same source→target pair refreshes the
+        row instead of duplicating it.
+        """
+        async with self._db.execute(
+            "INSERT OR REPLACE INTO deferred_dedup "
+            "(source_chat, source_msg_id, target_chat, thumb_phash, file_type, "
+            "file_size, caption, duration, grouped_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            (source_chat, source_msg_id, target_chat, thumb_phash, file_type,
+             file_size, caption, duration, grouped_id),
+        ) as cur:
+            row = await cur.fetchone()
+        await self._db.commit()
+        return row["id"]
+
+    async def list_deferred_dedup(
+        self, source_chat: str | None = None,
+        target_chat: str | None = None,
+    ) -> list[dict]:
+        """Return deferred rows, optionally scoped to a source and/or target
+        chat. No scoping → return everything (used by /process_deferred to
+        drain the full queue)."""
+        clauses = []
+        params: list = []
+        if source_chat:
+            clauses.append("source_chat = ?")
+            params.append(source_chat)
+        if target_chat:
+            clauses.append("target_chat = ?")
+            params.append(target_chat)
+        sql = "SELECT * FROM deferred_dedup"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id ASC"
+        async with self._db.execute(sql, tuple(params)) as cur:
+            return [dict(row) for row in await cur.fetchall()]
+
+    async def count_deferred_dedup(self) -> int:
+        async with self._db.execute(
+            "SELECT COUNT(*) AS n FROM deferred_dedup"
+        ) as cur:
+            row = await cur.fetchone()
+            return int(row["n"]) if row else 0
+
+    async def delete_deferred_dedup(self, row_id: int):
+        await self._db.execute(
+            "DELETE FROM deferred_dedup WHERE id = ?", (row_id,)
         )
         await self._db.commit()
 

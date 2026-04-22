@@ -621,3 +621,145 @@ class TestHandleDedupResponse:
 
         assert result.status == TaskStatus.DONE
         assert "t1" not in agent._pending_jobs
+
+
+class TestProcessDeferred:
+    """Phase 6: /process_deferred drains deferred_dedup, routing each row to
+    upload (no candidate), skip (strict metadata match), or pending_dedup
+    (thumb hit but metadata mismatch → Phase 5 user arbitration)."""
+
+    def _build_agent(self):
+        from agents.tg_transfer.__main__ import TGTransferAgent
+        agent = TGTransferAgent.__new__(TGTransferAgent)
+        agent.db = AsyncMock()
+        agent.db.create_job = AsyncMock(return_value="job-deferred")
+        agent.db.add_messages = AsyncMock()
+        agent.db.update_job_status = AsyncMock()
+        agent.db.mark_message = AsyncMock()
+        agent.media_db = AsyncMock()
+        agent.tg_client = AsyncMock()
+        agent.engine = AsyncMock()
+        agent.engine._cancelled = set()
+        agent._pending_jobs = {}
+        agent._bg_tasks = {}
+        agent._current_chat_id = {}
+        agent.ws_send_progress = AsyncMock()
+        agent.ws_send_result = AsyncMock()
+        return agent
+
+    @pytest.mark.asyncio
+    async def test_empty_queue_returns_done(self):
+        agent = self._build_agent()
+        agent.media_db.list_deferred_dedup = AsyncMock(return_value=[])
+
+        task = TaskRequest(task_id="td", content="/process_deferred")
+        result = await agent._handle_process_deferred(task)
+
+        assert result.status == TaskStatus.DONE
+        agent.db.create_job.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_candidate_uploads_with_skip_pre_dedup(self):
+        """No thumb match → fetch source msg + transfer_single. Must pass
+        skip_pre_dedup=True since we already did the lookup ourselves; without
+        it we'd re-run thumb dedup, hit no candidate, and waste cycles."""
+        agent = self._build_agent()
+        agent.media_db.list_deferred_dedup = AsyncMock(return_value=[
+            {"id": 1, "source_chat": "@src", "source_msg_id": 100,
+             "target_chat": "@tgt", "thumb_phash": "ph1",
+             "file_type": "photo", "file_size": 1234, "caption": "hi",
+             "duration": None, "grouped_id": None},
+        ])
+        agent.media_db.find_by_thumb_phash = AsyncMock(return_value=[])
+        agent.media_db.delete_deferred_dedup = AsyncMock()
+        agent.media_db.list_pending_dedup_by_job = AsyncMock(return_value=[])
+        agent.engine.transfer_single = AsyncMock(return_value={
+            "ok": True, "dedup": False, "similar": None,
+        })
+        agent.tg_client.get_messages = AsyncMock(return_value=MagicMock())
+
+        with patch("agents.tg_transfer.__main__.resolve_chat",
+                   new_callable=AsyncMock) as mock_resolve:
+            mock_resolve.return_value = MagicMock()
+            task = TaskRequest(task_id="td", content="/process_deferred",
+                               chat_id=99)
+            await agent._handle_process_deferred(task)
+            # Wait for the bg task to finish
+            await agent._bg_tasks["td"]
+
+        agent.engine.transfer_single.assert_awaited_once()
+        kwargs = agent.engine.transfer_single.await_args.kwargs
+        assert kwargs.get("skip_pre_dedup") is True
+        agent.media_db.delete_deferred_dedup.assert_awaited_once_with(1)
+
+    @pytest.mark.asyncio
+    async def test_strict_metadata_match_skips_and_upgrades(self):
+        """All metadata agree with a thumb candidate → upgrade trust to full
+        and mark skipped, no upload."""
+        agent = self._build_agent()
+        agent.media_db.list_deferred_dedup = AsyncMock(return_value=[
+            {"id": 7, "source_chat": "@src", "source_msg_id": 200,
+             "target_chat": "@tgt", "thumb_phash": "ph2",
+             "file_type": "photo", "file_size": 999, "caption": "match",
+             "duration": None, "grouped_id": None},
+        ])
+        agent.media_db.find_by_thumb_phash = AsyncMock(return_value=[
+            {"media_id": 50, "target_msg_id": 5000,
+             "caption": "match", "file_size": 999, "duration": None},
+        ])
+        agent.media_db.upgrade_thumb_to_full = AsyncMock()
+        agent.media_db.delete_deferred_dedup = AsyncMock()
+        agent.media_db.list_pending_dedup_by_job = AsyncMock(return_value=[])
+
+        with patch("agents.tg_transfer.__main__.resolve_chat",
+                   new_callable=AsyncMock) as mock_resolve:
+            mock_resolve.return_value = MagicMock()
+            task = TaskRequest(task_id="td", content="/process_deferred",
+                               chat_id=99)
+            await agent._handle_process_deferred(task)
+            await agent._bg_tasks["td"]
+
+        agent.engine.transfer_single.assert_not_called()
+        agent.media_db.upgrade_thumb_to_full.assert_awaited_once_with(
+            50, verified_by="metadata",
+        )
+
+    @pytest.mark.asyncio
+    async def test_metadata_mismatch_pushes_to_pending_dedup(self):
+        """Thumb collides but caption disagrees → can't auto-decide. Park in
+        pending_dedup so Phase 5 surfaces an ambiguous queue."""
+        agent = self._build_agent()
+        agent.media_db.list_deferred_dedup = AsyncMock(return_value=[
+            {"id": 9, "source_chat": "@src", "source_msg_id": 300,
+             "target_chat": "@tgt", "thumb_phash": "ph3",
+             "file_type": "video", "file_size": 5000, "caption": "v1",
+             "duration": 30, "grouped_id": None},
+        ])
+        agent.media_db.find_by_thumb_phash = AsyncMock(return_value=[
+            {"media_id": 70, "target_msg_id": 7000,
+             "caption": "v2", "file_size": 5000, "duration": 30},
+        ])
+        agent.media_db.insert_pending_dedup = AsyncMock(return_value=1)
+        agent.media_db.delete_deferred_dedup = AsyncMock()
+        agent.media_db.list_pending_dedup_by_job = AsyncMock(return_value=[
+            {"id": 1, "source_msg_id": 300,
+             "candidate_target_msg_ids": [7000]},
+        ])
+
+        with patch("agents.tg_transfer.__main__.resolve_chat",
+                   new_callable=AsyncMock) as mock_resolve, \
+             patch("agents.tg_transfer.__main__.format_ambiguous_summary",
+                   return_value="(summary)"):
+            mock_resolve.return_value = MagicMock()
+            task = TaskRequest(task_id="td", content="/process_deferred",
+                               chat_id=99)
+            await agent._handle_process_deferred(task)
+            await agent._bg_tasks["td"]
+
+        agent.media_db.insert_pending_dedup.assert_awaited_once()
+        # Job marked awaiting_dedup, not completed.
+        statuses = [c.args[1] for c in agent.db.update_job_status.await_args_list]
+        assert "awaiting_dedup" in statuses
+        # Final WS push asks for input.
+        last_result = agent.ws_send_result.await_args_list[-1].args[1]
+        assert last_result.status == TaskStatus.NEED_INPUT

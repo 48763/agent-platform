@@ -27,6 +27,12 @@ _THRESHOLD_RE = re.compile(
 # /index_target or /index_target @chat or "索引目標"
 _INDEX_TARGET_RE = re.compile(r"(^/index_target\b|索引目標|掃描目標)", re.IGNORECASE)
 _INDEX_TARGET_ARG_RE = re.compile(r"^/index_target\s+(\S+)", re.IGNORECASE)
+# /process_deferred — drain Phase 6 deferred_dedup queue
+_PROCESS_DEFERRED_RE = re.compile(
+    r"(^/process_deferred\b|處理延後|處理待比對)", re.IGNORECASE,
+)
+# --skip-dedup flag on a batch request. Matched anywhere in the message.
+_SKIP_DEDUP_RE = re.compile(r"(--skip-dedup|延後比對|延後 dedup)", re.IGNORECASE)
 # Matches "300MB", "1.5GB", "2gb", "500" (MB implied), etc.
 _THRESHOLD_VALUE_RE = re.compile(
     r"(\d+(?:\.\d+)?)\s*(gb|mb|kb)?", re.IGNORECASE,
@@ -63,10 +69,12 @@ def detect_forward(content: str, metadata: dict) -> Optional[ParsedLink]:
 def classify_intent(text: str) -> str:
     """Classify user message intent.
     Returns: 'single_transfer', 'config', 'threshold', 'search', 'stats',
-    'page', or 'batch'.
+    'page', 'index_target', 'process_deferred', or 'batch'.
     """
     if parse_tg_link(text) is not None:
         return "single_transfer"
+    if _PROCESS_DEFERRED_RE.search(text):
+        return "process_deferred"
     if _INDEX_TARGET_RE.search(text):
         return "index_target"
     if _CONFIG_RE.search(text):
@@ -80,6 +88,18 @@ def classify_intent(text: str) -> str:
     if _SEARCH_RE.search(text):
         return "search"
     return "batch"
+
+
+def has_skip_dedup_flag(text: str) -> bool:
+    """True when the user requested --skip-dedup on a batch request.
+
+    Phase 6: skip-dedup batches only record metadata to `deferred_dedup`;
+    the comparison (and any eventual upload) happens later via
+    /process_deferred. Trade-off is bandwidth: the scan downloads thumbs
+    only, so the expensive per-message comparison is deferred out of the
+    critical path.
+    """
+    return bool(_SKIP_DEDUP_RE.search(text))
 
 
 def parse_index_target_chat(text: str) -> Optional[str]:

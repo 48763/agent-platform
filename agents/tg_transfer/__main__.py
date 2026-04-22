@@ -12,7 +12,7 @@ from core.base_agent import BaseAgent
 from core.models import AgentResult, TaskRequest, TaskStatus
 from agents.tg_transfer.parser import (
     parse_tg_link, detect_forward, classify_intent, parse_threshold,
-    parse_index_target_chat, ai_classify_command,
+    parse_index_target_chat, ai_classify_command, has_skip_dedup_flag,
 )
 from agents.tg_transfer.chat_resolver import resolve_chat
 from agents.tg_transfer.db import TransferDB
@@ -25,7 +25,9 @@ from agents.tg_transfer.search import format_search_results, format_similar_resu
 from agents.tg_transfer.ambiguous import (
     format_ambiguous_summary, parse_ambiguous_reply,
 )
-from agents.tg_transfer.hasher import compute_phash, hamming_distance, PHASH_AVAILABLE
+from agents.tg_transfer.hasher import (
+    compute_phash, hamming_distance, PHASH_AVAILABLE, download_thumb_and_phash,
+)
 from agents.tg_transfer.liveness_checker import run_liveness_loop
 from agents.tg_transfer.dashboard import create_tg_dashboard_handler
 
@@ -273,6 +275,9 @@ class TGTransferAgent(BaseAgent):
 
         if intent == "index_target":
             return await self._handle_index_target(task, content)
+
+        if intent == "process_deferred":
+            return await self._handle_process_deferred(task)
 
         if intent == "page":
             return await self._handle_page(task)
@@ -576,8 +581,15 @@ class TGTransferAgent(BaseAgent):
         return AgentResult(status=TaskStatus.DONE, message="\n".join(lines))
 
     async def _handle_batch_request(self, task: TaskRequest) -> AgentResult:
-        """Parse batch command with AI, return estimate for confirmation."""
+        """Parse batch command with AI, return estimate for confirmation.
+
+        If the user appended `--skip-dedup` (or 中文 alias), we'll create the
+        job with mode='defer_scan' instead of 'batch'. The confirm path then
+        routes to a thumb-only scan that records metadata into deferred_dedup,
+        and `/process_deferred` does the actual upload/dedup later.
+        """
         content = task.content
+        defer_mode = has_skip_dedup_flag(content)
         parsed = await self._ai_parse_batch(content)
         if not parsed:
             return AgentResult(
@@ -602,21 +614,36 @@ class TGTransferAgent(BaseAgent):
         # Count messages
         count = await self._count_messages(source_entity, filter_type, filter_value)
 
-        # Check dedup
-        already_done = await self.db.get_transferred_message_ids(source, target)
+        # Defer-scan mode skips the historic-job dedup count — the whole
+        # point is to record everything and resolve later via /process_deferred.
+        already_done: set[int] = set()
+        if not defer_mode:
+            already_done = await self.db.get_transferred_message_ids(source, target)
         new_count = count - len(already_done) if already_done else count
 
         # Create job but don't start yet
         job_id = await self.db.create_job(
             source_chat=source,
             target_chat=target,
-            mode="batch",
+            mode="defer_scan" if defer_mode else "batch",
             filter_type=filter_type,
             filter_value=json.dumps(parsed.get("filter_value_raw")) if parsed.get("filter_value_raw") else None,
             task_id=task.task_id,
             chat_id=task.chat_id,
         )
         self._pending_jobs[task.task_id] = job_id
+
+        if defer_mode:
+            return AgentResult(
+                status=TaskStatus.NEED_INPUT,
+                message=(
+                    f"來源：{source}\n目標：{target}\n"
+                    f"符合條件的訊息：約 {count} 則\n"
+                    f"模式：--skip-dedup（只下縮圖記錄 metadata，不上傳）\n"
+                    f"事後請執行 /process_deferred 比對並上傳\n\n"
+                    f"確認執行？（是/否）"
+                ),
+            )
 
         dedup_note = f"（其中 {len(already_done)} 則已搬過，將跳過）" if already_done else ""
         return AgentResult(
@@ -633,8 +660,10 @@ class TGTransferAgent(BaseAgent):
         content = task.content.strip().lower()
 
         if job["status"] == "pending":
-            # Batch confirmation
+            # Batch / defer-scan confirmation
             if content in ("是", "yes", "y", "確認", "ok"):
+                if job.get("mode") == "defer_scan":
+                    return await self._start_defer_scan(task.task_id, job_id, job)
                 return await self._start_batch(task.task_id, job_id, job)
             else:
                 del self._pending_jobs[task.task_id]
@@ -792,6 +821,313 @@ class TGTransferAgent(BaseAgent):
             await self.ws_send_result(task_id, AgentResult(
                 status=TaskStatus.ERROR,
                 message=f"搬移失敗：{e}",
+            ))
+        finally:
+            if not keep_pending_binding:
+                self._pending_jobs.pop(task_id, None)
+            self._bg_tasks.pop(task_id, None)
+
+    async def _start_defer_scan(self, task_id: str, job_id: str, job: dict) -> AgentResult:
+        """Confirm + kick off `/batch --skip-dedup`. The job_messages table is
+        populated for progress accounting, but no upload happens — the bg
+        coroutine only downloads thumbs and writes deferred_dedup rows."""
+        source_entity = await resolve_chat(self.tg_client, job["source_chat"])
+        chat_id = self._current_chat_id.get(task_id, 0)
+
+        filter_type = job["filter_type"] or "all"
+        filter_value = json.loads(job["filter_value"]) if job["filter_value"] else None
+        messages = await self._collect_messages(source_entity, filter_type, filter_value)
+        msg_ids = [m.id for m in messages]
+        grouped_ids = {m.id: m.grouped_id for m in messages if m.grouped_id}
+        await self.db.add_messages(job_id, msg_ids, grouped_ids)
+
+        await self.ws_send_progress(
+            task_id, chat_id,
+            f"開始延後掃描 {len(msg_ids)} 則訊息（只記 metadata，不上傳）",
+        )
+
+        bg = asyncio.create_task(
+            self._run_defer_scan_background(task_id, job_id, job, messages, chat_id),
+        )
+        self._bg_tasks[task_id] = bg
+        return None
+
+    async def _run_defer_scan_background(
+        self, task_id: str, job_id: str, job: dict, messages: list, chat_id: int,
+    ):
+        """Walk the source messages, compute thumb_phash for photo/video,
+        record metadata into deferred_dedup. No comparison, no upload — those
+        happen later via /process_deferred.
+        """
+        await self.db.update_job_status(job_id, "running")
+        try:
+            recorded = 0
+            skipped = 0
+            for msg in messages:
+                if self.engine._cancelled and job_id in self.engine._cancelled:
+                    self.engine._cancelled.discard(job_id)
+                    await self.db.update_job_status(job_id, "cancelled")
+                    await self.ws_send_result(task_id, AgentResult(
+                        status=TaskStatus.DONE,
+                        message=f"延後掃描已取消（已記錄 {recorded} 則）",
+                    ))
+                    return
+
+                if self.engine.should_skip(msg):
+                    await self.db.mark_message(job_id, msg.id, "skipped")
+                    skipped += 1
+                    continue
+
+                ftype = self.engine._detect_file_type(msg) if msg.media else None
+                if not ftype and not msg.text:
+                    await self.db.mark_message(job_id, msg.id, "skipped")
+                    skipped += 1
+                    continue
+
+                # Photo/video → fetch thumb + phash. Documents/audio → skip
+                # phash; we still record metadata so process_deferred can do
+                # caption-based reasoning.
+                thumb_phash = None
+                if ftype in ("photo", "video"):
+                    try:
+                        thumb_phash = await download_thumb_and_phash(
+                            self.tg_client, msg,
+                        )
+                    except Exception as e:
+                        # A bad thumb shouldn't fail the whole row — just
+                        # record without phash and let process_deferred fall
+                        # back to full-file path.
+                        logger.warning(f"defer scan thumb failed for {msg.id}: {e}")
+
+                file_obj = getattr(msg, "file", None)
+                file_size = getattr(file_obj, "size", None) if file_obj else None
+                duration = getattr(file_obj, "duration", None) if file_obj else None
+                caption = getattr(msg, "message", None) or getattr(msg, "text", None)
+
+                await self.media_db.insert_deferred_dedup(
+                    source_chat=job["source_chat"],
+                    source_msg_id=int(msg.id),
+                    target_chat=job["target_chat"],
+                    thumb_phash=thumb_phash,
+                    file_type=ftype,
+                    file_size=file_size,
+                    caption=caption,
+                    duration=duration,
+                    grouped_id=int(msg.grouped_id) if msg.grouped_id else None,
+                )
+                await self.db.mark_message(job_id, msg.id, "success")
+                recorded += 1
+
+                if recorded % self.engine.progress_interval == 0:
+                    await self.ws_send_progress(
+                        task_id, chat_id,
+                        f"延後掃描進度：{recorded}/{len(messages)}",
+                    )
+
+            await self.db.update_job_status(job_id, "completed")
+            await self.ws_send_result(task_id, AgentResult(
+                status=TaskStatus.DONE,
+                message=(
+                    f"延後掃描完成\n"
+                    f"來源：{job['source_chat']}\n"
+                    f"目標：{job['target_chat']}\n"
+                    f"已記錄：{recorded} 則｜跳過：{skipped} 則\n\n"
+                    f"請執行 /process_deferred 進行比對與上傳"
+                ),
+            ))
+        except Exception as e:
+            logger.error(f"Defer scan error: {e}", exc_info=True)
+            await self.db.update_job_status(job_id, "failed")
+            await self.ws_send_result(task_id, AgentResult(
+                status=TaskStatus.ERROR,
+                message=f"延後掃描失敗：{e}",
+            ))
+        finally:
+            self._pending_jobs.pop(task_id, None)
+            self._bg_tasks.pop(task_id, None)
+
+    async def _handle_process_deferred(self, task: TaskRequest):
+        """Drain deferred_dedup: per row, do the Phase-4 thumb lookup against
+        target index. No candidates → upload (skip_pre_dedup so we don't re-
+        thumb-dedup against ourselves). All-metadata match → mark dedup +
+        upgrade. Mismatch → push into pending_dedup so Phase 5 can surface
+        the ambiguous queue at end.
+        """
+        rows = await self.media_db.list_deferred_dedup()
+        if not rows:
+            return AgentResult(
+                status=TaskStatus.DONE,
+                message="沒有延後比對的項目",
+            )
+
+        # Group rows by (source_chat, target_chat) so each pair runs as one
+        # job — that lets Phase 5's ambiguous queue stay scoped per job_id.
+        task_id = task.task_id
+        chat_id = task.chat_id
+        self._current_chat_id[task_id] = chat_id
+
+        # For v1 we collapse all rows into one job using the first row's
+        # source/target. If you have multiple source→target pairs queued, run
+        # /process_deferred once per pair (the queue will only drain matching
+        # rows on each run because we filter by source_chat/target_chat below).
+        first = rows[0]
+        source_chat = first["source_chat"]
+        target_chat = first["target_chat"]
+        scoped = [
+            r for r in rows
+            if r["source_chat"] == source_chat and r["target_chat"] == target_chat
+        ]
+
+        job_id = await self.db.create_job(
+            source_chat=source_chat,
+            target_chat=target_chat,
+            mode="process_deferred",
+            task_id=task_id,
+            chat_id=chat_id,
+        )
+        await self.db.add_messages(
+            job_id, [int(r["source_msg_id"]) for r in scoped],
+        )
+        self._pending_jobs[task_id] = job_id
+
+        await self.ws_send_progress(
+            task_id, chat_id,
+            f"開始處理延後佇列：{len(scoped)} 則（{source_chat} → {target_chat}）",
+        )
+
+        bg = asyncio.create_task(
+            self._run_process_deferred_background(
+                task_id, job_id, source_chat, target_chat, scoped, chat_id,
+            ),
+        )
+        self._bg_tasks[task_id] = bg
+        return None
+
+    async def _run_process_deferred_background(
+        self, task_id: str, job_id: str, source_chat: str, target_chat: str,
+        rows: list[dict], chat_id: int,
+    ):
+        """Background driver for /process_deferred. Mirrors _run_batch_background
+        in shape: report progress via WS, surface Phase 5 summary on finish."""
+        await self.db.update_job_status(job_id, "running")
+        keep_pending_binding = False
+        try:
+            source_entity = await resolve_chat(self.tg_client, source_chat)
+            target_entity = await resolve_chat(self.tg_client, target_chat)
+            uploaded = skipped = ambiguous = failed = 0
+
+            for row in rows:
+                src_msg_id = int(row["source_msg_id"])
+                thumb_phash = row.get("thumb_phash")
+
+                try:
+                    if thumb_phash:
+                        candidates = await self.media_db.find_by_thumb_phash(
+                            thumb_phash, target_chat,
+                        )
+                    else:
+                        candidates = []
+
+                    matched_cand = None
+                    for cand in candidates:
+                        if (cand.get("caption") == row.get("caption")
+                                and cand.get("file_size") == row.get("file_size")
+                                and cand.get("duration") == row.get("duration")):
+                            matched_cand = cand
+                            break
+
+                    if matched_cand:
+                        # Strict match → confirm dedup, upgrade thumb_only row,
+                        # don't upload.
+                        await self.media_db.upgrade_thumb_to_full(
+                            matched_cand["media_id"], verified_by="metadata",
+                        )
+                        await self.db.mark_message(job_id, src_msg_id, "skipped")
+                        skipped += 1
+                    elif candidates:
+                        # Thumb hit but metadata disagreed → park for Phase 5.
+                        await self.media_db.insert_pending_dedup(
+                            job_id=job_id, source_chat=source_chat,
+                            source_msg_id=src_msg_id,
+                            candidate_target_msg_ids=[
+                                c["target_msg_id"] for c in candidates
+                                if c.get("target_msg_id")
+                            ],
+                            reason="thumb_match_metadata_mismatch",
+                        )
+                        await self.db.mark_message(job_id, src_msg_id, "ambiguous")
+                        ambiguous += 1
+                    else:
+                        # No candidate → upload. skip_pre_dedup so we don't
+                        # re-do the thumb lookup we just performed manually.
+                        msg = await self.tg_client.get_messages(
+                            source_entity, ids=src_msg_id,
+                        )
+                        if msg is None:
+                            await self.db.mark_message(
+                                job_id, src_msg_id, "failed",
+                                error="message deleted",
+                            )
+                            failed += 1
+                        else:
+                            result = await self.engine.transfer_single(
+                                source_entity, target_entity, msg,
+                                target_chat=target_chat,
+                                source_chat=source_chat,
+                                job_id=job_id,
+                                skip_pre_dedup=True,
+                            )
+                            if result.get("ok"):
+                                await self.db.mark_message(
+                                    job_id, src_msg_id, "success",
+                                )
+                                uploaded += 1
+                            elif result.get("dedup"):
+                                await self.db.mark_message(
+                                    job_id, src_msg_id, "skipped",
+                                )
+                                skipped += 1
+                            else:
+                                await self.db.mark_message(
+                                    job_id, src_msg_id, "failed",
+                                )
+                                failed += 1
+                finally:
+                    # Drop the deferred row regardless of outcome — failed
+                    # uploads stay tracked via job_messages, not here.
+                    await self.media_db.delete_deferred_dedup(int(row["id"]))
+
+            pending = await self.media_db.list_pending_dedup_by_job(job_id)
+            if pending:
+                await self.db.update_job_status(job_id, "awaiting_dedup")
+                summary = format_ambiguous_summary(pending)
+                await self.ws_send_result(task_id, AgentResult(
+                    status=TaskStatus.NEED_INPUT,
+                    message=(
+                        f"延後比對完成（待確認 {len(pending)} 則歧異）\n"
+                        f"上傳：{uploaded}｜跳過：{skipped}｜"
+                        f"歧異：{ambiguous}｜失敗：{failed}\n\n"
+                        + summary
+                    ),
+                ))
+                keep_pending_binding = True
+            else:
+                await self.db.update_job_status(job_id, "completed")
+                await self.ws_send_result(task_id, AgentResult(
+                    status=TaskStatus.DONE,
+                    message=(
+                        f"延後比對完成\n"
+                        f"來源：{source_chat}\n"
+                        f"目標：{target_chat}\n"
+                        f"上傳：{uploaded}｜跳過：{skipped}｜失敗：{failed}"
+                    ),
+                ))
+        except Exception as e:
+            logger.error(f"process_deferred error: {e}", exc_info=True)
+            await self.db.update_job_status(job_id, "failed")
+            await self.ws_send_result(task_id, AgentResult(
+                status=TaskStatus.ERROR,
+                message=f"延後比對失敗：{e}",
             ))
         finally:
             if not keep_pending_binding:

@@ -5,6 +5,7 @@ from agents.tg_transfer.parser import (
     classify_intent,
     parse_threshold,
     ai_classify_command,
+    has_skip_dedup_flag,
     ParsedLink,
 )
 
@@ -93,6 +94,35 @@ class TestClassifyIntent:
 
     def test_index_target_chinese_phrase(self):
         assert classify_intent("索引目標") == "index_target"
+
+    def test_process_deferred_slash_command(self):
+        assert classify_intent("/process_deferred") == "process_deferred"
+
+    def test_process_deferred_chinese_phrase(self):
+        assert classify_intent("處理延後的項目") == "process_deferred"
+
+
+class TestHasSkipDedupFlag:
+    """`--skip-dedup` switches batch into Phase 6 defer-scan mode (record
+    metadata only, upload later via /process_deferred)."""
+
+    def test_english_flag(self):
+        assert has_skip_dedup_flag(
+            "把 @src 搬到 @tgt --skip-dedup"
+        ) is True
+
+    def test_chinese_phrase(self):
+        assert has_skip_dedup_flag(
+            "把 @src 搬到 @tgt 延後比對"
+        ) is True
+
+    def test_chinese_phrase_dedup(self):
+        assert has_skip_dedup_flag(
+            "搬移 @a 到 @b 延後 dedup"
+        ) is True
+
+    def test_no_flag(self):
+        assert has_skip_dedup_flag("把 @src 搬到 @tgt") is False
 
 
 class TestParseIndexTargetChat:
