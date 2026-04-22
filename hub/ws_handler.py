@@ -157,6 +157,15 @@ async def _forward_progress_to_gateway(app: web.Application, data: dict):
     if not task:
         return
 
+    # If a progress event arrives for a task that's already 'done', the agent
+    # is actively working on it again — e.g. agent restart re-attached to a
+    # running job after hub startup-cleanup flipped the task to done, or the
+    # user continued via Telegram reply. Flip it back to 'working' so the
+    # dashboard stats ("處理中") match the history pane's live progress text.
+    # `closed` / `archived` are user-intent terminal states — leave them.
+    if task["status"] == "done":
+        task_manager.update_status(task_id, "working")
+
     # Record progress in conversation history so dashboard shows it
     message = data.get("message", "")
     if message:
