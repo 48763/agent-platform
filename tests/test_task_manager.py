@@ -101,3 +101,30 @@ def test_append_assistant_response(tmp_path):
     updated = tm.get_task(task["task_id"])
     assert len(updated["conversation_history"]) == 2
     assert updated["conversation_history"][1] == {"role": "assistant", "content": "嗨！"}
+
+
+def test_cleanup_orphan_working_tasks(tmp_path):
+    tm = make_tm(tmp_path)
+    working = tm.create_task(agent_name="tg", chat_id=1, content="搬移")
+    waiting_in = tm.create_task(agent_name="tg", chat_id=2, content="等輸入")
+    tm.update_status(waiting_in["task_id"], "waiting_input")
+    waiting_ap = tm.create_task(agent_name="tg", chat_id=3, content="等核准")
+    tm.update_status(waiting_ap["task_id"], "waiting_approval")
+    done = tm.create_task(agent_name="tg", chat_id=4, content="完成")
+    tm.complete_task(done["task_id"])
+
+    affected = tm.cleanup_orphan_working_tasks("系統重啟")
+
+    # Only the `working` task should be affected.
+    assert len(affected) == 1
+    assert affected[0]["task_id"] == working["task_id"]
+
+    # `working` is now `done` with error message appended.
+    updated = tm.get_task(working["task_id"])
+    assert updated["status"] == "done"
+    assert updated["conversation_history"][-1] == {"role": "assistant", "content": "系統重啟"}
+
+    # `waiting_input` / `waiting_approval` / `done` are untouched.
+    assert tm.get_task(waiting_in["task_id"])["status"] == "waiting_input"
+    assert tm.get_task(waiting_ap["task_id"])["status"] == "waiting_approval"
+    assert tm.get_task(done["task_id"])["status"] == "done"

@@ -154,6 +154,29 @@ class TaskManager:
     def reopen_task(self, task_id: str):
         self.update_status(task_id, "done")
 
+    def cleanup_orphan_working_tasks(self, error_message: str) -> list[dict]:
+        """Mark all `working` tasks as `done` with an error message in history.
+
+        Used on hub startup: `working` tasks from a previous hub lifecycle are
+        orphans — the agent either died with the hub, or a fresh agent has no
+        memory of them. Leaving them as `working` causes the dashboard to show
+        ghost "processing" tasks forever.
+
+        `waiting_input` / `waiting_approval` are intentionally left alone because
+        they are safely resumable on the next user reply (full conversation
+        history is in DB).
+
+        Returns list of affected task dicts (for caller to notify gateway).
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM tasks WHERE status = 'working'"
+        ).fetchall()
+        affected = [self._row_to_dict(r) for r in rows]
+        for task in affected:
+            self.append_assistant_response(task["task_id"], error_message)
+            self.complete_task(task["task_id"])
+        return affected
+
     def run_lifecycle(self):
         """Run task lifecycle transitions based on time."""
         now = time.time()

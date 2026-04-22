@@ -1,4 +1,5 @@
 # hub/server.py
+import logging
 import os
 from aiohttp import web
 from core.models import AgentInfo, TaskRequest
@@ -31,7 +32,11 @@ from hub.auth import (
 )
 from hub.ws_handler import handle_agent_ws, handle_gateway_ws
 
+logger = logging.getLogger(__name__)
+
 DB_PATH = os.environ.get("TASKS_DB_PATH", "/data/tasks.db")
+
+STARTUP_ORPHAN_CLEANUP_MESSAGE = "系統重啟，任務已中斷，請重新開始"
 
 
 def create_hub_app(
@@ -92,7 +97,25 @@ def create_hub_app(
     app.router.add_get("/ws/agent/{name}", handle_agent_ws)
     app.router.add_get("/ws/gateway", handle_gateway_ws)
 
+    app.on_startup.append(_cleanup_orphan_tasks_on_startup)
+
     return app
+
+
+async def _cleanup_orphan_tasks_on_startup(app: web.Application):
+    """Clear any `working` tasks left over from a previous hub lifecycle.
+
+    Without this, a hub restart while an agent was processing leaves the task
+    stuck at `working` forever — the dashboard shows a ghost "processing" task
+    that no agent will ever finish. The WS disconnect cleanup in ws_handler.py
+    only fires for connections that existed in the *current* hub process.
+    """
+    task_manager = app["task_manager"]
+    affected = task_manager.cleanup_orphan_working_tasks(STARTUP_ORPHAN_CLEANUP_MESSAGE)
+    if affected:
+        logger.warning(
+            "Startup cleanup: marked %d orphan 'working' task(s) as done", len(affected),
+        )
 
 
 async def handle_register(request: web.Request) -> web.Response:
