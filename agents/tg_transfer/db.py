@@ -129,10 +129,17 @@ class TransferDB:
             return [dict(row) for row in await cur.fetchall()]
 
     async def get_resumable_jobs(self) -> list[dict]:
-        """Jobs that should be re-attached on agent startup: running (mid-transfer)
-        and paused (awaiting user decision). Pending/completed are excluded."""
+        """Jobs that should be re-attached on agent startup:
+        - running: mid-transfer, re-spawn the batch
+        - paused: awaiting user retry/skip decision
+        - awaiting_dedup: Phase 5 queue shown, user hasn't replied yet — we
+          need the in-memory _pending_jobs binding restored so the eventual
+          reply routes back to _handle_dedup_response.
+
+        Pending/completed/failed/cancelled are excluded."""
         async with self._db.execute(
-            "SELECT * FROM jobs WHERE status IN ('running', 'paused')"
+            "SELECT * FROM jobs WHERE status IN "
+            "('running', 'paused', 'awaiting_dedup')"
         ) as cur:
             return [dict(row) for row in await cur.fetchall()]
 

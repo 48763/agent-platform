@@ -206,6 +206,13 @@ class TGTransferAgent(BaseAgent):
                         task_id, chat_id,
                         f"服務重啟，關於任務 {job['job_id']}，請回覆：重試 / 跳過 / 一律跳過",
                     )
+            elif job["status"] == "awaiting_dedup":
+                # Phase 5: queue already shown to user. Just restore the
+                # in-memory binding so the eventual reply routes back to
+                # _handle_dedup_response. Re-sending the summary on every
+                # reconnect would spam the user with duplicate lists.
+                self._pending_jobs[task_id] = job["job_id"]
+                self._current_chat_id[task_id] = chat_id
 
     async def handle_task(self, task: TaskRequest) -> AgentResult:
         if self._init_error:
