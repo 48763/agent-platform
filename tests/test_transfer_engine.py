@@ -69,7 +69,13 @@ def engine_with_media_db(mock_client, db, media_db, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_transfer_single_message(engine, mock_client, db):
+async def test_transfer_single_text_only_is_skipped(engine, mock_client, db):
+    """Policy: pure text messages are never transferred — this tool is for
+    media migration. Calling transfer_single on a text-only message returns
+    a skip result (ok=False, no media effects) and does NOT hit send_message.
+
+    Previously we forwarded bare text, which made chatty source chats replay
+    their entire conversation into the target; users asked for it to stop."""
     source_entity = MagicMock()
     target_entity = MagicMock()
     msg = _make_message(100, text="hello", media=False)
@@ -81,8 +87,25 @@ async def test_transfer_single_message(engine, mock_client, db):
     await db.update_job_status(job_id, "running")
 
     result = await engine.transfer_single(source_entity, target_entity, msg)
-    assert result["ok"] is True
-    mock_client.send_message.assert_called_once()
+    assert result["ok"] is False
+    assert result["dedup"] is False
+    mock_client.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_should_skip_text_only(engine):
+    """Text-only messages (no media attached) must be marked skip so
+    run_batch records them as 'skipped' instead of forwarding."""
+    msg = _make_message(150, text="just typing", media=False)
+    assert engine.should_skip(msg) is True
+
+
+@pytest.mark.asyncio
+async def test_should_not_skip_photo_with_caption(engine):
+    """Caption text on a media message is NOT text-only — the media still
+    travels (with caption preserved by _transfer_media)."""
+    msg = _make_message(151, text="nice photo", media=True)
+    assert engine.should_skip(msg) is False
 
 
 @pytest.mark.asyncio

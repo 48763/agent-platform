@@ -212,12 +212,24 @@ class TransferEngine:
         return dest
 
     def should_skip(self, message) -> bool:
-        """Check if message type should be skipped (sticker, poll, voice)."""
+        """Check if message type should be skipped (sticker, poll, voice,
+        text-only).
+
+        Text-only is skipped by policy: this tool exists to migrate media,
+        and historically we also forwarded bare text — but that produced a
+        lot of noise (chatty chats would replay entire conversations in the
+        target). Skipping them keeps the target clean; users who want text
+        mirroring can copy/paste manually.
+        """
         if message.sticker:
             return True
         if message.poll:
             return True
         if message.voice:
+            return True
+        # Pure text (no media attached) — covers both text messages the user
+        # typed and messages that only carry a caption-less string.
+        if not message.media and getattr(message, "text", None):
             return True
         return False
 
@@ -237,10 +249,11 @@ class TransferEngine:
                 source_chat=source_chat, job_id=job_id,
                 skip_pre_dedup=skip_pre_dedup,
             )
-        elif message.text and not message.media:
-            await self.client.send_message(target_entity, message.text)
-            return {"ok": True, "dedup": False, "similar": None}
-        elif self.should_skip(message):
+        # Text-only / sticker / poll / voice all fall here: should_skip is the
+        # single source of truth. run_batch marks these 'skipped' before even
+        # calling us, so hitting this branch usually means a direct caller
+        # (e.g. resume path) fed us a skip-eligible message — treat as skip.
+        if self.should_skip(message):
             return {"ok": False, "dedup": False, "similar": None}
         return {"ok": True, "dedup": False, "similar": None}
 

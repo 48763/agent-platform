@@ -40,11 +40,14 @@ def mock_tg_client():
 
 
 @pytest.mark.asyncio
-async def test_single_transfer_via_link(db, mock_tg_client):
-    """User pastes a TG link -> agent downloads and re-uploads."""
+async def test_single_transfer_text_only_is_skipped(db, mock_tg_client):
+    """Text-only source message (no media) is now skipped by policy — the
+    transfer tool is media-only. Previously this test verified that we
+    forwarded the text via send_message; that behaviour was removed after
+    users reported chatty source chats flooding the target with text."""
     from agents.tg_transfer.transfer_engine import TransferEngine
 
-    msg = mock_tg_client._make_msg(123, text="photo caption")
+    msg = mock_tg_client._make_msg(123, text="just text, no media")
     mock_tg_client.get_messages = AsyncMock(return_value=msg)
     mock_tg_client.get_entity = AsyncMock(return_value=MagicMock())
     mock_tg_client.send_message = AsyncMock()
@@ -54,8 +57,8 @@ async def test_single_transfer_via_link(db, mock_tg_client):
     source = MagicMock()
 
     result = await engine.transfer_single(source, target, msg)
-    assert result["ok"] is True
-    mock_tg_client.send_message.assert_called_once_with(target, "photo caption")
+    assert result["ok"] is False
+    mock_tg_client.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio
