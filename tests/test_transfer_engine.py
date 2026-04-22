@@ -1660,24 +1660,21 @@ class TestPreDedupByThumb:
 
 
 class TestPremiumChunkTuning:
-    """Premium accounts get larger chunks for faster up/download. The flag is
-    read from the client on each call so it works even if detection moves or
-    gets re-probed later — getattr with a False default keeps non-premium and
-    missing-attribute cases identical."""
+    """Premium accounts get larger download chunks for ~2x throughput. The
+    flag is read from the client on each call via getattr(..., False) so a
+    missing attribute falls back to non-premium — important because some
+    test paths construct a TransferEngine with a bare MagicMock client."""
 
     def test_non_premium_defaults(self, engine, mock_client):
         # client has no premium_account attr at all → treated as non-premium.
         if hasattr(mock_client, "premium_account"):
             del mock_client.premium_account
         assert engine._download_request_size() == 512 * 1024
-        assert engine._upload_part_kb() == 256
 
     def test_premium_uses_max_chunks(self, engine, mock_client):
         mock_client.premium_account = True
         assert engine._download_request_size() == 1024 * 1024
-        assert engine._upload_part_kb() == 512
 
     def test_explicit_false_matches_non_premium(self, engine, mock_client):
         mock_client.premium_account = False
         assert engine._download_request_size() == 512 * 1024
-        assert engine._upload_part_kb() == 256

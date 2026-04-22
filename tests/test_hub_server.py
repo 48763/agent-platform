@@ -61,18 +61,49 @@ async def test_progress_reopens_done_task(tmp_db):
 
 
 @pytest.mark.asyncio
-async def test_progress_leaves_closed_task_alone(tmp_db):
-    """Closed is a user-intent terminal state — a stray agent progress must
-    not resurrect it. The history append still happens so the stray event is
-    visible for debugging, but status is preserved."""
+async def test_progress_on_closed_task_cancels_agent_and_drops_message(tmp_db):
+    """Closed is a user-intent terminal state. If an agent still sends progress
+    (usually because it restarted while the user had closed the task out of
+    band, so the earlier CANCEL never landed), hub must:
+      - keep status 'closed'
+      - NOT append the progress to history (no ghost '繼續搬移' lines)
+      - NOT fan out to gateway (no ghost Telegram message)
+      - send CANCEL back to the agent so it stops the underlying job
+    Otherwise the user sees '繼續任務' appear on a task they already closed
+    and can't tell whether work is actually still happening."""
     tm = TaskManager(db_path=tmp_db)
     task = tm.create_task(agent_name="tg", chat_id=100, content="搬移")
     tm.close_task(task["task_id"])
 
-    app = {"task_manager": tm, "gateway_connections": []}
+    sent = []
+    class _FakeWS:
+        async def send_str(self, s):
+            sent.append(s)
+    class _FakeRegistry:
+        def get_ws(self, name):
+            assert name == "tg"
+            return _FakeWS()
+
+    app = {
+        "task_manager": tm,
+        "gateway_connections": [],
+        "registry": _FakeRegistry(),
+    }
     await _forward_progress_to_gateway(app, {
         "task_id": task["task_id"],
-        "message": "should not reopen",
+        "message": "繼續搬移任務 job-abc",
     })
 
-    assert tm.get_task(task["task_id"])["status"] == "closed"
+    refreshed = tm.get_task(task["task_id"])
+    assert refreshed["status"] == "closed"
+    # No history append — the ghost line must not show on the dashboard.
+    assert all(
+        "繼續搬移任務" not in m.get("content", "")
+        for m in refreshed["conversation_history"]
+    )
+    # Exactly one CANCEL sent to the agent.
+    assert len(sent) == 1
+    import json as _json
+    parsed = _json.loads(sent[0])
+    assert parsed["type"] == "cancel"
+    assert parsed["task_id"] == task["task_id"]

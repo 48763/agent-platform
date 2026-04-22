@@ -157,12 +157,30 @@ async def _forward_progress_to_gateway(app: web.Application, data: dict):
     if not task:
         return
 
+    # Closed/archived are user-intent terminal states. If an agent still sends
+    # progress (typically after it restarted while the user had closed the task
+    # out-of-band — so the earlier CANCEL never reached it), tell the agent to
+    # cancel the underlying job and drop the message: no history append, no
+    # gateway fan-out. Otherwise the user sees ghost "繼續搬移" lines on a task
+    # they deliberately closed and can't tell whether it'll really keep running.
+    if task["status"] in ("closed", "archived"):
+        registry = app.get("registry")
+        if registry is not None:
+            agent_ws = registry.get_ws(task["agent_name"])
+            if agent_ws is not None:
+                try:
+                    await agent_ws.send_str(ws_msg(MsgType.CANCEL, task_id=task_id))
+                except Exception:
+                    logger.exception(
+                        "Failed to send CANCEL to agent for closed task %s", task_id
+                    )
+        return
+
     # If a progress event arrives for a task that's already 'done', the agent
     # is actively working on it again — e.g. agent restart re-attached to a
     # running job after hub startup-cleanup flipped the task to done, or the
     # user continued via Telegram reply. Flip it back to 'working' so the
     # dashboard stats ("處理中") match the history pane's live progress text.
-    # `closed` / `archived` are user-intent terminal states — leave them.
     if task["status"] == "done":
         task_manager.update_status(task_id, "working")
 
