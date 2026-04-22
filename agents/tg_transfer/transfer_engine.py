@@ -708,10 +708,26 @@ class TransferEngine:
 
     @staticmethod
     def _detect_file_type(message) -> str:
+        """Classify media kind, including documents whose MIME is video/* or
+        that carry a DocumentAttributeVideo. Telegram users often "send as
+        file" to avoid re-encoding — those arrive with message.video=None and
+        only message.document set. Missing that case was the root cause of
+        grey previews / 0:00 duration / wrong aspect ratio for transferred
+        videos: without the video classification the upload path never probed
+        ffmpeg metadata nor attached DocumentAttributeVideo, so TG rendered
+        the file as a generic document tile."""
         if message.photo:
             return "photo"
         if message.video:
             return "video"
+        doc = getattr(message, "document", None)
+        if doc is not None:
+            mime = getattr(doc, "mime_type", "") or ""
+            if mime.startswith("video/"):
+                return "video"
+            for a in getattr(doc, "attributes", None) or []:
+                if isinstance(a, DocumentAttributeVideo):
+                    return "video"
         return "document"
 
     async def run_batch(

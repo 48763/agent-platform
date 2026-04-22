@@ -1678,3 +1678,62 @@ class TestPremiumChunkTuning:
     def test_explicit_false_matches_non_premium(self, engine, mock_client):
         mock_client.premium_account = False
         assert engine._download_request_size() == 512 * 1024
+
+
+class TestDetectFileType:
+    """Regression guard: 'send as file' videos arrive with message.video=None
+    and only message.document set (no re-encoding). Without classifying those
+    as video, the upload path skipped ffprobe + DocumentAttributeVideo — TG
+    then rendered the upload as a grey file tile with 0:00 duration and no
+    aspect ratio. Detection must look past message.video into the document's
+    MIME type and attributes."""
+
+    def _build_doc_msg(self, mime_type=None, attrs=None):
+        msg = MagicMock()
+        msg.photo = None
+        msg.video = None
+        doc = MagicMock()
+        doc.mime_type = mime_type
+        doc.attributes = attrs or []
+        msg.document = doc
+        return msg
+
+    def test_native_photo(self):
+        from agents.tg_transfer.transfer_engine import TransferEngine
+        msg = MagicMock()
+        msg.photo = MagicMock()
+        assert TransferEngine._detect_file_type(msg) == "photo"
+
+    def test_native_video(self):
+        from agents.tg_transfer.transfer_engine import TransferEngine
+        msg = MagicMock()
+        msg.photo = None
+        msg.video = MagicMock()
+        assert TransferEngine._detect_file_type(msg) == "video"
+
+    def test_video_sent_as_file_by_mime(self):
+        """The original bug — mp4 uploaded via 'send as file'."""
+        from agents.tg_transfer.transfer_engine import TransferEngine
+        msg = self._build_doc_msg(mime_type="video/mp4")
+        assert TransferEngine._detect_file_type(msg) == "video"
+
+    def test_video_sent_as_file_by_attribute(self):
+        """Some clients set DocumentAttributeVideo even without video/* MIME."""
+        from agents.tg_transfer.transfer_engine import TransferEngine
+        from telethon.tl.types import DocumentAttributeVideo
+        attrs = [DocumentAttributeVideo(duration=30, w=1920, h=1080)]
+        msg = self._build_doc_msg(mime_type="application/octet-stream", attrs=attrs)
+        assert TransferEngine._detect_file_type(msg) == "video"
+
+    def test_plain_document_stays_document(self):
+        from agents.tg_transfer.transfer_engine import TransferEngine
+        msg = self._build_doc_msg(mime_type="application/pdf")
+        assert TransferEngine._detect_file_type(msg) == "document"
+
+    def test_no_document_stays_document(self):
+        from agents.tg_transfer.transfer_engine import TransferEngine
+        msg = MagicMock()
+        msg.photo = None
+        msg.video = None
+        msg.document = None
+        assert TransferEngine._detect_file_type(msg) == "document"
