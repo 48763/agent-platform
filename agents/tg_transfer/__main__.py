@@ -40,6 +40,7 @@ class TGTransferAgent(BaseAgent):
         self.tg_client = None
         self.engine: TransferEngine = None
         self._pending_jobs: dict[str, str] = {}  # task_id → job_id
+        self._bg_tasks: dict[str, asyncio.Task] = {}  # task_id → batch bg task
         self._search_state: dict[str, dict] = {}  # task_id → {keyword, page}
         self._current_chat_id: dict[str, int] = {}  # task_id → chat_id
         self._awaiting_target: dict[str, dict] = {}  # task_id → {chat, message_id}
@@ -91,16 +92,36 @@ class TGTransferAgent(BaseAgent):
         # because WS must be up before we can send progress/result.
 
     async def on_ws_connected(self):
-        """Resume interrupted jobs once WS is up (first connect only)."""
-        if getattr(self, '_resumed', False):
-            return
-        self._resumed = True
-        await self._resume_interrupted_jobs()
+        """Resume interrupted jobs on every WS connect.
 
-    async def _resume_interrupted_jobs(self):
-        """On startup re-attach running/paused jobs to their original TG task.
-        Running jobs get respawned in background; paused jobs get a reminder
-        message so user can reply retry/skip/skip-all."""
+        Runs every time (not just first connect) so hub restarts or WS flaps
+        that silently killed a `_run_batch_background` coroutine can recover.
+        Re-spawn is guarded by a liveness check on the tracked asyncio.Task so
+        healthy jobs aren't double-spawned. Paused-job user reminders only fire
+        on the first connect to avoid spamming on every reconnect.
+        """
+        first_connect = not getattr(self, '_resumed', False)
+        self._resumed = True
+        await self._resume_interrupted_jobs(first_connect=first_connect)
+
+    def _spawn_batch_bg(self, task_id: str, job_id: str, job: dict,
+                         source_entity, target_entity, chat_id: int) -> asyncio.Task:
+        """Start a batch background coroutine and record it for liveness checks."""
+        bg = asyncio.create_task(
+            self._run_batch_background(
+                task_id, job_id, job, source_entity, target_entity, chat_id
+            )
+        )
+        self._bg_tasks[task_id] = bg
+        return bg
+
+    async def _resume_interrupted_jobs(self, first_connect: bool = True):
+        """Re-attach running/paused jobs to their original TG task.
+
+        - Running jobs: re-spawn if no live background task is tracking them.
+        - Paused jobs: always keep the in-memory binding (so retry/skip replies
+          route correctly); only send the reminder message on the first connect.
+        """
         jobs = await self.db.get_resumable_jobs()
         for job in jobs:
             task_id = job.get("task_id")
@@ -111,29 +132,33 @@ class TGTransferAgent(BaseAgent):
                 )
                 continue
 
-            self._pending_jobs[task_id] = job["job_id"]
-            self._current_chat_id[task_id] = chat_id
-
             if job["status"] == "running":
+                bg = self._bg_tasks.get(task_id)
+                if bg is not None and not bg.done():
+                    # Still actively running in this process — nothing to do.
+                    continue
                 try:
                     source_entity = await resolve_chat(self.tg_client, job["source_chat"])
                     target_entity = await resolve_chat(self.tg_client, job["target_chat"])
                 except Exception as e:
                     logger.error(f"Resume {job['job_id']} resolve failed: {e}")
                     continue
+                self._pending_jobs[task_id] = job["job_id"]
+                self._current_chat_id[task_id] = chat_id
                 await self.ws_send_progress(
                     task_id, chat_id, f"繼續搬移任務 {job['job_id']}"
                 )
-                asyncio.create_task(
-                    self._run_batch_background(
-                        task_id, job["job_id"], job, source_entity, target_entity, chat_id
-                    )
+                self._spawn_batch_bg(
+                    task_id, job["job_id"], job, source_entity, target_entity, chat_id
                 )
             elif job["status"] == "paused":
-                await self.ws_send_progress(
-                    task_id, chat_id,
-                    f"服務重啟，關於任務 {job['job_id']}，請回覆：重試 / 跳過 / 一律跳過",
-                )
+                self._pending_jobs[task_id] = job["job_id"]
+                self._current_chat_id[task_id] = chat_id
+                if first_connect:
+                    await self.ws_send_progress(
+                        task_id, chat_id,
+                        f"服務重啟，關於任務 {job['job_id']}，請回覆：重試 / 跳過 / 一律跳過",
+                    )
 
     async def handle_task(self, task: TaskRequest) -> AgentResult:
         if self._init_error:
@@ -644,9 +669,7 @@ class TGTransferAgent(BaseAgent):
             f"開始搬移 {len(msg_ids)} 則訊息\n來源：{job['source_chat']}\n目標：{job['target_chat']}")
 
         # Start batch in event loop (non-blocking)
-        asyncio.create_task(
-            self._run_batch_background(task_id, job_id, job, source_entity, target_entity, chat_id)
-        )
+        self._spawn_batch_bg(task_id, job_id, job, source_entity, target_entity, chat_id)
 
         # Return None — result will be sent by _run_batch_background when done
         return None
@@ -693,6 +716,7 @@ class TGTransferAgent(BaseAgent):
             ))
         finally:
             self._pending_jobs.pop(task_id, None)
+            self._bg_tasks.pop(task_id, None)
 
     async def _resume_batch(self, task_id: str, job_id: str, job: dict):
         """Resume a paused batch job (non-blocking)."""
@@ -707,9 +731,7 @@ class TGTransferAgent(BaseAgent):
 
         await self.ws_send_progress(task_id, chat_id, "繼續搬移中...")
 
-        asyncio.create_task(
-            self._run_batch_background(task_id, job_id, job, source_entity, target_entity, chat_id)
-        )
+        self._spawn_batch_bg(task_id, job_id, job, source_entity, target_entity, chat_id)
 
         return None  # result sent by _run_batch_background
 

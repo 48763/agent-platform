@@ -123,6 +123,7 @@ class TestIncrementalTargetSyncBeforeBatch:
         agent.engine = AsyncMock()
         agent.config = {"settings": {}}
         agent._pending_jobs = {}
+        agent._bg_tasks = {}
         agent._current_chat_id = {"tid": 111}
         agent._init_error = ""
         agent.ws_send_progress = AsyncMock()
@@ -308,3 +309,111 @@ class TestLLMFallbackRouting:
             result = await agent.handle_task(task)
 
         assert result.status == TaskStatus.NEED_INPUT
+
+
+class TestResumeOnReconnect:
+    """Every WS reconnect must re-attach running jobs whose background
+    coroutine silently died (e.g. hub restart killed the in-flight send).
+    The first-connect-only behaviour in the original resume logic left
+    jobs permanently stuck on reconnect."""
+
+    def _build_agent(self):
+        import asyncio
+        from agents.tg_transfer.__main__ import TGTransferAgent
+        agent = TGTransferAgent.__new__(TGTransferAgent)
+        agent.db = AsyncMock()
+        agent.tg_client = AsyncMock()
+        agent._pending_jobs = {}
+        agent._bg_tasks = {}
+        agent._current_chat_id = {}
+        agent._awaiting_target = {}
+        agent._search_state = {}
+        # ws_send_progress is inherited from BaseAgent; stub it out.
+        agent.ws_send_progress = AsyncMock()
+        return agent
+
+    @pytest.mark.asyncio
+    async def test_running_job_respawned_when_bg_task_missing(self):
+        agent = self._build_agent()
+        agent.db.get_resumable_jobs = AsyncMock(return_value=[{
+            "job_id": "j1", "status": "running",
+            "source_chat": "src", "target_chat": "tgt",
+            "task_id": "t1", "chat_id": 100,
+        }])
+        spawned = []
+        agent._spawn_batch_bg = MagicMock(side_effect=lambda *a, **kw: spawned.append(a) or MagicMock())
+
+        with patch("agents.tg_transfer.__main__.resolve_chat", new_callable=AsyncMock) as mock_resolve:
+            mock_resolve.return_value = MagicMock()
+            await agent._resume_interrupted_jobs(first_connect=True)
+
+        assert len(spawned) == 1
+        assert spawned[0][0] == "t1"  # task_id
+        assert spawned[0][1] == "j1"  # job_id
+        agent.ws_send_progress.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_running_job_skipped_when_bg_task_alive(self):
+        """Double-spawn guard: if a background task is already running for this
+        job, reconnect must NOT spawn another one."""
+        import asyncio
+        agent = self._build_agent()
+        agent.db.get_resumable_jobs = AsyncMock(return_value=[{
+            "job_id": "j1", "status": "running",
+            "source_chat": "src", "target_chat": "tgt",
+            "task_id": "t1", "chat_id": 100,
+        }])
+        # Alive placeholder: a never-resolved future counts as not-done.
+        alive = asyncio.get_event_loop().create_future()
+        agent._bg_tasks["t1"] = alive
+        agent._spawn_batch_bg = MagicMock()
+
+        await agent._resume_interrupted_jobs(first_connect=False)
+
+        agent._spawn_batch_bg.assert_not_called()
+        agent.ws_send_progress.assert_not_called()
+        alive.cancel()
+
+    @pytest.mark.asyncio
+    async def test_running_job_respawned_when_bg_task_done(self):
+        """Silently-died bg task (done but job still 'running' in DB) must
+        trigger a re-spawn on the next WS connect."""
+        import asyncio
+        agent = self._build_agent()
+        agent.db.get_resumable_jobs = AsyncMock(return_value=[{
+            "job_id": "j1", "status": "running",
+            "source_chat": "src", "target_chat": "tgt",
+            "task_id": "t1", "chat_id": 100,
+        }])
+        dead = asyncio.get_event_loop().create_future()
+        dead.set_result(None)
+        agent._bg_tasks["t1"] = dead
+        spawned = []
+        agent._spawn_batch_bg = MagicMock(side_effect=lambda *a, **kw: spawned.append(a) or MagicMock())
+
+        with patch("agents.tg_transfer.__main__.resolve_chat", new_callable=AsyncMock) as mock_resolve:
+            mock_resolve.return_value = MagicMock()
+            await agent._resume_interrupted_jobs(first_connect=False)
+
+        assert len(spawned) == 1
+
+    @pytest.mark.asyncio
+    async def test_paused_job_reminder_first_connect_only(self):
+        """User-facing 'please retry/skip' reminder only on the first connect,
+        to avoid spamming on every WS flap."""
+        agent = self._build_agent()
+        agent.db.get_resumable_jobs = AsyncMock(return_value=[{
+            "job_id": "j2", "status": "paused",
+            "source_chat": "src", "target_chat": "tgt",
+            "task_id": "t2", "chat_id": 200,
+        }])
+
+        await agent._resume_interrupted_jobs(first_connect=True)
+        assert agent.ws_send_progress.call_count == 1
+        assert "t2" in agent._pending_jobs
+
+        # Second connect: binding preserved, no new reminder.
+        agent.ws_send_progress.reset_mock()
+        await agent._resume_interrupted_jobs(first_connect=False)
+        agent.ws_send_progress.assert_not_called()
+        assert agent._pending_jobs["t2"] == "j2"
