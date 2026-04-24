@@ -1,10 +1,17 @@
 import os
 import logging
 import asyncio
+import mimetypes
 import uuid
 from typing import Callable, Optional, Any
-from telethon import TelegramClient
-from telethon.tl.types import DocumentAttributeVideo
+from telethon import TelegramClient, utils as tl_utils
+from telethon.tl.types import (
+    DocumentAttributeVideo, DocumentAttributeFilename,
+    InputMediaUploadedDocument, InputMediaUploadedPhoto, InputSingleMedia,
+)
+from telethon.tl.functions.messages import (
+    UploadMediaRequest, SendMultiMediaRequest,
+)
 from agents.tg_transfer.db import TransferDB
 from agents.tg_transfer.hasher import (
     compute_sha256, compute_phash, compute_phash_video, hamming_distance,
@@ -414,20 +421,22 @@ class TransferEngine:
                 per_file_attrs.append(attrs)
                 per_file_thumbs.append(thumb)
 
-            upload_kwargs = {"caption": caption}
-            # Only pass attributes/thumb lists if any file has them
-            if any(a is not None for a in per_file_attrs):
-                upload_kwargs["attributes"] = per_file_attrs
-            if any(t is not None for t in per_file_thumbs):
-                upload_kwargs["thumb"] = per_file_thumbs
-
-            result = await self.client.send_file(
-                target_entity, effective_paths, **upload_kwargs,
+            # Manual album upload — bypasses Telethon's send_file(list=...),
+            # which silently drops per-file `attributes` and `thumb` inside
+            # `_send_album` (it calls `_file_to_media` without them). For
+            # small videos the TG server auto-probes uploaded MP4s and
+            # compensates; for large uploads (~200MB+) the probe fails,
+            # leaving the bogus DocumentAttributeVideo(0, 1, 1) that Telethon
+            # synthesises → target renders as 0:00 with no preview. Sending
+            # each file via UploadMediaRequest with our own attributes/thumb
+            # makes the per-file metadata actually reach the server.
+            result = await self._upload_album_manual(
+                target_entity, effective_messages, effective_paths,
+                per_file_attrs, per_file_thumbs, caption,
             )
 
-            # Mark uploaded per file. send_file for a list returns a list of
-            # Message objects (one per media); fall back gracefully if TG
-            # returned a single object or something unexpected.
+            # Mark uploaded per file. _upload_album_manual returns a list of
+            # Message-like objects (one per media) produced from TG's Updates.
             if self.media_db and media_ids and result:
                 sent_list = list(result) if isinstance(result, (list, tuple)) else [result]
                 for idx, mid in enumerate(media_ids):
@@ -464,6 +473,94 @@ class TransferEngine:
                         os.unlink(p)
                 except Exception:
                     logger.debug(f"Failed to unlink tmp file {p}", exc_info=True)
+
+    async def _upload_album_manual(self, target_entity, effective_messages,
+                                    effective_paths, per_file_attrs,
+                                    per_file_thumbs, caption):
+        """Manually assemble an album upload so per-file attributes + thumbs
+        actually reach Telegram. See `transfer_album` for why we can't use
+        `client.send_file(file=list, attributes=..., thumb=...)` here.
+
+        Returns a list of Message-like objects (one per uploaded file), each
+        with at least `.id` set — same contract as the old `send_file(list)`
+        return value, so `media_db.mark_uploaded` keeps working.
+        """
+        single_media = []
+        for msg, path, attrs, thumb_path in zip(
+            effective_messages, effective_paths,
+            per_file_attrs, per_file_thumbs,
+        ):
+            file_type = self._detect_file_type(msg)
+            file_handle = await self.client.upload_file(path)
+
+            if file_type == "photo":
+                uploaded = InputMediaUploadedPhoto(file=file_handle)
+            else:
+                mime, _ = mimetypes.guess_type(path)
+                if not mime:
+                    mime = "video/mp4" if file_type == "video" \
+                        else "application/octet-stream"
+                doc_attrs = list(attrs) if attrs else []
+                # Always include filename — plays nicely with TG UI and with
+                # downloaders that key off DocumentAttributeFilename.
+                name = (
+                    getattr(getattr(msg, "file", None), "name", None)
+                    or os.path.basename(path)
+                )
+                doc_attrs.append(DocumentAttributeFilename(file_name=name))
+                thumb_handle = None
+                if thumb_path:
+                    thumb_handle = await self.client.upload_file(thumb_path)
+                uploaded = InputMediaUploadedDocument(
+                    file=file_handle, mime_type=mime,
+                    attributes=doc_attrs, thumb=thumb_handle,
+                )
+
+            # Turn the uploaded media into a server-side reference via
+            # UploadMediaRequest — same shape Telethon itself uses in
+            # `_send_album`. This is where the server probe would normally
+            # run; by passing our own attributes/thumb we don't depend on
+            # that probe succeeding for large files.
+            r = await self.client(UploadMediaRequest(
+                peer=target_entity, media=uploaded,
+            ))
+            if file_type == "photo":
+                final_media = tl_utils.get_input_media(r.photo)
+            else:
+                final_media = tl_utils.get_input_media(
+                    r.document, supports_streaming=True,
+                )
+
+            single_media.append(InputSingleMedia(
+                media=final_media,
+                message=caption or "",
+            ))
+            # Only the first file carries the caption in an album (matches
+            # Telethon's _send_album behaviour — subsequent files get '').
+            caption = ""
+
+        result = await self.client(SendMultiMediaRequest(
+            peer=target_entity, multi_media=single_media,
+        ))
+        random_ids = [m.random_id for m in single_media]
+        try:
+            return self.client._get_response_message(
+                random_ids, result, target_entity,
+            )
+        except Exception:
+            # Fallback: synthesise minimal Message stubs so media_db still
+            # sees a non-None `.id` per sent file. This should only hit in
+            # tests or if Telethon's internal helper is refactored.
+            logger.warning(
+                "_get_response_message failed; returning stub Message list",
+                exc_info=True,
+            )
+            sent = []
+            for update in getattr(result, "updates", []) or []:
+                msg = getattr(update, "message", None)
+                if msg is not None and getattr(msg, "id", None) is not None:
+                    sent.append(msg)
+            return sent
 
     async def _transfer_media(self, target_entity, message, target_chat: str = "",
                                source_chat: str = "", job_id: str = None,

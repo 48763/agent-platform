@@ -68,6 +68,75 @@ def engine_with_media_db(mock_client, db, media_db, tmp_path):
     )
 
 
+def _stub_album_upload(mock_client, upload_side_effect=None):
+    """Configure mock_client so `transfer_album`'s manual upload path
+    (upload_file + UploadMediaRequest + SendMultiMediaRequest) completes
+    without exceptions in tests that don't care about the wire format.
+
+    Returns `req_log` — a list of all TL requests the engine sent to
+    `client(...)`, in order — so tests can still assert call counts etc.
+
+    `upload_side_effect`: optional callable invoked for each `upload_file`
+    call (e.g. to raise, to record paths). Default is no-op.
+    """
+    from telethon.tl.types import Document, Photo, PhotoSize
+    from telethon.tl.functions.messages import (
+        UploadMediaRequest, SendMultiMediaRequest,
+    )
+
+    async def _upload(path, **kwargs):
+        if upload_side_effect is not None:
+            return upload_side_effect(path, **kwargs)
+        return MagicMock(name="file_handle")
+    mock_client.upload_file = AsyncMock(side_effect=_upload)
+
+    req_log = []
+    counter = {"n": 0}
+
+    async def _call(request):
+        req_log.append(request)
+        counter["n"] += 1
+        if isinstance(request, UploadMediaRequest):
+            # Return both `photo` and `document` fields populated with real TL
+            # objects so `tl_utils.get_input_media` works for either branch —
+            # the engine picks one based on the file_type it detected.
+            r = MagicMock()
+            r.document = Document(
+                id=7_000_000 + counter["n"],
+                access_hash=1,
+                file_reference=b"\x00",
+                date=None,
+                mime_type="video/mp4",
+                size=0,
+                dc_id=2,
+                attributes=[],
+                thumbs=[],
+            )
+            r.photo = Photo(
+                id=8_000_000 + counter["n"],
+                access_hash=2,
+                file_reference=b"\x00",
+                date=None,
+                sizes=[PhotoSize(type="m", w=320, h=320, size=1)],
+                dc_id=2,
+            )
+            return r
+        if isinstance(request, SendMultiMediaRequest):
+            upd = MagicMock()
+            upd.updates = []
+            return upd
+        return MagicMock()
+    mock_client.side_effect = _call
+
+    # Telethon's internal helper that maps the Updates result back to a
+    # Message list — stub it so media_db.mark_uploaded sees real ints.
+    def _stub_response(random_ids, result, entity):
+        return [MagicMock(id=5000 + i) for i in range(len(random_ids))]
+    mock_client._get_response_message = _stub_response
+
+    return req_log
+
+
 @pytest.mark.asyncio
 async def test_transfer_single_text_only_is_skipped(engine, mock_client, db):
     """Policy: pure text messages are never transferred — this tool is for
@@ -434,12 +503,7 @@ async def test_transfer_album_writes_media_db_per_file(
         return gen()
     mock_client.iter_download = _make_iter
 
-    sent_msgs = []
-    for i, msg_id in enumerate([501, 502, 503]):
-        sm = MagicMock()
-        sm.id = 9000 + i
-        sent_msgs.append(sm)
-    mock_client.send_file = AsyncMock(return_value=sent_msgs)
+    _stub_album_upload(mock_client)
 
     with patch("agents.tg_transfer.transfer_engine.compute_phash", return_value=None):
         ok = await engine_with_media_db.transfer_album(
@@ -501,7 +565,11 @@ async def test_transfer_album_upload_exception_marks_failed_not_deletes(
             yield bytes([msg.id % 256]) * 10
         return gen()
     mock_client.iter_download = _make_iter
-    mock_client.send_file = AsyncMock(side_effect=RuntimeError("boom"))
+    # Manual album upload path: make upload_file blow up so the whole upload
+    # fails the same way send_file used to.
+    async def _boom(path, **kwargs):
+        raise RuntimeError("boom")
+    mock_client.upload_file = AsyncMock(side_effect=_boom)
 
     with patch("agents.tg_transfer.transfer_engine.compute_phash", return_value=None):
         with pytest.raises(RuntimeError):
@@ -575,9 +643,7 @@ async def test_transfer_album_skips_duplicate_file_sends_rest(
         return gen()
     mock_client.iter_download = _make_iter
 
-    # send_file returns 2 sent msgs (for 2 non-dup files)
-    sent_msgs = [MagicMock(id=801), MagicMock(id=802)]
-    mock_client.send_file = AsyncMock(return_value=sent_msgs)
+    _stub_album_upload(mock_client)
 
     # transfer_album computes sha in message order (zip(messages, file_paths)),
     # so side_effect-as-list maps 1:1 to msg1/msg2/msg3.
@@ -592,10 +658,10 @@ async def test_transfer_album_skips_duplicate_file_sends_rest(
             )
 
     assert ok is True
-    # send_file was called with only 2 paths (msg2 removed as duplicate)
-    call_args = mock_client.send_file.call_args
-    sent_paths = call_args.args[1]
-    assert len(sent_paths) == 2
+    # upload_file was called with only 2 paths (msg2 removed as duplicate).
+    # Photos have no thumb upload, so one upload_file call per file.
+    uploaded_paths = [c.args[0] for c in mock_client.upload_file.call_args_list]
+    assert len(uploaded_paths) == 2
 
     # media_db: 1 prior uploaded + 2 newly uploaded = 3 uploaded
     stats = await media_db.get_stats()
@@ -625,7 +691,7 @@ async def test_transfer_album_all_duplicate_no_send_file(
             yield bytes([msg.id % 256]) * 10
         return gen()
     mock_client.iter_download = _make_iter
-    mock_client.send_file = AsyncMock()
+    req_log = _stub_album_upload(mock_client)
 
     with patch(
         "agents.tg_transfer.transfer_engine.compute_sha256",
@@ -638,7 +704,193 @@ async def test_transfer_album_all_duplicate_no_send_file(
             )
 
     assert ok is True
-    mock_client.send_file.assert_not_called()
+    # Nothing uploaded, no wire requests sent
+    mock_client.upload_file.assert_not_called()
+    assert req_log == []
+
+
+@pytest.mark.asyncio
+async def test_transfer_album_video_sends_per_file_attributes_and_thumb(
+    engine_with_media_db, mock_client, media_db, tmp_path
+):
+    """Regression: album video upload MUST forward per-file
+    DocumentAttributeVideo (duration/w/h) AND thumb to Telegram.
+
+    Telethon's `send_file(file=list, attributes=..., thumb=...)` silently drops
+    both in `_send_album` (verified against telethon==1.43.1: `_send_album`
+    calls `_file_to_media` without them). For small album videos the TG server
+    auto-probe compensates, but for large uploads (~200MB+) the probe fails,
+    leaving the bogus `DocumentAttributeVideo(0, 1, 1)` Telethon synthesises —
+    rendering the message as 0:00 with no preview.
+
+    Fix: bypass `send_file(list=...)` with a manual pipeline
+    (upload_file → InputMediaUploadedDocument(attributes, thumb) →
+    UploadMediaRequest → InputSingleMedia → SendMultiMediaRequest), so each
+    per-file attribute set actually reaches the server."""
+    from telethon.tl.types import (
+        InputMediaUploadedDocument, DocumentAttributeVideo,
+        Document, PhotoSize,
+    )
+    from telethon.tl.functions.messages import (
+        UploadMediaRequest, SendMultiMediaRequest,
+    )
+
+    target_entity = MagicMock()
+
+    def _vid_msg(msg_id, grouped_id, duration, w, h, size):
+        m = _make_message(msg_id, grouped_id=grouped_id)
+        m.photo = None
+        m.video = MagicMock()
+        m.document = MagicMock()
+        m.document.mime_type = "video/mp4"
+        m.document.attributes = []
+        m.document.thumbs = [MagicMock()]  # signal that a thumb exists
+        m.file = MagicMock()
+        m.file.duration = duration
+        m.file.width = w
+        m.file.height = h
+        m.file.size = size
+        m.file.mime_type = "video/mp4"
+        m.file.ext = ".mp4"
+        m.file.name = f"video_{msg_id}.mp4"
+        return m
+
+    # Small + large video; the regression is that the large one renders as
+    # 0:00 when attributes/thumb are dropped.
+    msg1 = _vid_msg(701, grouped_id=70, duration=51, w=1280, h=720, size=6_600_000)
+    msg2 = _vid_msg(702, grouped_id=70, duration=195, w=720, h=1280, size=205_000_000)
+
+    def _make_iter(msg, offset=0, **kwargs):
+        async def gen():
+            yield bytes([msg.id % 256]) * 10
+        return gen()
+    mock_client.iter_download = _make_iter
+
+    # _download_tg_thumb writes a real JPEG so the fallback extract_video_thumb
+    # path is not triggered and the upload code sees a non-None thumb path.
+    async def _dl_media(message, file=None, **kwargs):
+        if file is not None:
+            with open(file, "wb") as fh:
+                fh.write(b"\xff\xd8\xff\xe0")  # JPEG magic
+            return file
+        return None
+    mock_client.download_media = AsyncMock(side_effect=_dl_media)
+
+    upload_calls = []
+
+    async def _upload(path, **kwargs):
+        upload_calls.append(path)
+        handle = MagicMock(name=f"fh_{len(upload_calls)}")
+        return handle
+    mock_client.upload_file = AsyncMock(side_effect=_upload)
+
+    # If the current (broken) code still reaches send_file, let it complete
+    # cleanly so the real assertion (send_file MUST NOT be called) is what
+    # fires — not a spurious SQLite type error from MagicMock id fields.
+    mock_client.send_file = AsyncMock(
+        return_value=[MagicMock(id=9000), MagicMock(id=9001)],
+    )
+
+    req_log = []
+
+    async def _call(request):
+        req_log.append(request)
+        if isinstance(request, UploadMediaRequest):
+            # Real Document TL object so tl_utils.get_input_media can cast it
+            # back to InputMediaDocument.
+            r = MagicMock()
+            r.document = Document(
+                id=7_000_000 + len(req_log),
+                access_hash=1,
+                file_reference=b"\x00",
+                date=None,
+                mime_type="video/mp4",
+                size=0,
+                dc_id=2,
+                attributes=[],
+                thumbs=[],
+            )
+            return r
+        if isinstance(request, SendMultiMediaRequest):
+            upd = MagicMock()
+            upd.updates = []
+            return upd
+        return MagicMock()
+    mock_client.side_effect = _call
+
+    # Per-file ffprobe metadata returned by path basename suffix.
+    async def _ffprobe(path):
+        if "701" in os.path.basename(path):
+            return {"duration": 51, "width": 1280, "height": 720}
+        if "702" in os.path.basename(path):
+            return {"duration": 195, "width": 720, "height": 1280}
+        return None
+    # _get_response_message normally builds Message objects from Updates;
+    # for the test we stub it so media_db.mark_uploaded isn't fussy.
+    def _stub_get_response_message(random_ids, result, entity):
+        return [MagicMock(id=5000 + i) for i in range(len(random_ids))]
+    mock_client._get_response_message = _stub_get_response_message
+
+    with patch(
+        "agents.tg_transfer.transfer_engine.ffprobe_metadata",
+        new=AsyncMock(side_effect=_ffprobe),
+    ):
+        with patch(
+            "agents.tg_transfer.transfer_engine.compute_sha256",
+            side_effect=lambda p: f"sha-{os.path.basename(p)}",
+        ):
+            with patch(
+                "agents.tg_transfer.transfer_engine.compute_phash_video",
+                new=AsyncMock(return_value=None),
+            ):
+                ok = await engine_with_media_db.transfer_album(
+                    target_entity, [msg1, msg2],
+                    target_chat="@dst", source_chat="@src",
+                    job_id="job-album-video",
+                )
+
+    assert ok is True
+
+    # The whole point: never use send_file(list) — it drops per-file
+    # attributes/thumb in Telethon's _send_album path.
+    assert not mock_client.send_file.called, (
+        "album upload must NOT use send_file(list=) (Telethon drops "
+        "attributes/thumb). Use UploadMediaRequest + SendMultiMediaRequest."
+    )
+
+    upload_reqs = [r for r in req_log if isinstance(r, UploadMediaRequest)]
+    send_reqs = [r for r in req_log if isinstance(r, SendMultiMediaRequest)]
+    assert len(upload_reqs) == 2, (
+        f"expected 2 UploadMediaRequest (one per file), got {len(upload_reqs)}"
+    )
+    assert len(send_reqs) == 1, (
+        f"expected 1 SendMultiMediaRequest, got {len(send_reqs)}"
+    )
+
+    seen_dims = []
+    for req in upload_reqs:
+        assert isinstance(req.media, InputMediaUploadedDocument), (
+            f"expected InputMediaUploadedDocument, got {type(req.media).__name__}"
+        )
+        assert req.media.thumb is not None, (
+            "album video thumb must be forwarded — dropping it causes the "
+            "no-preview regression"
+        )
+        vids = [a for a in (req.media.attributes or [])
+                if isinstance(a, DocumentAttributeVideo)]
+        assert vids, "missing DocumentAttributeVideo on album video upload"
+        v = vids[0]
+        # Must not be the Telethon placeholder (0, 1, 1) that renders as 0:00.
+        assert v.duration > 0, f"duration dropped (got {v.duration})"
+        assert v.w > 1 and v.h > 1, f"dims dropped (got {v.w}x{v.h})"
+        seen_dims.append((int(v.duration), v.w, v.h))
+
+    # Each file's actual per-file metadata must appear (proving attributes are
+    # not collapsed to a single shared value).
+    assert (51, 1280, 720) in seen_dims
+    assert (195, 720, 1280) in seen_dims
+
+    assert len(send_reqs[0].multi_media) == 2
 
 
 @pytest.mark.asyncio
@@ -656,12 +908,14 @@ async def test_transfer_album_parallel_download(engine, mock_client, tmp_path):
             f.write(b"\x00" * 10)
 
     mock_client.download_media = AsyncMock(side_effect=[path1, path2])
-    mock_client.send_file = AsyncMock()
+    req_log = _stub_album_upload(mock_client)
 
     result = await engine.transfer_album(target_entity, [msg1, msg2])
 
     assert result is True
-    mock_client.send_file.assert_called_once()
+    # One SendMultiMediaRequest per album upload.
+    from telethon.tl.functions.messages import SendMultiMediaRequest
+    assert sum(1 for r in req_log if isinstance(r, SendMultiMediaRequest)) == 1
 
 
 # ---- Phase 1b: _download_with_resume ----
@@ -802,7 +1056,7 @@ async def test_transfer_album_streams_via_iter_download(
             yield b"\xAB" * 8
         return gen()
     mock_client.iter_download = make_iter_download
-    mock_client.send_file = AsyncMock(return_value=[MagicMock(id=9001), MagicMock(id=9002)])
+    _stub_album_upload(mock_client)
 
     with patch("agents.tg_transfer.transfer_engine.compute_sha256",
                side_effect=["sha_a", "sha_b"]):
@@ -847,7 +1101,7 @@ async def test_transfer_album_resumes_one_file_from_partial(
             yield b"R" * 7
         return gen()
     mock_client.iter_download = make_iter_download
-    mock_client.send_file = AsyncMock(return_value=[MagicMock(id=1), MagicMock(id=2)])
+    _stub_album_upload(mock_client)
 
     with patch("agents.tg_transfer.transfer_engine.compute_sha256",
                side_effect=["sha1", "sha2"]):
@@ -880,7 +1134,7 @@ async def test_transfer_album_clears_partial_state_on_success(
             yield b"X" * 4
         return gen()
     mock_client.iter_download = make_iter_download
-    mock_client.send_file = AsyncMock(return_value=[MagicMock(id=1), MagicMock(id=2)])
+    _stub_album_upload(mock_client)
 
     with patch("agents.tg_transfer.transfer_engine.compute_sha256",
                side_effect=["sX", "sY"]):
@@ -1343,7 +1597,7 @@ async def test_transfer_album_under_sum_limit_proceeds(
             yield bytes([msg.id % 256]) * 10
         return gen()
     mock_client.iter_download = _make_iter
-    mock_client.send_file = AsyncMock(return_value=[MagicMock(id=1), MagicMock(id=2)])
+    _stub_album_upload(mock_client)
 
     with patch(
         "agents.tg_transfer.transfer_engine.compute_sha256",
@@ -1407,7 +1661,7 @@ async def test_transfer_album_no_limit_set_is_no_op(
             yield b"\x00" * 5
         return gen()
     mock_client.iter_download = _make_iter
-    mock_client.send_file = AsyncMock(return_value=[MagicMock(id=1), MagicMock(id=2)])
+    _stub_album_upload(mock_client)
 
     with patch(
         "agents.tg_transfer.transfer_engine.compute_sha256",
@@ -1551,9 +1805,7 @@ class TestUploadFilenameExtension:
                 yield b"\x89PNG"
             return gen()
         mock_client.iter_download = _make_iter
-        mock_client.send_file = AsyncMock(
-            return_value=[MagicMock(id=1), MagicMock(id=2)],
-        )
+        _stub_album_upload(mock_client)
 
         with patch(
             "agents.tg_transfer.transfer_engine.compute_sha256",
@@ -1567,8 +1819,10 @@ class TestUploadFilenameExtension:
             )
 
         assert ok is True
-        sent_paths = mock_client.send_file.call_args.args[1]
-        for p in sent_paths:
+        # Photos → one upload_file call per file (no thumb), path is arg 0.
+        uploaded_paths = [c.args[0] for c in mock_client.upload_file.call_args_list]
+        assert len(uploaded_paths) == 2
+        for p in uploaded_paths:
             assert p.endswith(".jpg"), (
                 f"album file path should end in .jpg, got {p!r}"
             )
