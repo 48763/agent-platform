@@ -1,4 +1,5 @@
 import aiosqlite
+import json
 import uuid
 from typing import Optional
 
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     auto_skip   BOOLEAN DEFAULT 0,
     task_id     TEXT,
     chat_id     INTEGER,
+    final_progress TEXT,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -67,6 +69,10 @@ class TransferDB:
             await self._db.execute("ALTER TABLE jobs ADD COLUMN task_id TEXT")
         if "chat_id" not in cols:
             await self._db.execute("ALTER TABLE jobs ADD COLUMN chat_id INTEGER")
+        if "final_progress" not in cols:
+            await self._db.execute(
+                "ALTER TABLE jobs ADD COLUMN final_progress TEXT"
+            )
 
         async with self._db.execute("PRAGMA table_info(job_messages)") as cur:
             jm_cols = {row["name"] for row in await cur.fetchall()}
@@ -108,13 +114,24 @@ class TransferDB:
             return dict(row) if row else None
 
     async def update_job_status(self, job_id: str, status: str):
-        await self._db.execute(
-            "UPDATE jobs SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?",
-            (status, job_id),
-        )
         if status in _TERMINAL_STATUSES:
+            # Snapshot per-message counts BEFORE the DELETE below wipes them,
+            # otherwise the caller (who reads get_progress right after the
+            # transition) sees 0/0/0 even on a fully successful job.
+            snapshot = await self.get_progress(job_id)
+            await self._db.execute(
+                "UPDATE jobs SET status = ?, final_progress = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE job_id = ?",
+                (status, json.dumps(snapshot), job_id),
+            )
             await self._db.execute(
                 "DELETE FROM job_messages WHERE job_id = ?", (job_id,),
+            )
+        else:
+            await self._db.execute(
+                "UPDATE jobs SET status = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE job_id = ?",
+                (status, job_id),
             )
         await self._db.commit()
 
@@ -241,6 +258,23 @@ class TransferDB:
             async for row in cur:
                 counts[row["status"]] = row["cnt"]
                 counts["total"] += row["cnt"]
+        # After a terminal transition, job_messages has been pruned — fall
+        # back to the snapshot stored on the jobs row so callers still see
+        # the real final counts rather than 0/0/0.
+        if counts["total"] == 0:
+            async with self._db.execute(
+                "SELECT final_progress FROM jobs WHERE job_id = ?", (job_id,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row and row["final_progress"]:
+                try:
+                    snapshot = json.loads(row["final_progress"])
+                except (ValueError, TypeError):
+                    snapshot = None
+                if isinstance(snapshot, dict):
+                    for k in counts:
+                        if k in snapshot:
+                            counts[k] = snapshot[k]
         return counts
 
     # -- Dedup --

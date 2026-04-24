@@ -348,8 +348,6 @@ class TestJobTerminalCleanup:
 
         # Messages wiped, job row remains.
         assert await db.get_next_pending(job_id) is None
-        progress = await db.get_progress(job_id)
-        assert progress["total"] == 0
         assert await db.get_job(job_id) is not None
 
     @pytest.mark.asyncio
@@ -360,8 +358,7 @@ class TestJobTerminalCleanup:
         await db.add_messages(job_id, [10, 20])
         await db.update_job_status(job_id, "failed")
 
-        progress = await db.get_progress(job_id)
-        assert progress["total"] == 0
+        assert await db.get_next_pending(job_id) is None
         assert await db.get_job(job_id) is not None
 
     @pytest.mark.asyncio
@@ -372,8 +369,40 @@ class TestJobTerminalCleanup:
         await db.add_messages(job_id, [5])
         await db.update_job_status(job_id, "cancelled")
 
+        assert await db.get_next_pending(job_id) is None
+
+    @pytest.mark.asyncio
+    async def test_terminal_status_snapshots_progress(self, db):
+        """Regression: a terminal transition deletes job_messages, but
+        get_progress must still return the real final counts so the user
+        sees 3/1/1 — not 0/0/0. Fix: snapshot progress before prune, return
+        snapshot on reads once the job is terminal."""
+        job_id = await db.create_job(
+            source_chat="@s", target_chat="@t", mode="batch",
+        )
+        await db.add_messages(job_id, [1, 2, 3, 4, 5])
+        await db.mark_message(job_id, 1, "success")
+        await db.mark_message(job_id, 2, "success")
+        await db.mark_message(job_id, 3, "success")
+        await db.mark_message(job_id, 4, "skipped")
+        await db.mark_message(job_id, 5, "failed")
+
+        # Pre-transition — counts come from job_messages as before.
         progress = await db.get_progress(job_id)
-        assert progress["total"] == 0
+        assert progress == {
+            "total": 5, "success": 3, "failed": 1,
+            "skipped": 1, "pending": 0,
+        }
+
+        await db.update_job_status(job_id, "completed")
+
+        # Post-transition — job_messages is gone, but the snapshot must
+        # preserve what the user actually sees in the "完成" message.
+        progress = await db.get_progress(job_id)
+        assert progress == {
+            "total": 5, "success": 3, "failed": 1,
+            "skipped": 1, "pending": 0,
+        }
 
     @pytest.mark.asyncio
     async def test_non_terminal_preserves_job_messages(self, db):
