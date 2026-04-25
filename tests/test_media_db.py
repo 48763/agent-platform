@@ -192,6 +192,85 @@ async def test_find_similar_phash(mdb):
     assert results[0]["phash"] == "0000000000000000"
 
 
+class TestGetAllPhashesFilters:
+    """`get_all_phashes` must let the dedup path scope the candidate
+    set so a video's phash can't accidentally match an image (and vice
+    versa) and so a target's index doesn't bleed into another target's
+    dedup decisions. Both filters are optional for backward compat."""
+
+    @pytest.mark.asyncio
+    async def test_filter_by_file_type(self, mdb):
+        m_photo = await mdb.insert_media(
+            sha256="p1", phash="0000000000000000", file_type="photo",
+            file_size=100, caption="", source_chat="@s",
+            source_msg_id=1, target_chat="@d", job_id="j",
+        )
+        await mdb.mark_uploaded(m_photo, target_msg_id=1)
+        m_video = await mdb.insert_media(
+            sha256="v1", phash="1111111111111111", file_type="video",
+            file_size=500, caption="", source_chat="@s",
+            source_msg_id=2, target_chat="@d", job_id="j",
+        )
+        await mdb.mark_uploaded(m_video, target_msg_id=2)
+
+        videos = await mdb.get_all_phashes(file_type="video")
+        assert [r["phash"] for r in videos] == ["1111111111111111"]
+
+        photos = await mdb.get_all_phashes(file_type="photo")
+        assert [r["phash"] for r in photos] == ["0000000000000000"]
+
+    @pytest.mark.asyncio
+    async def test_filter_by_target_chat(self, mdb):
+        m_a = await mdb.insert_media(
+            sha256="a1", phash="aaaaaaaaaaaaaaaa", file_type="photo",
+            file_size=100, caption="", source_chat="@s",
+            source_msg_id=10, target_chat="@target_a", job_id="j",
+        )
+        await mdb.mark_uploaded(m_a, target_msg_id=100)
+        m_b = await mdb.insert_media(
+            sha256="b1", phash="bbbbbbbbbbbbbbbb", file_type="photo",
+            file_size=100, caption="", source_chat="@s",
+            source_msg_id=11, target_chat="@target_b", job_id="j",
+        )
+        await mdb.mark_uploaded(m_b, target_msg_id=200)
+
+        only_a = await mdb.get_all_phashes(target_chat="@target_a")
+        assert [r["phash"] for r in only_a] == ["aaaaaaaaaaaaaaaa"]
+
+    @pytest.mark.asyncio
+    async def test_combined_filters(self, mdb):
+        # Same target, different file_types — combined filter narrows further.
+        m_v = await mdb.insert_media(
+            sha256="cv", phash="cccccccccccccccc", file_type="video",
+            file_size=500, caption="", source_chat="@s",
+            source_msg_id=20, target_chat="@d", job_id="j",
+        )
+        await mdb.mark_uploaded(m_v, target_msg_id=20)
+        m_p = await mdb.insert_media(
+            sha256="cp", phash="dddddddddddddddd", file_type="photo",
+            file_size=100, caption="", source_chat="@s",
+            source_msg_id=21, target_chat="@d", job_id="j",
+        )
+        await mdb.mark_uploaded(m_p, target_msg_id=21)
+
+        rows = await mdb.get_all_phashes(file_type="video", target_chat="@d")
+        assert [r["phash"] for r in rows] == ["cccccccccccccccc"]
+
+    @pytest.mark.asyncio
+    async def test_no_args_keeps_legacy_behaviour(self, mdb):
+        """Existing callers that pass no kwargs must still see all rows
+        — backward-compat for tests / search / scan code paths."""
+        for i, ft in enumerate(["photo", "video", "photo"]):
+            mid = await mdb.insert_media(
+                sha256=f"any{i}", phash=f"{i:016x}", file_type=ft,
+                file_size=10, caption="", source_chat="@s",
+                source_msg_id=30 + i, target_chat=f"@t{i % 2}", job_id="j",
+            )
+            await mdb.mark_uploaded(mid, target_msg_id=30 + i)
+        rows = await mdb.get_all_phashes()
+        assert len(rows) == 3
+
+
 @pytest.mark.asyncio
 async def test_tags_crud(mdb):
     media_id = await mdb.insert_media(

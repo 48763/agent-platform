@@ -472,11 +472,32 @@ class MediaDB:
             row = await cur.fetchone()
             return dict(row) if row else None
 
-    async def get_all_phashes(self) -> list[dict]:
-        async with self._db.execute(
-            "SELECT media_id, phash, caption, target_chat, target_msg_id "
+    async def get_all_phashes(
+        self,
+        file_type: str | None = None,
+        target_chat: str | None = None,
+    ) -> list[dict]:
+        """Return uploaded rows that have a phash set.
+
+        Optional `file_type` / `target_chat` scope the result so the dedup
+        path can avoid comparing across mismatched media types (e.g. a
+        video's phash CSV against a photo's single-frame phash) or
+        bleeding one target's index into another's decisions. Both
+        filters default to None for backward compat with callers that
+        want every uploaded phash row."""
+        query = (
+            "SELECT media_id, phash, caption, target_chat, target_msg_id, "
+            "file_type, file_size "
             "FROM media WHERE phash IS NOT NULL AND status = 'uploaded'"
-        ) as cur:
+        )
+        params: list = []
+        if file_type is not None:
+            query += " AND file_type = ?"
+            params.append(file_type)
+        if target_chat is not None:
+            query += " AND target_chat = ?"
+            params.append(target_chat)
+        async with self._db.execute(query, params) as cur:
             return [dict(row) for row in await cur.fetchall()]
 
     # -- Tags --
