@@ -470,7 +470,10 @@ class TGTransferAgent(BaseAgent):
             return AgentResult(status=TaskStatus.DONE, message="無法計算圖片 hash")
 
         threshold = self.config.get("settings", {}).get("phash_threshold", 10)
-        all_phashes = await self.media_db.get_all_phashes()
+        # Photo-only candidates so we don't try to int(csv, 16) a video's
+        # multi-frame phash (would raise ValueError) and don't surface
+        # cross-format false positives.
+        all_phashes = await self.media_db.get_all_phashes(file_type="photo")
         similar = []
         for row in all_phashes:
             dist = hamming_distance(phash, row["phash"])

@@ -14,8 +14,8 @@ from telethon.tl.functions.messages import (
 )
 from agents.tg_transfer.db import TransferDB
 from agents.tg_transfer.hasher import (
-    compute_sha256, compute_phash, compute_phash_video, hamming_distance,
-    download_thumb_and_phash,
+    compute_sha256, compute_phash, compute_phash_video,
+    hamming_distance_multi, download_thumb_and_phash,
 )
 from agents.tg_transfer.media_db import MediaDB
 from agents.tg_transfer.tag_extractor import extract_tags
@@ -54,6 +54,95 @@ def _meta_from_message(message) -> dict | None:
     return {"duration": int(duration), "width": int(width), "height": int(height)}
 
 
+def _metadata_matches(
+    *, source_size: int | None, source_duration: int | None,
+    cand_size: int | None, cand_duration: int | None,
+) -> bool:
+    """Strict metadata equality between a source candidate and a target row.
+    A `None` on either side counts as 'unknown' and never matches — we
+    can't auto-skip on a phash hit alone if we can't confirm the file
+    is byte-equivalent. Photos legitimately have duration=None on both
+    sides, which counts as a match (both known to be 'no duration')."""
+    if source_size is None or cand_size is None:
+        return False
+    if source_size != cand_size:
+        return False
+    # Photos: both None → matches. Videos: both must be known and equal.
+    if source_duration is None and cand_duration is None:
+        return True
+    if source_duration is None or cand_duration is None:
+        return False
+    return source_duration == cand_duration
+
+
+def classify_phash_dedup(
+    *,
+    phash: str,
+    file_size: int | None,
+    duration: int | None,
+    candidates: list[dict],
+    per_frame_threshold: int,
+) -> tuple[str, dict | None, tuple[int, int]]:
+    """3-case dedup decision used by both album and single transfer paths.
+
+    Compares the source's phash (single-frame hex or 3-frame CSV) against
+    every uploaded candidate's phash via `hamming_distance_multi`, picks
+    the highest-fidelity match (most frames matched), then applies the
+    user-defined matrix:
+
+      - all frames match within `per_frame_threshold` AND metadata
+        agrees → "auto_skip" (silently drop, mark `skipped`).
+      - some-but-not-all frames match (only meaningful with multi-frame,
+        e.g. 2/3) AND metadata agrees → "ambiguous" (block, surface to
+        the pending_dedup queue for user confirmation).
+      - otherwise → "different" (proceed to upload).
+
+    Returns (decision, matched_row, (matched_frames, total_frames)). The
+    matched_row is the candidate that produced the best score (None if
+    no candidates) so callers can record which target item was matched
+    when building pending_dedup rows or logging diagnostics."""
+    best: tuple[int, int] = (0, 0)  # (matched, total) of best candidate
+    best_row: dict | None = None
+    for row in candidates:
+        cand_phash = row.get("phash")
+        if not cand_phash:
+            continue
+        matched, total = hamming_distance_multi(
+            phash, cand_phash, per_frame_threshold=per_frame_threshold,
+        )
+        # Prefer (3, 3) over (2, 3) over (1, 1). A higher matched count
+        # with same total wins; otherwise the higher fraction wins.
+        if total == 0:
+            continue
+        if best_row is None:
+            best, best_row = (matched, total), row
+            continue
+        bm, bt = best
+        # Prefer rows with more frames matched relative to total.
+        if (matched, total) == (bm, bt):
+            continue
+        # Compare matched-frame counts first, then total as tiebreak.
+        if matched > bm or (matched == bm and total > bt):
+            best, best_row = (matched, total), row
+
+    if best_row is None or best[0] == 0:
+        return "different", None, (0, 0)
+
+    matched, total = best
+    if not _metadata_matches(
+        source_size=file_size, source_duration=duration,
+        cand_size=best_row.get("file_size"),
+        cand_duration=best_row.get("duration"),
+    ):
+        return "different", best_row, (matched, total)
+
+    if matched == total:
+        return "auto_skip", best_row, (matched, total)
+    # 0 < matched < total: only possible with multi-frame source AND
+    # multi-frame candidate. Surface as ambiguous.
+    return "ambiguous", best_row, (matched, total)
+
+
 class TransferEngine:
     def __init__(
         self,
@@ -81,6 +170,49 @@ class TransferEngine:
 
     def cancel_job(self, job_id: str):
         self._cancelled.add(job_id)
+
+    async def _mark_dedup_skipped(self, job_id: str | None, message_id: int):
+        """Mark a per-album message as `skipped` in job_messages because
+        it dedup'd against the target. Without this the run_batch bulk-
+        mark would overwrite it with `success` once the rest of the album
+        uploads successfully — the silent-drop bug we're fixing."""
+        if job_id is None:
+            return
+        try:
+            await self.db.mark_message(job_id, message_id, "skipped")
+        except Exception:
+            logger.debug(
+                "mark_dedup_skipped failed for job %s msg %s",
+                job_id, message_id, exc_info=True,
+            )
+
+    async def _mark_dedup_ambiguous(
+        self, job_id: str | None, source_chat: str,
+        message_id: int, matched_row: dict | None,
+    ):
+        """Park an ambiguous match: insert a pending_dedup row so Phase 5
+        can surface it for user arbitration, and mark the source message
+        as `ambiguous` in job_messages so run_batch's bulk-mark leaves
+        it alone."""
+        if job_id is None:
+            return
+        candidate_ids: list[int] = []
+        if matched_row and matched_row.get("target_msg_id"):
+            candidate_ids.append(int(matched_row["target_msg_id"]))
+        try:
+            if self.media_db:
+                await self.media_db.insert_pending_dedup(
+                    job_id=job_id, source_chat=source_chat,
+                    source_msg_id=message_id,
+                    candidate_target_msg_ids=candidate_ids,
+                    reason="phash_partial_match_metadata_match",
+                )
+            await self.db.mark_message(job_id, message_id, "ambiguous")
+        except Exception:
+            logger.debug(
+                "mark_dedup_ambiguous failed for job %s msg %s",
+                job_id, message_id, exc_info=True,
+            )
 
     def _download_request_size(self) -> int:
         """Download chunk size. Premium accounts can safely pull 1 MiB chunks
@@ -339,30 +471,62 @@ class TransferEngine:
             effective_paths: list[str] = []
 
             if self.media_db:
-                all_phashes = None  # lazy-load
+                # phash candidates are scoped per-file_type so a video's
+                # 3-frame CSV phash is never compared against a photo's
+                # single-frame phash (and vice versa).
+                phash_cands_by_type: dict[str, list[dict]] = {}
                 for msg, path in zip(messages, file_paths):
                     sha256 = compute_sha256(path)
                     file_type = self._detect_file_type(msg)
                     phash = None
+                    duration = None
                     if file_type == "photo":
                         phash = compute_phash(path)
                     elif file_type == "video":
                         phash = await compute_phash_video(path, self.tmp_dir)
+                        meta = await ffprobe_metadata(path)
+                        if meta:
+                            duration = meta.get("duration")
+                    file_size = (
+                        os.path.getsize(path) if os.path.exists(path) else None
+                    )
 
-                    # sha256 dedup
+                    # sha256 match → strongest dedup signal, drop silently
+                    # but mark the source message as `skipped` in
+                    # job_messages so the run_batch bulk-mark won't later
+                    # overwrite it with `success` (silent-drop fix).
                     if await self.media_db.find_by_sha256(sha256, target_chat):
+                        await self._mark_dedup_skipped(job_id, msg.id)
                         continue
-                    # phash similarity
+
+                    # phash similarity → 3-case classification:
+                    # auto_skip (3/3 + metadata)   → mark skipped, drop
+                    # ambiguous (2/3 + metadata)   → mark ambiguous,
+                    #                                queue pending_dedup
+                    # different                    → upload
                     if phash:
-                        if all_phashes is None:
-                            all_phashes = await self.media_db.get_all_phashes()
-                        if any(
-                            hamming_distance(phash, row["phash"]) <= self.phash_threshold
-                            for row in all_phashes
-                        ):
+                        if file_type not in phash_cands_by_type:
+                            phash_cands_by_type[file_type] = (
+                                await self.media_db.get_all_phashes(
+                                    file_type=file_type,
+                                    target_chat=target_chat,
+                                )
+                            )
+                        decision, matched_row, _ = classify_phash_dedup(
+                            phash=phash, file_size=file_size,
+                            duration=duration,
+                            candidates=phash_cands_by_type[file_type],
+                            per_frame_threshold=self.phash_threshold,
+                        )
+                        if decision == "auto_skip":
+                            await self._mark_dedup_skipped(job_id, msg.id)
+                            continue
+                        if decision == "ambiguous":
+                            await self._mark_dedup_ambiguous(
+                                job_id, source_chat, msg.id, matched_row,
+                            )
                             continue
 
-                    file_size = os.path.getsize(path) if os.path.exists(path) else None
                     media_id = await self.media_db.upsert_pending(
                         sha256=sha256, phash=phash, file_type=file_type,
                         file_size=file_size, caption=msg.text or "",
@@ -371,6 +535,7 @@ class TransferEngine:
                     )
                     if media_id is None:
                         # Race: uploaded row slipped in between check and upsert
+                        await self._mark_dedup_skipped(job_id, msg.id)
                         continue
                     media_ids.append(media_id)
                     effective_messages.append(msg)
@@ -623,10 +788,15 @@ class TransferEngine:
             sha256 = compute_sha256(path)
             file_type = self._detect_file_type(message)
             phash = None
+            duration = None
             if file_type == "video":
                 phash = await compute_phash_video(path, self.tmp_dir)
+                meta = await ffprobe_metadata(path)
+                if meta:
+                    duration = meta.get("duration")
             elif file_type == "photo":
                 phash = compute_phash(path)
+            file_size = os.path.getsize(path) if os.path.exists(path) else None
 
             # Check dedup if media_db available
             if self.media_db:
@@ -634,20 +804,35 @@ class TransferEngine:
                 if existing:
                     return {"ok": True, "dedup": True, "similar": None}
 
-                # Check pHash similarity
+                # 3-case classification on phash + metadata. Scope
+                # candidates by file_type / target_chat so a photo's
+                # single-frame phash is never compared against a video's
+                # 3-frame CSV (and vice versa) — the comparison would
+                # both crash on `int(csv, 16)` AND produce false-positive
+                # auto-skips.
                 if phash:
-                    all_phashes = await self.media_db.get_all_phashes()
-                    similar = []
-                    for row in all_phashes:
-                        dist = hamming_distance(phash, row["phash"])
-                        if dist <= self.phash_threshold:
-                            similar.append({**row, "distance": dist})
-                    if similar:
-                        return {"ok": False, "dedup": False, "similar": similar}
+                    candidates = await self.media_db.get_all_phashes(
+                        file_type=file_type, target_chat=target_chat,
+                    )
+                    decision, matched_row, _ = classify_phash_dedup(
+                        phash=phash, file_size=file_size, duration=duration,
+                        candidates=candidates,
+                        per_frame_threshold=self.phash_threshold,
+                    )
+                    if decision == "auto_skip":
+                        return {"ok": True, "dedup": True, "similar": None}
+                    if decision == "ambiguous":
+                        if job_id is not None:
+                            await self._mark_dedup_ambiguous(
+                                job_id, source_chat, message.id, matched_row,
+                            )
+                        return {
+                            "ok": False, "dedup": False, "similar": None,
+                            "ambiguous": True,
+                        }
 
                 # Upsert pending media record (revives failed/skipped rows)
                 caption = message.text or ""
-                file_size = os.path.getsize(path) if os.path.exists(path) else None
                 media_id = await self.media_db.upsert_pending(
                     sha256=sha256, phash=phash, file_type=file_type,
                     file_size=file_size, caption=caption,
@@ -926,8 +1111,18 @@ class TransferEngine:
                     else:
                         status = "failed"
 
-                    for gr in group_rows:
-                        await self.db.mark_message(job_id, gr["message_id"], status)
+                    # transfer_album already marks dedup'd / ambiguous
+                    # messages individually (silent-drop fix); the bulk-
+                    # mark here must only fill in rows that are still
+                    # `pending`, never overwrite the per-message decisions.
+                    refreshed = await self.db.get_grouped_messages(
+                        job_id, grouped_id,
+                    )
+                    for gr in refreshed:
+                        if gr["status"] == "pending":
+                            await self.db.mark_message(
+                                job_id, gr["message_id"], status,
+                            )
                     processed += len(group_rows)
                 else:
                     # Single message

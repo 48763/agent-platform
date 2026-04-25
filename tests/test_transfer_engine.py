@@ -2074,3 +2074,415 @@ class TestDetectFileType:
         msg.video = None
         msg.document = None
         assert TransferEngine._detect_file_type(msg) == "document"
+
+
+class TestClassifyPhashDedup:
+    """Apply the 3-case decision matrix used by both the album and single
+    transfer paths:
+
+      1. all frames match within `per_frame_threshold` AND metadata agrees
+         → "auto_skip" (silently drop, mark as skipped — case 1)
+      2. some-but-not-all frames match (e.g. 2/3) AND metadata agrees →
+         "ambiguous" (block, push into pending_dedup queue for user
+         confirmation — case 2)
+      3. otherwise → "different" (proceed to upload — case 3)
+
+    Metadata agree = file_size equal AND duration equal (or both None).
+    A `None` on either side counts as "unknown" and DOES NOT match — we
+    can't auto-skip without confirmation that the metadata lines up.
+
+    Returned tuple is (decision, matched_row, (matched_frames, total_frames))
+    so callers can build pending_dedup rows / log diagnostics with the
+    matched candidate's identity.
+    """
+
+    def _cand(
+        self, *, phash, file_size=100, duration=None,
+        media_id=1, target_msg_id=10, file_type="video",
+    ):
+        return {
+            "media_id": media_id, "target_msg_id": target_msg_id,
+            "phash": phash, "file_size": file_size, "duration": duration,
+            "file_type": file_type, "caption": "",
+        }
+
+    def test_no_candidates_is_different(self):
+        from agents.tg_transfer.transfer_engine import classify_phash_dedup
+        decision, row, frames = classify_phash_dedup(
+            phash="0000000000000000,1111111111111111,2222222222222222",
+            file_size=100, duration=10, candidates=[],
+            per_frame_threshold=10,
+        )
+        assert decision == "different"
+        assert row is None
+        assert frames == (0, 0)
+
+    def test_full_match_with_metadata_match_is_auto_skip(self):
+        from agents.tg_transfer.transfer_engine import classify_phash_dedup
+        cand = self._cand(
+            phash="0000000000000000,1111111111111111,2222222222222222",
+            file_size=100, duration=10,
+        )
+        decision, row, frames = classify_phash_dedup(
+            phash="0000000000000000,1111111111111111,2222222222222222",
+            file_size=100, duration=10, candidates=[cand],
+            per_frame_threshold=10,
+        )
+        assert decision == "auto_skip"
+        assert row is cand
+        assert frames == (3, 3)
+
+    def test_full_match_metadata_mismatch_is_different(self):
+        """User-stated case-3 fallback: 3/3 phash but file_size differs is
+        treated as 'different' (upload), not auto-skip — re-encoded videos
+        with byte-different output should not silently drop."""
+        from agents.tg_transfer.transfer_engine import classify_phash_dedup
+        cand = self._cand(
+            phash="0000000000000000,1111111111111111,2222222222222222",
+            file_size=999, duration=10,
+        )
+        decision, _, _ = classify_phash_dedup(
+            phash="0000000000000000,1111111111111111,2222222222222222",
+            file_size=100, duration=10, candidates=[cand],
+            per_frame_threshold=10,
+        )
+        assert decision == "different"
+
+    def test_partial_match_with_metadata_match_is_ambiguous(self):
+        from agents.tg_transfer.transfer_engine import classify_phash_dedup
+        # frame 1 differs by 64 bits, frames 0 and 2 identical → 2/3.
+        cand = self._cand(
+            phash="0000000000000000,eeeeeeeeeeeeeeee,2222222222222222",
+            file_size=100, duration=10,
+        )
+        decision, row, frames = classify_phash_dedup(
+            phash="0000000000000000,1111111111111111,2222222222222222",
+            file_size=100, duration=10, candidates=[cand],
+            per_frame_threshold=10,
+        )
+        assert decision == "ambiguous"
+        assert row is cand
+        assert frames == (2, 3)
+
+    def test_partial_match_metadata_mismatch_is_different(self):
+        from agents.tg_transfer.transfer_engine import classify_phash_dedup
+        cand = self._cand(
+            phash="0000000000000000,eeeeeeeeeeeeeeee,2222222222222222",
+            file_size=999, duration=10,
+        )
+        decision, _, _ = classify_phash_dedup(
+            phash="0000000000000000,1111111111111111,2222222222222222",
+            file_size=100, duration=10, candidates=[cand],
+            per_frame_threshold=10,
+        )
+        assert decision == "different"
+
+    def test_zero_match_is_different(self):
+        from agents.tg_transfer.transfer_engine import classify_phash_dedup
+        cand = self._cand(
+            phash="ffffffffffffffff,ffffffffffffffff,ffffffffffffffff",
+            file_size=100, duration=10,
+        )
+        decision, _, _ = classify_phash_dedup(
+            phash="0000000000000000,1111111111111111,2222222222222222",
+            file_size=100, duration=10, candidates=[cand],
+            per_frame_threshold=10,
+        )
+        assert decision == "different"
+
+    def test_single_frame_photo_match_is_auto_skip(self):
+        """Photos always have a single-frame phash — the (1, 1) result from
+        hamming_distance_multi means 'all frames match' so the auto_skip
+        branch fires when metadata matches."""
+        from agents.tg_transfer.transfer_engine import classify_phash_dedup
+        cand = self._cand(
+            phash="0000000000000000", file_size=100, duration=None,
+            file_type="photo",
+        )
+        decision, _, frames = classify_phash_dedup(
+            phash="0000000000000000", file_size=100, duration=None,
+            candidates=[cand], per_frame_threshold=10,
+        )
+        assert decision == "auto_skip"
+        assert frames == (1, 1)
+
+    def test_single_frame_legacy_compared_to_multi_frame(self):
+        """Cross-format compare: source has new 3-frame CSV, target row is
+        legacy single-frame. hamming_distance_multi reports (1, 1) — only
+        comparing frame 0. Metadata match → auto_skip on lower confidence."""
+        from agents.tg_transfer.transfer_engine import classify_phash_dedup
+        legacy_cand = self._cand(
+            phash="0000000000000000", file_size=100, duration=10,
+        )
+        decision, _, frames = classify_phash_dedup(
+            phash="0000000000000000,1111111111111111,2222222222222222",
+            file_size=100, duration=10, candidates=[legacy_cand],
+            per_frame_threshold=10,
+        )
+        assert decision == "auto_skip"
+        assert frames == (1, 1)
+
+    def test_picks_best_candidate_full_match_over_partial(self):
+        """If multiple candidates match, prefer the highest-fidelity one so
+        the (matched, total) reported reflects the strongest signal."""
+        from agents.tg_transfer.transfer_engine import classify_phash_dedup
+        partial_cand = self._cand(
+            phash="0000000000000000,eeeeeeeeeeeeeeee,2222222222222222",
+            file_size=100, duration=10, media_id=1,
+        )
+        full_cand = self._cand(
+            phash="0000000000000000,1111111111111111,2222222222222222",
+            file_size=100, duration=10, media_id=2,
+        )
+        decision, row, frames = classify_phash_dedup(
+            phash="0000000000000000,1111111111111111,2222222222222222",
+            file_size=100, duration=10,
+            candidates=[partial_cand, full_cand],
+            per_frame_threshold=10,
+        )
+        assert decision == "auto_skip"
+        assert row["media_id"] == 2
+        assert frames == (3, 3)
+
+    def test_metadata_none_does_not_match_metadata(self):
+        """If either side has duration=None, treat as 'unknown' — don't
+        auto-skip on a phash hit alone, surface as ambiguous so user
+        confirms."""
+        from agents.tg_transfer.transfer_engine import classify_phash_dedup
+        cand = self._cand(
+            phash="0000000000000000,1111111111111111,2222222222222222",
+            file_size=100, duration=None,  # candidate missing duration
+        )
+        decision, _, _ = classify_phash_dedup(
+            phash="0000000000000000,1111111111111111,2222222222222222",
+            file_size=100, duration=10, candidates=[cand],
+            per_frame_threshold=10,
+        )
+        # 3/3 phash but unknown duration → different (let it upload rather
+        # than silently drop).
+        assert decision == "different"
+
+
+@pytest.mark.asyncio
+async def test_transfer_album_marks_dedup_skipped_in_job_messages(
+    engine_with_media_db, mock_client, media_db, db, tmp_path,
+):
+    """Silent-drop regression: when transfer_album drops a file because of a
+    sha256 match, the message must be marked `skipped` in job_messages —
+    NOT left in `pending` for run_batch to blanket-mark `success`. The
+    bug it guards against: a video silently disappeared from an album
+    because a false-positive phash hit dropped it without marking, then
+    run_batch's bulk-mark made it look like a successful upload to the
+    user."""
+    # Pre-populate target with a sha that msg 902 will collide with.
+    existing = await media_db.insert_media(
+        sha256="dup_sha", phash=None, file_type="photo",
+        file_size=10, caption="prior", source_chat="@old",
+        source_msg_id=1, target_chat="@dst", job_id="old_job",
+    )
+    await media_db.mark_uploaded(existing, target_msg_id=77)
+
+    # Create job + job_messages so mark_message UPDATEs hit real rows.
+    job_id = await db.create_job("@src", "@dst", "batch")
+    await db.add_messages(job_id, [901, 902, 903], grouped_ids={
+        901: 90, 902: 90, 903: 90,
+    })
+
+    target_entity = MagicMock()
+    msg1 = _make_message(901, text="cap", grouped_id=90)
+    msg2 = _make_message(902, grouped_id=90)
+    msg3 = _make_message(903, grouped_id=90)
+
+    def _make_iter(msg, offset=0, **kwargs):
+        async def gen():
+            yield bytes([msg.id % 256]) * 10
+        return gen()
+    mock_client.iter_download = _make_iter
+    _stub_album_upload(mock_client)
+
+    with patch(
+        "agents.tg_transfer.transfer_engine.compute_sha256",
+        side_effect=["sha_a", "dup_sha", "sha_c"],
+    ):
+        with patch(
+            "agents.tg_transfer.transfer_engine.compute_phash",
+            return_value=None,
+        ):
+            await engine_with_media_db.transfer_album(
+                target_entity, [msg1, msg2, msg3],
+                target_chat="@dst", source_chat="@src", job_id=job_id,
+            )
+
+    # The dedup-dropped msg 902 must be visible to the caller as skipped,
+    # not silently left pending (which would later be overwritten as
+    # success by the bulk-mark in run_batch).
+    rows = await db.get_grouped_messages(job_id, 90)
+    by_id = {r["message_id"]: r["status"] for r in rows}
+    assert by_id[902] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_run_batch_album_preserves_dedup_skipped_status(
+    engine_with_media_db, mock_client, media_db, db, tmp_path,
+):
+    """End-to-end silent-drop fix: run_batch's grouped-message handling
+    used to bulk-mark every row in the group with the album's overall
+    status, which would overwrite the `skipped` mark transfer_album set
+    on a dedup'd message and re-surface it to the user as `success`.
+    After the fix run_batch must only mark rows that are still
+    `pending`."""
+    # Pre-seed dedup hit
+    existing = await media_db.insert_media(
+        sha256="dup_sha", phash=None, file_type="photo",
+        file_size=10, caption=None, source_chat="@old",
+        source_msg_id=1, target_chat="@dst", job_id="old_job",
+    )
+    await media_db.mark_uploaded(existing, target_msg_id=77)
+
+    job_id = await db.create_job("@src", "@dst", "batch")
+    await db.add_messages(job_id, [901, 902], grouped_ids={
+        901: 90, 902: 90,
+    })
+
+    source_entity = MagicMock()
+    target_entity = MagicMock()
+    msg1 = _make_message(901, text="cap", grouped_id=90)
+    msg2 = _make_message(902, grouped_id=90)
+    by_msg_id = {901: msg1, 902: msg2}
+
+    async def fake_get_messages(_entity, ids=None):
+        return by_msg_id.get(ids)
+    mock_client.get_messages = fake_get_messages
+
+    def _make_iter(m, offset=0, **kwargs):
+        async def gen():
+            yield bytes([m.id % 256]) * 10
+        return gen()
+    mock_client.iter_download = _make_iter
+    _stub_album_upload(mock_client)
+
+    async def _noop(_):
+        return None
+
+    with patch(
+        "agents.tg_transfer.transfer_engine.compute_sha256",
+        side_effect=["sha_a", "dup_sha"],
+    ):
+        with patch(
+            "agents.tg_transfer.transfer_engine.compute_phash",
+            return_value=None,
+        ):
+            await engine_with_media_db.run_batch(
+                job_id, source_entity, target_entity, _noop,
+            )
+
+    # job_messages rows are deleted when the job hits a terminal status,
+    # so observe the bulk-mark vs per-message distinction via the
+    # progress snapshot recorded at completion time.
+    job = await db.get_job(job_id)
+    import json
+    snapshot = json.loads(job["final_progress"])
+    # 1 successful upload (msg 901), 1 dedup-skip (msg 902). The bug
+    # would have shown 2 successes and 0 skipped because run_batch's
+    # bulk-mark wiped transfer_album's per-message `skipped`.
+    assert snapshot["success"] == 1
+    assert snapshot["skipped"] == 1
+    assert snapshot["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_transfer_single_does_not_crash_on_csv_phash_candidate(
+    engine_with_media_db, mock_client, media_db, db, tmp_path,
+):
+    """transfer_single must use the multi-frame classifier when comparing
+    against an uploaded video's CSV phash. The legacy code path called
+    `hamming_distance(phash, row['phash'])` which raises ValueError on
+    `int("h1,h2,h3", 16)` and would crash the per-message dedup
+    check."""
+    existing = await media_db.insert_media(
+        sha256="prior_sha",
+        phash="aaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbb,cccccccccccccccc",
+        file_type="video",
+        file_size=500, caption=None, source_chat="@old",
+        source_msg_id=1, target_chat="@dst", job_id="old_job",
+    )
+    await media_db.mark_uploaded(existing, target_msg_id=88)
+
+    src = MagicMock()
+    target = MagicMock()
+    msg = _make_message(1234, text="cap")
+
+    # Use the photo path to avoid mocking ffprobe.
+    media_path = str(tmp_path / "downloads" / "1234.jpg")
+    os.makedirs(os.path.dirname(media_path), exist_ok=True)
+    with open(media_path, "wb") as f:
+        f.write(b"PHOTO_BYTES")
+    mock_client.download_media = AsyncMock(return_value=media_path)
+    mock_client.send_file = AsyncMock(return_value=MagicMock(id=999))
+
+    with patch(
+        "agents.tg_transfer.transfer_engine.compute_sha256",
+        return_value="new_sha",
+    ):
+        with patch(
+            "agents.tg_transfer.transfer_engine.compute_phash",
+            return_value="dddddddddddddddd",
+        ):
+            # Should not raise ValueError.
+            result = await engine_with_media_db.transfer_single(
+                src, target, msg,
+                target_chat="@dst", source_chat="@src", job_id=None,
+            )
+    assert result.get("ok") is True or result.get("similar") is not None
+
+
+@pytest.mark.asyncio
+async def test_transfer_album_does_not_crash_on_csv_phash(
+    engine_with_media_db, mock_client, media_db, db, tmp_path,
+):
+    """Phase-after-multi-frame regression: video phashes are now stored as
+    CSVs (`"h1,h2,h3"`) but the legacy comparison used
+    `hamming_distance(phash, row["phash"])` which calls `int(csv, 16)`
+    and raises ValueError on commas. That would crash the entire album
+    flow on the first video. Use the multi-frame classifier so CSVs are
+    handled correctly."""
+    # Seed an uploaded video with a 3-frame CSV phash so the dedup loop
+    # hits it as a candidate.
+    existing = await media_db.insert_media(
+        sha256="prior_video_sha",
+        phash="aaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbb,cccccccccccccccc",
+        file_type="video",
+        file_size=500, caption=None, source_chat="@old",
+        source_msg_id=1, target_chat="@dst", job_id="old_job",
+    )
+    await media_db.mark_uploaded(existing, target_msg_id=88)
+
+    job_id = await db.create_job("@src", "@dst", "batch")
+    await db.add_messages(job_id, [801], grouped_ids={801: 80})
+
+    target_entity = MagicMock()
+    msg = _make_message(801, text="cap", grouped_id=80)
+
+    def _make_iter(m, offset=0, **kwargs):
+        async def gen():
+            yield bytes([m.id % 256]) * 10
+        return gen()
+    mock_client.iter_download = _make_iter
+    _stub_album_upload(mock_client)
+
+    # Photo path so we don't have to mock ffprobe; the candidate is a
+    # video CSV phash that the legacy code path would crash on.
+    with patch(
+        "agents.tg_transfer.transfer_engine.compute_sha256",
+        return_value="new_sha",
+    ):
+        with patch(
+            "agents.tg_transfer.transfer_engine.compute_phash",
+            return_value="dddddddddddddddd",
+        ):
+            # Should not raise ValueError despite candidate phash being a CSV.
+            ok = await engine_with_media_db.transfer_album(
+                target_entity, [msg],
+                target_chat="@dst", source_chat="@src", job_id=job_id,
+            )
+    assert ok is True
