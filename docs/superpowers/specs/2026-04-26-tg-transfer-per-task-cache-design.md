@@ -88,7 +88,7 @@ data/tg_transfer/tmp/
 
 維持現狀的 per-artefacts 刪除機制（transfer_album / transfer_single 末尾的 `for p in artefacts: os.remove(p)`），不改動。
 
-job 走到 terminal 狀態（completed/failed/cancelled）時，在 `update_job_status` 那條路徑（或 `_run_batch_background` 末尾）加一行 `os.rmdir(task_dir)`（只刪空目錄，有殘檔就讓孤兒掃描接手）。
+**不主動 rmdir 空目錄**。理由：空目錄只佔一個 inode，沒實質成本；孤兒掃描（3c）下次啟動時必清。為了清空目錄在三個 background 協程加 finally 是過度工程。空目錄 = 待孤兒掃描清的下一輪。
 
 ### 5. 既有誤導註解清理
 
