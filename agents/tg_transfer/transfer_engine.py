@@ -347,12 +347,7 @@ class TransferEngine:
                     if file_type == "photo":
                         phash = compute_phash(path)
                     elif file_type == "video":
-                        frame_path = os.path.join(
-                            self.tmp_dir,
-                            f"{msg.id}_{uuid.uuid4().hex[:8]}.frame.jpg",
-                        )
-                        artefacts.append(frame_path)
-                        phash = await compute_phash_video(path, frame_path)
+                        phash = await compute_phash_video(path, self.tmp_dir)
 
                     # sha256 dedup
                     if await self.media_db.find_by_sha256(sha256, target_chat):
@@ -604,9 +599,8 @@ class TransferEngine:
         base = f"{message.id}_{uuid.uuid4().hex[:8]}"
         ext = _derive_upload_ext(message)
         media_path = os.path.join(self.tmp_dir, f"{base}{ext}")
-        frame_path = os.path.join(self.tmp_dir, f"{base}.frame.jpg")
         thumb_path_target = os.path.join(self.tmp_dir, f"{base}.thumb.jpg")
-        artefacts = [media_path, frame_path, thumb_path_target]
+        artefacts = [media_path, thumb_path_target]
         media_id = None
 
         try:
@@ -630,7 +624,7 @@ class TransferEngine:
             file_type = self._detect_file_type(message)
             phash = None
             if file_type == "video":
-                phash = await compute_phash_video(path, frame_path)
+                phash = await compute_phash_video(path, self.tmp_dir)
             elif file_type == "photo":
                 phash = compute_phash(path)
 
