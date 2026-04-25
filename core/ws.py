@@ -13,6 +13,7 @@ class MsgType(str, Enum):
     # Hub → Agent
     TASK = "task"
     CANCEL = "cancel"
+    TASK_DELETED = "task_deleted"
 
     # Agent → Hub
     RESULT = "result"

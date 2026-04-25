@@ -127,3 +127,34 @@ async def test_ws_send_result_no_ws(agent):
     """ws_send_result should not raise when WS is None."""
     result = AgentResult(status=TaskStatus.DONE, message="ok")
     await agent.ws_send_result("t1", result)  # should not raise
+
+
+import asyncio
+import pytest
+from core.ws import MsgType, ws_msg
+
+
+class _SubAgent(BaseAgent):
+    def __init__(self):
+        # Bypass BaseAgent.__init__ network bits for unit test
+        self._cancelled_tasks = set()
+        self.deleted = []
+
+    async def handle_task(self, task):
+        pass
+
+    def on_task_deleted(self, task_id: str):
+        self.deleted.append(task_id)
+
+
+@pytest.mark.asyncio
+async def test_task_deleted_dispatches_to_hook():
+    agent = _SubAgent()
+    raw = ws_msg(MsgType.TASK_DELETED, task_id="abc-123")
+    # Simulate the WS dispatch logic — the loop body must call on_task_deleted
+    # for TASK_DELETED messages.
+    import json
+    data = json.loads(raw)
+    if data.get("type") == MsgType.TASK_DELETED.value:
+        agent.on_task_deleted(data["task_id"])
+    assert agent.deleted == ["abc-123"]

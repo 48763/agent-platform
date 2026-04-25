@@ -79,6 +79,12 @@ class BaseAgent(ABC):
         """Hook for subclasses to handle task cancellation."""
         pass
 
+    def on_task_deleted(self, task_id: str):
+        """Hook for subclasses to handle permanent task deletion. Called when
+        the hub deletes a conversation — agent should release any task-scoped
+        resources (cache directories, DB rows tied to this task)."""
+        pass
+
     async def register(self, actual_port: int) -> None:
         info = AgentInfo(
             name=self.name,
@@ -143,6 +149,12 @@ class BaseAgent(ABC):
                                         self._cancelled_tasks.add(task_id)
                                         self.on_cancel(task_id)
                                         logger.info(f"Task cancelled: {task_id}")
+
+                                elif msg_type == MsgType.TASK_DELETED.value:
+                                    task_id = data.get("task_id")
+                                    if task_id:
+                                        self.on_task_deleted(task_id)
+                                        logger.info(f"Task deleted: {task_id}")
 
                             elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSE):
                                 break
