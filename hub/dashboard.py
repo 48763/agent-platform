@@ -477,13 +477,21 @@ async def handle_task_delete(request: web.Request) -> web.Response:
     tm = request.app["task_manager"]
     task = tm.get_task(task_id)
 
-    # Cancel running agent before deleting — same logic as handle_task_close
-    if task and task["status"] in ("working", "waiting_input", "waiting_approval"):
-        registry = request.app["registry"]
+    registry = request.app["registry"]
+    if task:
         agent_ws = registry.get_ws(task["agent_name"])
         if agent_ws:
             from core.ws import ws_msg, MsgType
-            await agent_ws.send_str(ws_msg(MsgType.CANCEL, task_id=task_id))
+            # CANCEL only for in-flight states (matches handle_task_close
+            # semantics — stop work in progress).
+            if task["status"] in ("working", "waiting_input", "waiting_approval"):
+                await agent_ws.send_str(ws_msg(MsgType.CANCEL, task_id=task_id))
+            # TASK_DELETED unconditionally — agent must release task-scoped
+            # resources (cache dir, DB rows) regardless of state. Offline
+            # agents miss this; orphan scan on next startup catches up.
+            await agent_ws.send_str(
+                ws_msg(MsgType.TASK_DELETED, task_id=task_id),
+            )
 
     tm._conn.execute("DELETE FROM task_messages WHERE task_id = ?", (task_id,))
     tm._conn.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))

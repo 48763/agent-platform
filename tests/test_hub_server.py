@@ -130,3 +130,46 @@ async def test_progress_on_closed_task_cancels_agent_and_drops_message(tmp_db):
     parsed = _json.loads(sent[0])
     assert parsed["type"] == "cancel"
     assert parsed["task_id"] == task["task_id"]
+
+
+@pytest.mark.asyncio
+async def test_handle_task_delete_sends_task_deleted_to_agent(tmp_path):
+    """Deleting a conversation must push TASK_DELETED to the bound agent
+    so the agent can rmtree its task-scoped cache and DB rows.
+    TASK_DELETED is sent unconditionally (regardless of task status);
+    CANCEL is only sent for in-flight states."""
+    import json
+    from aiohttp.test_utils import make_mocked_request
+    from hub.task_manager import TaskManager
+    from hub.dashboard import handle_task_delete
+
+    tm = TaskManager(db_path=str(tmp_path / "tasks.db"))
+    task = tm.create_task(
+        agent_name="tg_transfer", chat_id=12345, content="batch x to y",
+    )
+
+    sent = []
+
+    class FakeWS:
+        async def send_str(self, s):
+            sent.append(s)
+
+    class FakeRegistry:
+        def get_ws(self, name):
+            return FakeWS()
+
+    app = {"task_manager": tm, "registry": FakeRegistry()}
+
+    request = make_mocked_request(
+        "POST", f"/dashboard/task/{task['task_id']}/delete",
+        match_info={"task_id": task["task_id"]},
+        app=app,
+    )
+    resp = await handle_task_delete(request)
+    assert resp.status == 200
+
+    decoded = [json.loads(s) for s in sent]
+    assert any(
+        m.get("type") == "task_deleted" and m.get("task_id") == task["task_id"]
+        for m in decoded
+    ), f"TASK_DELETED not in sent: {decoded}"
