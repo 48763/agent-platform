@@ -1394,9 +1394,11 @@ class TGTransferAgent(BaseAgent):
         target_entity = await resolve_chat(self.tg_client, job["target_chat"])
         chat_id = self._current_chat_id.get(task_id, 0)
 
-        # If the reply came in under a new task_id (e.g. hub created a fresh
-        # task), rewrite the DB binding so future progress goes to the new task.
-        if job.get("task_id") != task_id or job.get("chat_id") != chat_id:
+        # task_id is invariant per the _pending_jobs guarantee (hub's reply
+        # routes back under the same task_id we registered, hub never reuses
+        # a task_id, and _pending_jobs is keyed by task_id). Only chat_id
+        # may diverge if the user replied from a different chat.
+        if job.get("chat_id") != chat_id:
             await self.db.update_job_binding(job_id, task_id, chat_id)
 
         await self.ws_send_progress(task_id, chat_id, "繼續搬移中...")
