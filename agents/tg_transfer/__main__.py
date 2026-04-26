@@ -247,6 +247,15 @@ class TGTransferAgent(BaseAgent):
         bg = self._bg_tasks.pop(task_id, None)
         if bg is not None and not bg.done():
             bg.cancel()
+            # Await the cancellation to guarantee the bg coroutine has fully
+            # stopped before we proceed to remove its files.
+            try:
+                await bg
+            except (asyncio.CancelledError, Exception):
+                # CancelledError is expected; other exceptions inside the bg task
+                # were already that task's problem to log. We just need to be sure
+                # it's stopped before we touch its files.
+                pass
         # Mark cancelled so any in-flight engine.run_batch loop bails out.
         # Look up the job_id for this task so engine.cancel_job is keyed
         # correctly (engine cancels by job_id, not task_id).
@@ -269,9 +278,11 @@ class TGTransferAgent(BaseAgent):
         # Remove the per-task cache directory.
         task_dir = os.path.join(self.engine.tmp_dir, task_id)
         try:
-            shutil.rmtree(task_dir, ignore_errors=True)
+            shutil.rmtree(task_dir)
+        except FileNotFoundError:
+            pass  # already gone, nothing to do
         except Exception as e:
-            logger.warning(f"rmtree({task_dir}) failed: {e}")
+            logger.warning(f"rmtree({task_dir}) failed (will retry on orphan scan): {e}")
 
         logger.info(f"Cleaned up cache + DB for deleted task {task_id}")
 
