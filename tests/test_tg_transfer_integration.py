@@ -197,3 +197,70 @@ async def test_orphan_scan_ignores_non_directory_entries(tmp_path):
 
     # Files should still be there — orphan scan is per-directory only
     assert os.path.exists(os.path.join(agent.engine.tmp_dir, "legacy.mp4"))
+
+
+@pytest.mark.asyncio
+async def test_legacy_migration_clears_root_files_and_partials(tmp_path):
+    """First startup with the new layout must:
+    - delete every file at the root of tmp/ (the old flat layout)
+    - reset every partial_path/downloaded_bytes in job_messages
+    - write the .migrated_v2 flag so it doesn't re-run."""
+    agent = await _build_test_agent(tmp_path)
+    os.makedirs(agent.engine.tmp_dir, exist_ok=True)
+
+    # Old flat-layout artefacts
+    legacy_a = os.path.join(agent.engine.tmp_dir, "32171_4e0a9e2d.mp4")
+    legacy_b = os.path.join(agent.engine.tmp_dir, "32172_d8ca1764.mp4")
+    with open(legacy_a, "wb") as f:
+        f.write(b"x" * 100)
+    with open(legacy_b, "wb") as f:
+        f.write(b"x" * 100)
+
+    # An already-correct subdir — must NOT be touched
+    keep_dir = os.path.join(agent.engine.tmp_dir, "task-keep")
+    os.makedirs(keep_dir, exist_ok=True)
+    with open(os.path.join(keep_dir, "y.bin"), "wb") as f:
+        f.write(b"y")
+
+    # Existing partial in DB (legacy absolute path)
+    job_id = await agent.db.create_job(
+        source_chat="s", target_chat="t", mode="batch", task_id="task-keep",
+    )
+    await agent.db.add_messages(job_id, [42])
+    await agent.db.set_partial(job_id, 42, legacy_a, 100)
+
+    await agent._migrate_legacy_tmp_layout()
+
+    # Root-level files removed
+    assert not os.path.exists(legacy_a)
+    assert not os.path.exists(legacy_b)
+    # Subdir survives
+    assert os.path.exists(os.path.join(keep_dir, "y.bin"))
+    # Partial reset
+    msg = await agent.db.get_message(job_id, 42)
+    assert msg["partial_path"] is None
+    assert msg["downloaded_bytes"] == 0
+    # Flag written
+    assert os.path.exists(
+        os.path.join(agent.engine.tmp_dir, ".migrated_v2"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_migration_idempotent_when_flag_present(tmp_path):
+    """If .migrated_v2 is present, migration must be a no-op even when
+    root-level files exist (those would now be from a different cause and
+    should not be silently nuked)."""
+    agent = await _build_test_agent(tmp_path)
+    os.makedirs(agent.engine.tmp_dir, exist_ok=True)
+    flag = os.path.join(agent.engine.tmp_dir, ".migrated_v2")
+    with open(flag, "wb") as f:
+        f.write(b"")
+
+    sentinel = os.path.join(agent.engine.tmp_dir, "post_migration.bin")
+    with open(sentinel, "wb") as f:
+        f.write(b"x")
+
+    await agent._migrate_legacy_tmp_layout()
+
+    assert os.path.exists(sentinel)  # untouched

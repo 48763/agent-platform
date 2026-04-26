@@ -111,6 +111,8 @@ class TGTransferAgent(BaseAgent):
         """
         first_connect = not getattr(self, '_resumed', False)
         self._resumed = True
+        if first_connect:
+            await self._migrate_legacy_tmp_layout()
         await self._resume_interrupted_jobs(first_connect=first_connect)
         if first_connect:
             await self._scan_orphan_task_dirs()
@@ -290,6 +292,58 @@ class TGTransferAgent(BaseAgent):
             logger.warning(f"rmtree({task_dir}) failed (will retry on orphan scan): {e}")
 
         logger.info(f"Cleaned up cache + DB for deleted task {task_id}")
+
+    async def _migrate_legacy_tmp_layout(self):
+        """One-shot migration from the flat tmp/ layout to per-task subdirs.
+
+        Pre-Task-3, downloads landed directly in tmp_dir as `{msg}_{uuid}.ext`.
+        After Task 3, every file is under `tmp/{task_id}/`. Root-level files
+        from the old layout can't be reliably re-attributed to a task, so we:
+
+        1. Remove every regular file at the root of tmp_dir.
+        2. Reset all job_messages.partial_path / downloaded_bytes — those
+           rows referenced absolute paths under the flat layout that we just
+           wiped, so resume must re-download from byte 0.
+        3. Drop a `.migrated_v2` flag file so subsequent boots skip this.
+
+        Subdirectories are left alone — they're either pre-existing manual
+        creations (rare) or the new per-task layout (after a partial deploy).
+        """
+        tmp_root = self.engine.tmp_dir
+        if not os.path.isdir(tmp_root):
+            os.makedirs(tmp_root, exist_ok=True)
+        flag = os.path.join(tmp_root, ".migrated_v2")
+        if os.path.exists(flag):
+            return
+
+        removed = 0
+        for entry in os.listdir(tmp_root):
+            if entry.startswith("."):
+                continue
+            full = os.path.join(tmp_root, entry)
+            if os.path.isfile(full):
+                try:
+                    os.remove(full)
+                    removed += 1
+                except Exception as e:
+                    logger.warning(f"Legacy migration: failed to remove {full}: {e}")
+
+        try:
+            reset_rows = await self.db.clear_all_partials()
+        except Exception as e:
+            logger.warning(f"Legacy migration: clear_all_partials failed: {e}")
+            reset_rows = 0
+
+        try:
+            with open(flag, "w") as f:
+                f.write("v2\n")
+        except Exception as e:
+            logger.warning(f"Legacy migration: failed to write flag: {e}")
+
+        logger.info(
+            f"Legacy migration done: removed {removed} root-level files, "
+            f"reset {reset_rows} partial-download rows"
+        )
 
     async def _scan_orphan_task_dirs(self):
         """Remove tmp/{task_id}/ directories whose task_id has no active job.
