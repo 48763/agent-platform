@@ -427,7 +427,7 @@ class TransferEngine:
         media_ids: list[int] = []
 
         try:
-            # Parallel download into flat tmp_dir with unique per-file names.
+            # Parallel download into task_dir with unique per-file names.
             planned_paths = []
             for msg in messages:
                 base = f"{msg.id}_{uuid.uuid4().hex[:8]}"
@@ -776,7 +776,7 @@ class TransferEngine:
                     "ok": False, "dedup": False, "similar": None,
                     "ambiguous": True,
                 }
-        # Flat layout: per-message filenames share one directory to keep
+        # Per-task layout: per-message filenames share one directory to keep
         # filesystem metadata churn (mkdir/rmtree per message) minimal.
         base = f"{message.id}_{uuid.uuid4().hex[:8]}"
         ext = _derive_upload_ext(message)

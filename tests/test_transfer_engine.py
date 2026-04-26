@@ -2547,12 +2547,16 @@ async def test_transfer_media_writes_into_task_subdir(tmp_path, monkeypatch):
     db = TransferDB(str(tmp_path / "t.db"))
     await db.init()
 
+    captured_paths = []
+
     class FakeClient:
         async def download_media(self, msg, file):
+            captured_paths.append(file)
             with open(file, "wb") as f:
                 f.write(b"x" * 16)
             return file
 
+        # Bypass upload — this test only verifies download path construction.
         async def send_file(self, *args, **kwargs):
             return type("M", (), {"id": 1})()
 
@@ -2570,7 +2574,7 @@ async def test_transfer_media_writes_into_task_subdir(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "should_skip", lambda _m: False)
     monkeypatch.setattr(engine, "_detect_file_type", lambda _m: "photo")
     # Skip pre-dedup so we don't need a media_db
-    result = await engine._transfer_media(
+    await engine._transfer_media(
         target_entity=None, message=FakeMsg(),
         target_chat="t", source_chat="s",
         job_id=None, skip_pre_dedup=True,
@@ -2578,7 +2582,10 @@ async def test_transfer_media_writes_into_task_subdir(tmp_path, monkeypatch):
     )
 
     expected_dir = os.path.join(str(tmp_path / "tmp"), "task-ABC")
-    # Even if upload was no-op, the download path should have been under
-    # the task subdir. Check that the directory exists (mkdir was called).
     assert os.path.isdir(expected_dir)
+    assert captured_paths, "download_media was never called"
+    for p in captured_paths:
+        assert p.startswith(expected_dir + os.sep), (
+            f"{p!r} not under {expected_dir!r}"
+        )
     await db.close()
