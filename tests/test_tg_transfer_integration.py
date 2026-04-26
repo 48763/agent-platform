@@ -1,4 +1,5 @@
 """Integration tests for TG Transfer Agent — tests the full flow without real Telegram."""
+import os
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock
@@ -90,3 +91,59 @@ async def test_config_persistence(db):
 
     await db.set_config("default_target_chat", "@second")
     assert await db.get_config("default_target_chat") == "@second"
+
+
+async def _build_test_agent(tmp_path):
+    """Bare-minimum TGTransferAgent for unit tests: real DB + engine,
+    fake TG client, no WS, no Hub."""
+    from agents.tg_transfer.__main__ import TGTransferAgent
+    from agents.tg_transfer.db import TransferDB
+    from agents.tg_transfer.transfer_engine import TransferEngine
+
+    agent = TGTransferAgent.__new__(TGTransferAgent)
+    agent._pending_jobs = {}
+    agent._bg_tasks = {}
+    agent._current_chat_id = {}
+    agent._search_state = {}
+    agent._awaiting_target = {}
+    agent._cancelled_tasks = set()
+    agent.db = TransferDB(str(tmp_path / "t.db"))
+    await agent.db.init()
+    agent.engine = TransferEngine(
+        client=None, db=agent.db, tmp_dir=str(tmp_path / "tmp"),
+    )
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_on_task_deleted_removes_dir_and_db_rows(tmp_path):
+    """Calling on_task_deleted must rmtree tmp/{task_id}/ and delete the
+    task's jobs + job_messages, plus drop in-memory state."""
+    import shutil
+    from agents.tg_transfer.__main__ import TGTransferAgent
+
+    # Set up: real TransferDB with one bound job, and a tmp/{task_id}/ dir
+    # containing a fake artefact.
+    agent = await _build_test_agent(tmp_path)
+    job_id = await agent.db.create_job(
+        source_chat="s", target_chat="t", mode="batch", task_id="task-DEL",
+    )
+    await agent.db.add_messages(job_id, [1])
+
+    task_dir = os.path.join(agent.engine.tmp_dir, "task-DEL")
+    os.makedirs(task_dir, exist_ok=True)
+    with open(os.path.join(task_dir, "leftover.mp4"), "wb") as f:
+        f.write(b"x")
+
+    agent._pending_jobs["task-DEL"] = job_id
+    agent._current_chat_id["task-DEL"] = 999
+
+    await agent._on_task_deleted_async("task-DEL")
+
+    # Directory gone
+    assert not os.path.exists(task_dir)
+    # DB rows gone
+    assert await agent.db.get_job(job_id) is None
+    # In-memory binding gone
+    assert "task-DEL" not in agent._pending_jobs
+    assert "task-DEL" not in agent._current_chat_id

@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sys
 import logging
 
@@ -233,6 +234,46 @@ class TGTransferAgent(BaseAgent):
         if task_id in self._pending_jobs:
             job_id = self._pending_jobs[task_id]
             self.engine.cancel_job(job_id)
+
+    def on_task_deleted(self, task_id: str):
+        """Hub deleted this conversation. Schedule async cleanup of the
+        task-scoped cache directory and DB rows. Synchronous-from-WS-loop
+        wrapper around _on_task_deleted_async."""
+        asyncio.create_task(self._on_task_deleted_async(task_id))
+
+    async def _on_task_deleted_async(self, task_id: str):
+        # Cancel any live background coroutine first so it doesn't write
+        # into a directory we're about to remove.
+        bg = self._bg_tasks.pop(task_id, None)
+        if bg is not None and not bg.done():
+            bg.cancel()
+        # Mark cancelled so any in-flight engine.run_batch loop bails out.
+        # Look up the job_id for this task so engine.cancel_job is keyed
+        # correctly (engine cancels by job_id, not task_id).
+        job_id = self._pending_jobs.pop(task_id, None)
+        if job_id:
+            self.engine.cancel_job(job_id)
+
+        # Drop other in-memory bindings.
+        self._current_chat_id.pop(task_id, None)
+        self._search_state.pop(task_id, None)
+        self._awaiting_target.pop(task_id, None)
+
+        # Remove DB rows. Errors here are non-fatal; orphan scan on next
+        # startup will retry.
+        try:
+            await self.db.delete_jobs_by_task(task_id)
+        except Exception as e:
+            logger.warning(f"delete_jobs_by_task({task_id}) failed: {e}")
+
+        # Remove the per-task cache directory.
+        task_dir = os.path.join(self.engine.tmp_dir, task_id)
+        try:
+            shutil.rmtree(task_dir, ignore_errors=True)
+        except Exception as e:
+            logger.warning(f"rmtree({task_dir}) failed: {e}")
+
+        logger.info(f"Cleaned up cache + DB for deleted task {task_id}")
 
     async def _dispatch(self, task: TaskRequest) -> AgentResult:
         content = task.content
