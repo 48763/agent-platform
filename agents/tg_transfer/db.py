@@ -170,6 +170,50 @@ class TransferDB:
         )
         await self._db.commit()
 
+    async def delete_jobs_by_task(self, task_id: str) -> int:
+        """Delete every job (and its job_messages) bound to `task_id`.
+        Returns number of `jobs` rows removed.
+
+        Used when the hub deletes a conversation: the agent must release the
+        task's DB rows so resume scans don't try to revive them, and the
+        per-task cache directory has no orphan jobs pointing at it."""
+        async with self._db.execute(
+            "SELECT job_id FROM jobs WHERE task_id = ?", (task_id,),
+        ) as cur:
+            job_ids = [row["job_id"] for row in await cur.fetchall()]
+        for jid in job_ids:
+            await self._db.execute(
+                "DELETE FROM job_messages WHERE job_id = ?", (jid,),
+            )
+            await self._db.execute(
+                "DELETE FROM jobs WHERE job_id = ?", (jid,),
+            )
+        await self._db.commit()
+        return len(job_ids)
+
+    async def get_active_task_ids(self) -> set[str]:
+        """All task_ids tied to jobs in non-terminal status. Used by the
+        orphan-scan fallback: any tmp/{task_id}/ directory whose task_id is
+        NOT in this set was already abandoned and can be removed."""
+        async with self._db.execute(
+            "SELECT DISTINCT task_id FROM jobs "
+            "WHERE task_id IS NOT NULL AND status NOT IN "
+            "('completed', 'failed', 'cancelled')"
+        ) as cur:
+            return {row["task_id"] for row in await cur.fetchall()}
+
+    async def clear_all_partials(self) -> int:
+        """Reset every job_messages.partial_path / downloaded_bytes.
+        Used during the legacy-layout migration: old absolute paths point at
+        the flat tmp/ layout that no longer exists, so we force a clean
+        re-download on the next attempt. Returns row count touched."""
+        cur = await self._db.execute(
+            "UPDATE job_messages SET partial_path = NULL, downloaded_bytes = 0 "
+            "WHERE partial_path IS NOT NULL",
+        )
+        await self._db.commit()
+        return cur.rowcount or 0
+
     # -- Messages --
 
     async def add_messages(

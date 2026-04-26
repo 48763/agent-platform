@@ -415,3 +415,78 @@ class TestJobTerminalCleanup:
         assert (await db.get_progress(job_id))["total"] == 3
         await db.update_job_status(job_id, "paused")
         assert (await db.get_progress(job_id))["total"] == 3
+
+
+@pytest.mark.asyncio
+async def test_delete_jobs_by_task_removes_jobs_and_messages(tmp_path):
+    db = TransferDB(str(tmp_path / "t.db"))
+    await db.init()
+    job_id = await db.create_job(
+        source_chat="s", target_chat="t", mode="batch", task_id="task-A",
+    )
+    await db.add_messages(job_id, [1, 2, 3])
+
+    deleted = await db.delete_jobs_by_task("task-A")
+
+    assert deleted == 1  # one job
+    assert await db.get_job(job_id) is None
+    # job_messages must also be gone
+    assert await db.get_message(job_id, 1) is None
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_jobs_by_task_unknown_task_returns_zero(tmp_path):
+    db = TransferDB(str(tmp_path / "t.db"))
+    await db.init()
+    deleted = await db.delete_jobs_by_task("never-existed")
+    assert deleted == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_get_active_task_ids_filters_terminal(tmp_path):
+    db = TransferDB(str(tmp_path / "t.db"))
+    await db.init()
+    j_running = await db.create_job(
+        source_chat="s", target_chat="t", mode="batch", task_id="t-run",
+    )
+    await db.update_job_status(j_running, "running")
+    j_paused = await db.create_job(
+        source_chat="s", target_chat="t", mode="batch", task_id="t-paused",
+    )
+    await db.update_job_status(j_paused, "paused")
+    j_done = await db.create_job(
+        source_chat="s", target_chat="t", mode="batch", task_id="t-done",
+    )
+    await db.update_job_status(j_done, "completed")
+
+    ids = await db.get_active_task_ids()
+
+    assert "t-run" in ids
+    assert "t-paused" in ids
+    assert "t-done" not in ids
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_clear_all_partials_resets_every_partial(tmp_path):
+    db = TransferDB(str(tmp_path / "t.db"))
+    await db.init()
+    j = await db.create_job(
+        source_chat="s", target_chat="t", mode="batch", task_id="x",
+    )
+    await db.add_messages(j, [10, 20])
+    await db.set_partial(j, 10, "/some/path", 1024)
+    await db.set_partial(j, 20, "/other/path", 2048)
+
+    rows = await db.clear_all_partials()
+
+    assert rows == 2
+    msg10 = await db.get_message(j, 10)
+    msg20 = await db.get_message(j, 20)
+    assert msg10["partial_path"] is None
+    assert msg10["downloaded_bytes"] == 0
+    assert msg20["partial_path"] is None
+    assert msg20["downloaded_bytes"] == 0
+    await db.close()
