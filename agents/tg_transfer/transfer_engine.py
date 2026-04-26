@@ -1121,6 +1121,7 @@ class TransferEngine:
                                 target_chat=job["target_chat"],
                                 source_chat=job["source_chat"],
                                 job_id=job_id,
+                                task_id=job.get("task_id"),
                             )
                             status = "success" if ok else "failed"
                     elif messages and self.should_skip(messages[0]):
@@ -1171,6 +1172,7 @@ class TransferEngine:
                             target_chat=job["target_chat"],
                             source_chat=job["source_chat"],
                             job_id=job_id,
+                            task_id=job.get("task_id"),
                         )
                         if result["dedup"]:
                             await self.db.mark_message(job_id, message_id, "skipped")

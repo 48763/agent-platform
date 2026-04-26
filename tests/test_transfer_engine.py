@@ -1431,7 +1431,7 @@ async def test_size_limit_is_read_dynamically_per_message(
 
     mock_client.get_messages = fake_get_messages
 
-    async def fake_transfer_single(src, tgt, msg, target_chat="", source_chat="", job_id=None):
+    async def fake_transfer_single(src, tgt, msg, target_chat="", source_chat="", job_id=None, task_id=None):
         if msg.id == 4000:
             # Lower the limit before msg2 is processed.
             await db.set_config("size_limit_mb", "50")
@@ -1526,7 +1526,7 @@ async def test_run_batch_catches_oversize_mid_stream_and_skips(
 
     mock_client.get_messages = AsyncMock(return_value=msg)
 
-    async def boom(source, target, message, target_chat="", source_chat="", job_id=None):
+    async def boom(source, target, message, target_chat="", source_chat="", job_id=None, task_id=None):
         raise OverSizeLimit("downloaded exceeds live limit")
 
     engine.transfer_single = boom

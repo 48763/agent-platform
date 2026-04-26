@@ -361,7 +361,10 @@ class TGTransferAgent(BaseAgent):
                     status=TaskStatus.DONE, message="已跳過（超過大小門檻）",
                 )
 
-            ok = await self.engine.transfer_album(target_entity, album_msgs)
+            ok = await self.engine.transfer_album(
+                target_entity, album_msgs,
+                task_id=task.task_id,
+            )
             count = len(album_msgs)
         else:
             if self.engine.should_skip(msg):
@@ -369,6 +372,7 @@ class TGTransferAgent(BaseAgent):
             result = await self.engine.transfer_single(
                 source_entity, target_entity, msg,
                 target_chat=target_chat, source_chat=str(chat_id), job_id=None,
+                task_id=task.task_id,
             )
             if result.get("over_limit"):
                 return AgentResult(
@@ -1079,6 +1083,7 @@ class TGTransferAgent(BaseAgent):
                                 source_chat=source_chat,
                                 job_id=job_id,
                                 skip_pre_dedup=True,
+                                task_id=task_id,
                             )
                             if result.get("ok"):
                                 await self.db.mark_message(
@@ -1209,6 +1214,7 @@ class TGTransferAgent(BaseAgent):
                         source_chat=job["source_chat"],
                         job_id=job_id,
                         skip_pre_dedup=True,
+                        task_id=task_id,
                     )
                     if result.get("ok"):
                         uploaded += 1
