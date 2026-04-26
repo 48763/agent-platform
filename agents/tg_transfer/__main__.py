@@ -105,10 +105,15 @@ class TGTransferAgent(BaseAgent):
         Re-spawn is guarded by a liveness check on the tracked asyncio.Task so
         healthy jobs aren't double-spawned. Paused-job user reminders only fire
         on the first connect to avoid spamming on every reconnect.
+
+        Orphan scan runs once on first connect — it's idempotent but only
+        useful when the agent has just (re)started.
         """
         first_connect = not getattr(self, '_resumed', False)
         self._resumed = True
         await self._resume_interrupted_jobs(first_connect=first_connect)
+        if first_connect:
+            await self._scan_orphan_task_dirs()
 
     def _spawn_batch_bg(self, task_id: str, job_id: str, job: dict,
                          source_entity, target_entity, chat_id: int) -> asyncio.Task:
@@ -285,6 +290,38 @@ class TGTransferAgent(BaseAgent):
             logger.warning(f"rmtree({task_dir}) failed (will retry on orphan scan): {e}")
 
         logger.info(f"Cleaned up cache + DB for deleted task {task_id}")
+
+    async def _scan_orphan_task_dirs(self):
+        """Remove tmp/{task_id}/ directories whose task_id has no active job.
+
+        Rationale: hub may have deleted a conversation while this agent was
+        offline, so we never received TASK_DELETED. On startup, anything
+        not pointed at by an active job in the DB is dead weight — clear it.
+
+        Only operates on direct subdirectories of tmp_dir. Ignores files at
+        the root level (those are handled by the legacy migration in
+        Task 8) and dotfiles (e.g. .migrated_v2 flag)."""
+        tmp_root = self.engine.tmp_dir
+        if not os.path.isdir(tmp_root):
+            return
+        try:
+            active_ids = await self.db.get_active_task_ids()
+        except Exception as e:
+            logger.warning(f"get_active_task_ids failed during orphan scan: {e}")
+            return
+        for entry in os.listdir(tmp_root):
+            if entry.startswith("."):
+                continue
+            full = os.path.join(tmp_root, entry)
+            if not os.path.isdir(full):
+                continue
+            if entry in active_ids:
+                continue
+            try:
+                shutil.rmtree(full, ignore_errors=True)
+                logger.info(f"Orphan scan removed {full}")
+            except Exception as e:
+                logger.warning(f"Orphan scan failed to remove {full}: {e}")
 
     async def _dispatch(self, task: TaskRequest) -> AgentResult:
         content = task.content

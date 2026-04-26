@@ -147,3 +147,53 @@ async def test_on_task_deleted_removes_dir_and_db_rows(tmp_path):
     # In-memory binding gone
     assert "task-DEL" not in agent._pending_jobs
     assert "task-DEL" not in agent._current_chat_id
+
+
+@pytest.mark.asyncio
+async def test_orphan_scan_removes_dir_with_no_active_job(tmp_path):
+    """tmp/{task_id}/ directories whose task_id has no active job in the
+    DB must be removed on startup (covers the agent-was-offline-when-hub-
+    deleted case)."""
+    agent = await _build_test_agent(tmp_path)
+
+    # Active job — its dir should survive
+    active_job = await agent.db.create_job(
+        source_chat="s", target_chat="t", mode="batch", task_id="active",
+    )
+    await agent.db.update_job_status(active_job, "running")
+    os.makedirs(os.path.join(agent.engine.tmp_dir, "active"), exist_ok=True)
+
+    # Completed job's task_id — orphan, dir should go
+    done_job = await agent.db.create_job(
+        source_chat="s", target_chat="t", mode="batch", task_id="done",
+    )
+    await agent.db.update_job_status(done_job, "completed")
+    os.makedirs(os.path.join(agent.engine.tmp_dir, "done"), exist_ok=True)
+
+    # Wholly unknown task_id — orphan, dir should go
+    os.makedirs(os.path.join(agent.engine.tmp_dir, "stranger"), exist_ok=True)
+
+    await agent._scan_orphan_task_dirs()
+
+    assert os.path.isdir(os.path.join(agent.engine.tmp_dir, "active"))
+    assert not os.path.exists(os.path.join(agent.engine.tmp_dir, "done"))
+    assert not os.path.exists(os.path.join(agent.engine.tmp_dir, "stranger"))
+
+
+@pytest.mark.asyncio
+async def test_orphan_scan_ignores_non_directory_entries(tmp_path):
+    """If something weird is sitting in tmp_dir root (legacy file, dotfile),
+    the orphan scan must not crash. It should ignore non-directories."""
+    agent = await _build_test_agent(tmp_path)
+    os.makedirs(agent.engine.tmp_dir, exist_ok=True)
+    # Stray legacy file
+    with open(os.path.join(agent.engine.tmp_dir, "legacy.mp4"), "wb") as f:
+        f.write(b"x")
+    # Stray dotfile (e.g. .DS_Store, migration flag)
+    with open(os.path.join(agent.engine.tmp_dir, ".something"), "wb") as f:
+        f.write(b"")
+
+    await agent._scan_orphan_task_dirs()  # must not raise
+
+    # Files should still be there — orphan scan is per-directory only
+    assert os.path.exists(os.path.join(agent.engine.tmp_dir, "legacy.mp4"))
