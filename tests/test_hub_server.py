@@ -173,3 +173,58 @@ async def test_handle_task_delete_sends_task_deleted_to_agent(tmp_path):
         m.get("type") == "task_deleted" and m.get("task_id") == task["task_id"]
         for m in decoded
     ), f"TASK_DELETED not in sent: {decoded}"
+
+
+@pytest.mark.asyncio
+async def test_handle_task_delete_sends_task_deleted_even_for_terminal_task(tmp_path):
+    """TASK_DELETED must be sent even when task is NOT in an in-flight state.
+    CANCEL stays gated by status, but TASK_DELETED is unconditional so the
+    agent always cleans up cache + DB rows regardless of when the user deletes."""
+    import json
+    from aiohttp.test_utils import make_mocked_request
+    from hub.task_manager import TaskManager
+    from hub.dashboard import handle_task_delete
+
+    tm = TaskManager(db_path=str(tmp_path / "tasks.db"))
+    task = tm.create_task(
+        agent_name="tg_transfer", chat_id=12345, content="batch x to y",
+    )
+
+    # Force task into terminal 'done' state before deletion
+    tm._conn.execute(
+        "UPDATE tasks SET status = 'done' WHERE task_id = ?",
+        (task["task_id"],),
+    )
+    tm._conn.commit()
+
+    sent = []
+
+    class FakeWS:
+        async def send_str(self, s):
+            sent.append(s)
+
+    class FakeRegistry:
+        def get_ws(self, name):
+            return FakeWS()
+
+    app = {"task_manager": tm, "registry": FakeRegistry()}
+
+    request = make_mocked_request(
+        "POST", f"/dashboard/task/{task['task_id']}/delete",
+        match_info={"task_id": task["task_id"]},
+        app=app,
+    )
+    resp = await handle_task_delete(request)
+    assert resp.status == 200
+
+    decoded = [json.loads(s) for s in sent]
+    # Assert TASK_DELETED was sent unconditionally
+    assert any(
+        m.get("type") == "task_deleted" and m.get("task_id") == task["task_id"]
+        for m in decoded
+    ), f"TASK_DELETED not in sent: {decoded}"
+    # Assert CANCEL was NOT sent (not in-flight state)
+    assert not any(
+        m.get("type") == "cancel"
+        for m in decoded
+    ), f"CANCEL should not be sent for terminal task: {decoded}"
