@@ -375,18 +375,21 @@ class TransferEngine:
     async def transfer_single(self, source_entity, target_entity, message,
                                target_chat: str = "", source_chat: str = "",
                                job_id: str = None,
-                               skip_pre_dedup: bool = False) -> dict:
+                               skip_pre_dedup: bool = False,
+                               task_id: str = None) -> dict:
         """Transfer a single message. Returns {"ok": bool, "dedup": bool, "similar": list | None}.
 
         `skip_pre_dedup`: bypass Phase 4 thumb-phash check. Used by the Phase 5
         dedup resolver when the user explicitly marks an ambiguous source as
         "different" — otherwise we'd just re-park it in pending_dedup forever.
+        `task_id`: hub conversation id; downloads go under tmp/{task_id}/.
         """
         if message.media and not self.should_skip(message):
             return await self._transfer_media(
                 target_entity, message, target_chat=target_chat,
                 source_chat=source_chat, job_id=job_id,
                 skip_pre_dedup=skip_pre_dedup,
+                task_id=task_id,
             )
         # Text-only / sticker / poll / voice all fall here: should_skip is the
         # single source of truth. run_batch marks these 'skipped' before even
@@ -398,14 +401,22 @@ class TransferEngine:
 
     async def transfer_album(self, target_entity, messages: list,
                               target_chat: str = "", source_chat: str = "",
-                              job_id: str = None) -> bool:
+                              job_id: str = None,
+                              task_id: str = None) -> bool:
         """Transfer a media group (album) as a single album.
         Atomic: if any download fails, nothing is uploaded.
+
+        `task_id`: hub conversation id. When provided, downloads land in
+        tmp/{task_id}/ so deleting the hub task cleans them in one rmtree.
+        Falls back to flat tmp_dir for direct/CLI invocations without a task.
 
         Also writes one media_db row per file (status=uploaded on success) so
         dashboard stats reflect real transfer count.
         """
-        os.makedirs(self.tmp_dir, exist_ok=True)
+        task_dir = (
+            os.path.join(self.tmp_dir, task_id) if task_id else self.tmp_dir
+        )
+        os.makedirs(task_dir, exist_ok=True)
 
         caption = None
         for msg in messages:
@@ -421,7 +432,7 @@ class TransferEngine:
             for msg in messages:
                 base = f"{msg.id}_{uuid.uuid4().hex[:8]}"
                 ext = _derive_upload_ext(msg)
-                dest = os.path.join(self.tmp_dir, f"{base}{ext}")
+                dest = os.path.join(task_dir, f"{base}{ext}")
                 planned_paths.append(dest)
                 artefacts.append(dest)
 
@@ -483,7 +494,7 @@ class TransferEngine:
                     if file_type == "photo":
                         phash = compute_phash(path)
                     elif file_type == "video":
-                        phash = await compute_phash_video(path, self.tmp_dir)
+                        phash = await compute_phash_video(path, task_dir)
                         meta = await ffprobe_metadata(path)
                         if meta:
                             duration = meta.get("duration")
@@ -567,7 +578,7 @@ class TransferEngine:
                             supports_streaming=True,
                         )]
                     thumb_dest = os.path.join(
-                        self.tmp_dir,
+                        task_dir,
                         f"{msg.id}_{uuid.uuid4().hex[:8]}.athumb.jpg",
                     )
                     artefacts.append(thumb_dest)
@@ -724,11 +735,17 @@ class TransferEngine:
 
     async def _transfer_media(self, target_entity, message, target_chat: str = "",
                                source_chat: str = "", job_id: str = None,
-                               skip_pre_dedup: bool = False) -> dict:
+                               skip_pre_dedup: bool = False,
+                               task_id: str = None) -> dict:
         """Download and re-upload a single media message.
         Returns: {"ok": bool, "dedup": bool, "similar": list | None}
+
+        `task_id`: hub conversation id; downloads go under tmp/{task_id}/.
         """
-        os.makedirs(self.tmp_dir, exist_ok=True)
+        task_dir = (
+            os.path.join(self.tmp_dir, task_id) if task_id else self.tmp_dir
+        )
+        os.makedirs(task_dir, exist_ok=True)
         # Size-limit gate: reject oversize messages before spending any
         # bandwidth. Caller marks the result as 'skipped', not 'failed'.
         limit = await self._size_limit_bytes()
@@ -763,8 +780,8 @@ class TransferEngine:
         # filesystem metadata churn (mkdir/rmtree per message) minimal.
         base = f"{message.id}_{uuid.uuid4().hex[:8]}"
         ext = _derive_upload_ext(message)
-        media_path = os.path.join(self.tmp_dir, f"{base}{ext}")
-        thumb_path_target = os.path.join(self.tmp_dir, f"{base}.thumb.jpg")
+        media_path = os.path.join(task_dir, f"{base}{ext}")
+        thumb_path_target = os.path.join(task_dir, f"{base}.thumb.jpg")
         artefacts = [media_path, thumb_path_target]
         media_id = None
 
@@ -790,7 +807,7 @@ class TransferEngine:
             phash = None
             duration = None
             if file_type == "video":
-                phash = await compute_phash_video(path, self.tmp_dir)
+                phash = await compute_phash_video(path, task_dir)
                 meta = await ffprobe_metadata(path)
                 if meta:
                     duration = meta.get("duration")

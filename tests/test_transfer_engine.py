@@ -2486,3 +2486,99 @@ async def test_transfer_album_does_not_crash_on_csv_phash(
                 target_chat="@dst", source_chat="@src", job_id=job_id,
             )
     assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_transfer_album_writes_into_task_subdir(tmp_path, monkeypatch):
+    """transfer_album with task_id must mkdir tmp/{task_id}/ and write
+    downloaded files there, not into the flat tmp_dir root."""
+    db = TransferDB(str(tmp_path / "t.db"))
+    await db.init()
+    captured_paths = []
+
+    class FakeClient:
+        async def download_media(self, msg, file):
+            captured_paths.append(file)
+            # Touch the file so atomicity check passes
+            with open(file, "wb") as f:
+                f.write(b"x" * 16)
+            return file
+
+    engine = TransferEngine(
+        client=FakeClient(), db=db,
+        tmp_dir=str(tmp_path / "tmp"),
+    )
+
+    class FakeMsg:
+        def __init__(self, mid):
+            self.id = mid
+            self.text = ""
+            self.media = object()
+            self.file = type("F", (), {"size": 16, "name": None, "ext": ".jpg"})()
+
+    # Skip the actual upload — for this test we just need to confirm path
+    # construction. Patch the upload to no-op success.
+    async def _noop_upload(*args, **kwargs):
+        return [type("M", (), {"id": 1})()]
+    monkeypatch.setattr(engine, "_upload_album_manual", _noop_upload)
+    monkeypatch.setattr(engine, "should_skip", lambda _m: False)
+    monkeypatch.setattr(engine, "_detect_file_type", lambda _m: "photo")
+    # Bypass per-file dedup classification for this path test
+    monkeypatch.setattr(
+        "agents.tg_transfer.transfer_engine.classify_phash_dedup",
+        lambda **_kw: ("upload", None, (0, 0)),
+    )
+
+    msgs = [FakeMsg(101), FakeMsg(102)]
+    ok = await engine.transfer_album(
+        target_entity=None, messages=msgs,
+        target_chat="t", source_chat="s", task_id="task-XYZ",
+    )
+
+    assert ok is True
+    expected_dir = os.path.join(str(tmp_path / "tmp"), "task-XYZ")
+    for p in captured_paths:
+        assert p.startswith(expected_dir + os.sep), f"{p} not under {expected_dir}"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_transfer_media_writes_into_task_subdir(tmp_path, monkeypatch):
+    db = TransferDB(str(tmp_path / "t.db"))
+    await db.init()
+
+    class FakeClient:
+        async def download_media(self, msg, file):
+            with open(file, "wb") as f:
+                f.write(b"x" * 16)
+            return file
+
+        async def send_file(self, *args, **kwargs):
+            return type("M", (), {"id": 1})()
+
+    engine = TransferEngine(
+        client=FakeClient(), db=db,
+        tmp_dir=str(tmp_path / "tmp"),
+    )
+
+    class FakeMsg:
+        id = 555
+        text = ""
+        media = object()
+        file = type("F", (), {"size": 16, "name": None, "ext": ".jpg"})()
+
+    monkeypatch.setattr(engine, "should_skip", lambda _m: False)
+    monkeypatch.setattr(engine, "_detect_file_type", lambda _m: "photo")
+    # Skip pre-dedup so we don't need a media_db
+    result = await engine._transfer_media(
+        target_entity=None, message=FakeMsg(),
+        target_chat="t", source_chat="s",
+        job_id=None, skip_pre_dedup=True,
+        task_id="task-ABC",
+    )
+
+    expected_dir = os.path.join(str(tmp_path / "tmp"), "task-ABC")
+    # Even if upload was no-op, the download path should have been under
+    # the task subdir. Check that the directory exists (mkdir was called).
+    assert os.path.isdir(expected_dir)
+    await db.close()
