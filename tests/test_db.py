@@ -460,11 +460,16 @@ async def test_get_active_task_ids_filters_terminal(tmp_path):
         source_chat="s", target_chat="t", mode="batch", task_id="t-done",
     )
     await db.update_job_status(j_done, "completed")
+    j_dedup = await db.create_job(
+        source_chat="s", target_chat="t", mode="batch", task_id="t-dedup",
+    )
+    await db.update_job_status(j_dedup, "awaiting_dedup")
 
     ids = await db.get_active_task_ids()
 
     assert "t-run" in ids
     assert "t-paused" in ids
+    assert "t-dedup" in ids
     assert "t-done" not in ids
     await db.close()
 

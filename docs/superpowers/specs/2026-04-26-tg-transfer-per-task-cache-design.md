@@ -1,7 +1,7 @@
 # TG Transfer 下載緩存改 per-task-id 化設計
 
 日期：2026-04-26
-狀態：待實作
+狀態：已實作（commits 7da2360..bdbb28c）
 
 ## 背景
 
