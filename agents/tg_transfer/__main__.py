@@ -91,8 +91,14 @@ class TGTransferAgent(BaseAgent):
         )
 
         # Start liveness checker
-        interval = settings.get("liveness_check_interval", 24)
-        asyncio.create_task(run_liveness_loop(self.tg_client, self.media_db, interval))
+        liveness_tmp_root = os.path.join(data_dir, "tmp")
+        liveness_interval_seconds = int(
+            settings.get("liveness_check_interval", 24)
+        ) * 3600
+        asyncio.create_task(run_liveness_loop(
+            self.tg_client, self.media_db, liveness_tmp_root,
+            interval_seconds=liveness_interval_seconds,
+        ))
 
         # Resume is triggered by on_ws_connected(), not here,
         # because WS must be up before we can send progress/result.
