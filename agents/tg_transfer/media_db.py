@@ -83,6 +83,8 @@ CREATE INDEX IF NOT EXISTS idx_media_phash ON media(phash);
 CREATE INDEX IF NOT EXISTS idx_media_thumb_phash ON media(thumb_phash);
 CREATE INDEX IF NOT EXISTS idx_media_caption ON media(caption);
 CREATE INDEX IF NOT EXISTS idx_media_status ON media(status);
+CREATE INDEX IF NOT EXISTS idx_media_source_target_status
+    ON media(source_chat, target_chat, status);
 CREATE INDEX IF NOT EXISTS idx_pending_dedup_job ON pending_dedup(job_id);
 CREATE INDEX IF NOT EXISTS idx_deferred_dedup_target
     ON deferred_dedup(target_chat);
