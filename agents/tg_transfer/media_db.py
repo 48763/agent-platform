@@ -90,6 +90,10 @@ CREATE INDEX IF NOT EXISTS idx_deferred_dedup_target
     ON deferred_dedup(target_chat);
 CREATE INDEX IF NOT EXISTS idx_deferred_dedup_thumb
     ON deferred_dedup(thumb_phash);
+CREATE INDEX IF NOT EXISTS idx_media_phash_lookup
+    ON media(target_chat, file_type, status) WHERE phash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_media_target_msg
+    ON media(target_chat, target_msg_id);
 """
 
 
@@ -102,6 +106,8 @@ class MediaDB:
         self._db = await aiosqlite.connect(self.db_path)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA foreign_keys = ON")
+        await self._db.execute("PRAGMA journal_mode=WAL")
+        await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.executescript(_MEDIA_TABLES)
         await self._migrate()
         await self._db.executescript(_MEDIA_INDEXES)

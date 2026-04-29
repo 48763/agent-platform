@@ -1050,6 +1050,38 @@ async def test_update_caption_and_tags_replaces_caption_and_tags(mdb):
 
 
 @pytest.mark.asyncio
+async def test_init_enables_wal_mode_media(tmp_path):
+    mdb = MediaDB(str(tmp_path / "wal.db"))
+    await mdb.init()
+    try:
+        async with mdb._db.execute("PRAGMA journal_mode") as cur:
+            row = await cur.fetchone()
+        assert row[0].lower() == "wal"
+    finally:
+        await mdb.close()
+
+
+@pytest.mark.asyncio
+async def test_phash_lookup_index_exists(mdb):
+    async with mdb._db.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='index' AND name='idx_media_phash_lookup'"
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None
+
+
+@pytest.mark.asyncio
+async def test_target_msg_index_exists(mdb):
+    async with mdb._db.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='index' AND name='idx_media_target_msg'"
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None
+
+
+@pytest.mark.asyncio
 async def test_update_caption_and_tags_bumps_last_updated_at(mdb):
     media_id = await mdb.insert_media(
         sha256="b", phash=None, file_type="photo", file_size=1,

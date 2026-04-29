@@ -545,6 +545,37 @@ async def test_get_transferred_message_ids_reads_from_media_table(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_add_messages_inserts_all_rows_in_one_batch(db):
+    """add_messages should accept large batches and persist all rows
+    via executemany (single round-trip rather than N awaits)."""
+    job_id = await db.create_job("@s", "@d", "batch")
+    ids = list(range(1000, 2000))
+    grouped = {1500: 99999, 1501: 99999}
+    await db.add_messages(job_id, ids, grouped_ids=grouped)
+
+    msg_first = await db.get_message(job_id, 1000)
+    assert msg_first is not None
+    msg_grouped = await db.get_message(job_id, 1500)
+    assert msg_grouped["grouped_id"] == 99999
+    msg_last = await db.get_message(job_id, 1999)
+    assert msg_last is not None
+
+
+@pytest.mark.asyncio
+async def test_init_enables_wal_mode(tmp_path):
+    """init() must set journal_mode=WAL to avoid serialized writes
+    when MediaDB and TransferDB share a file."""
+    db = TransferDB(str(tmp_path / "wal.db"))
+    await db.init()
+    try:
+        async with db._db.execute("PRAGMA journal_mode") as cur:
+            row = await cur.fetchone()
+        assert row[0].lower() == "wal"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_get_transferred_message_ids_excludes_non_uploaded(tmp_path):
     """A media row with status != 'uploaded' (failed, pending) must NOT
     count as transferred — re-running the batch should retry those."""

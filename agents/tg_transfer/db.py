@@ -57,6 +57,8 @@ class TransferDB:
     async def init(self):
         self._db = await aiosqlite.connect(self.db_path)
         self._db.row_factory = aiosqlite.Row
+        await self._db.execute("PRAGMA journal_mode=WAL")
+        await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.executescript(_SCHEMA)
         await self._migrate()
         await self._db.commit()
@@ -220,12 +222,15 @@ class TransferDB:
         self, job_id: str, message_ids: list[int], grouped_ids: dict[int, int] = None
     ):
         grouped_ids = grouped_ids or {}
-        for msg_id in message_ids:
-            gid = grouped_ids.get(msg_id)
-            await self._db.execute(
-                "INSERT OR IGNORE INTO job_messages (job_id, message_id, grouped_id) VALUES (?, ?, ?)",
-                (job_id, msg_id, gid),
-            )
+        rows = [
+            (job_id, msg_id, grouped_ids.get(msg_id))
+            for msg_id in message_ids
+        ]
+        await self._db.executemany(
+            "INSERT OR IGNORE INTO job_messages (job_id, message_id, grouped_id) "
+            "VALUES (?, ?, ?)",
+            rows,
+        )
         await self._db.commit()
 
     async def get_next_pending(self, job_id: str) -> Optional[dict]:
