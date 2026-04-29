@@ -332,3 +332,42 @@ async def test_run_one_scan_atomic_rewrite_after_each_batch(mdb, tmp_path, monke
     assert saves[2] == ids[4:]
     # After pop-1 (or pop-2 with only 1 left): 0 remaining
     assert saves[3] == []
+
+
+@pytest.mark.asyncio
+async def test_run_liveness_loop_continues_after_scan_error(mdb, tmp_path, monkeypatch):
+    """If run_one_scan raises, the loop must log and continue (sleep + retry),
+    NOT crash. Otherwise a transient error would silently kill the background
+    coroutine and liveness would stop forever."""
+    from agents.tg_transfer import liveness_checker
+    import asyncio as _asyncio
+
+    call_count = 0
+    sleep_calls = []
+
+    async def flaky_scan(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("simulated transient failure")
+        # Second iteration: stop the loop by raising CancelledError
+        raise _asyncio.CancelledError()
+
+    async def fake_sleep(s):
+        sleep_calls.append(s)
+
+    monkeypatch.setattr(liveness_checker, "run_one_scan", flaky_scan)
+    monkeypatch.setattr(liveness_checker.asyncio, "sleep", fake_sleep)
+
+    client = AsyncMock()
+    with pytest.raises(_asyncio.CancelledError):
+        await liveness_checker.run_liveness_loop(
+            client, mdb, tmp_root=str(tmp_path / "tmp"),
+            interval_seconds=42,
+        )
+
+    # Ran twice: first raised RuntimeError (caught), second raised
+    # CancelledError (uncaught — that's how we exit the test).
+    assert call_count == 2
+    # Slept exactly once between the two iterations, with our interval.
+    assert sleep_calls == [42]
