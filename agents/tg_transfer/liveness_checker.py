@@ -78,7 +78,11 @@ async def create_plan(media_db: MediaDB, tmp_root: str) -> str:
 async def locate_or_create_plan(media_db: MediaDB, tmp_root: str) -> str:
     """Return path of the in-progress plan file if one exists; otherwise
     build a new one. This is what makes restart-resume work — a partly
-    consumed plan from before reboot picks up where it left off."""
+    consumed plan from before reboot picks up where it left off.
+
+    Defensive: if the existing plan file is corrupt (zero-byte / truncated
+    JSON from a freak crash before atomic rename), remove it so we don't
+    block liveness for 24h on an unparseable file."""
     plan_dir = _plan_dir(tmp_root)
     if os.path.isdir(plan_dir):
         existing = sorted(
@@ -86,9 +90,20 @@ async def locate_or_create_plan(media_db: MediaDB, tmp_root: str) -> str:
             for name in os.listdir(plan_dir)
             if name.endswith(".json")
         )
-        if existing:
-            logger.info("Liveness scan resuming from %s", existing[0])
-            return existing[0]
+        for candidate in existing:
+            try:
+                load_plan(candidate)
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(
+                    "Liveness plan %s is corrupt (%s), removing", candidate, e,
+                )
+                try:
+                    os.remove(candidate)
+                except OSError:
+                    pass
+                continue
+            logger.info("Liveness scan resuming from %s", candidate)
+            return candidate
     return await create_plan(media_db, tmp_root)
 
 

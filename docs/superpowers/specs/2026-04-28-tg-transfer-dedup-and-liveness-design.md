@@ -1,7 +1,7 @@
 # TG Transfer 重複搬移修復 + Liveness Loop 重寫設計
 
 日期：2026-04-28
-狀態：待實作
+狀態：已實作（commits 002a4ed..7d7bd27）
 
 ## 背景與動機
 
