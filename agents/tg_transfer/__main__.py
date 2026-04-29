@@ -768,7 +768,7 @@ class TGTransferAgent(BaseAgent):
         # point is to record everything and resolve later via /process_deferred.
         already_done: set[int] = set()
         if not defer_mode:
-            already_done = await self.db.get_transferred_message_ids(source, target)
+            already_done = await self.db.get_transferred_message_ids(source, target, media_db=self.media_db)
         new_count = count - len(already_done) if already_done else count
 
         # Create job but don't start yet
@@ -888,7 +888,7 @@ class TGTransferAgent(BaseAgent):
         filter_value = json.loads(job["filter_value"]) if job["filter_value"] else None
         messages = await self._collect_messages(source_entity, filter_type, filter_value)
 
-        already_done = await self.db.get_transferred_message_ids(job["source_chat"], job["target_chat"])
+        already_done = await self.db.get_transferred_message_ids(job["source_chat"], job["target_chat"], media_db=self.media_db)
         grouped_ids = {}
         msg_ids = []
         for msg in messages:

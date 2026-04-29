@@ -323,14 +323,26 @@ class TransferDB:
 
     # -- Dedup --
 
-    async def get_transferred_message_ids(self, source_chat: str, target_chat: str) -> set[int]:
-        async with self._db.execute(
-            "SELECT jm.message_id FROM job_messages jm "
-            "JOIN jobs j ON jm.job_id = j.job_id "
-            "WHERE j.source_chat = ? AND j.target_chat = ? AND jm.status = 'success'",
-            (source_chat, target_chat),
-        ) as cur:
-            return {row["message_id"] for row in await cur.fetchall()}
+    async def get_transferred_message_ids(
+        self, source_chat: str, target_chat: str, media_db=None,
+    ) -> set[int]:
+        """Source message IDs already successfully delivered to the target.
+
+        Reads from the durable `media` table (queried via the supplied
+        `media_db` instance), NOT `job_messages` — the latter is wiped
+        when a job reaches a terminal status, so completed historical
+        jobs would otherwise look like 'never transferred'. Without
+        this fix, re-running an identical batch re-downloads everything.
+
+        `media_db` is optional only to keep callers in unit tests that
+        don't care about cross-source dedup compiling. Production
+        callers (__main__.py:771, :891) pass `self.media_db`.
+        """
+        if media_db is None:
+            return set()
+        return await media_db.list_uploaded_source_msg_ids(
+            source_chat, target_chat,
+        )
 
     # -- Config --
 

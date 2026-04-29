@@ -489,6 +489,21 @@ class MediaDB:
 
     # -- Dedup --
 
+    async def list_uploaded_source_msg_ids(
+        self, source_chat: str, target_chat: str,
+    ) -> set[int]:
+        """Source-side message IDs already uploaded to (source_chat,
+        target_chat). Used by the dedup gate at batch-start to skip any
+        message we've already delivered, even after the originating
+        job's job_messages rows have been wiped."""
+        async with self._db.execute(
+            "SELECT source_msg_id FROM media "
+            "WHERE source_chat = ? AND target_chat = ? "
+            "AND status = 'uploaded'",
+            (source_chat, target_chat),
+        ) as cur:
+            return {row["source_msg_id"] for row in await cur.fetchall()}
+
     async def list_all_uploaded_ids(self) -> list[int]:
         """Every media_id with status='uploaded'. Used by the liveness loop
         to build a scan plan covering all live target rows. Returned in

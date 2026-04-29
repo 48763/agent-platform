@@ -84,18 +84,18 @@ async def test_set_auto_skip(db):
 
 
 @pytest.mark.asyncio
-async def test_dedup_returns_success_ids_while_job_running(db):
-    """Cross-job text-message dedup is sourced from job_messages.status.
-    It works WHILE the job is alive (running / paused). Once the job
-    reaches a terminal status the messages are pruned — see
-    TestJobTerminalCleanup for the contract."""
+async def test_dedup_returns_empty_without_media_db(db):
+    """get_transferred_message_ids now reads from the media table via the
+    supplied media_db instance. Without it (unit-test shorthand), it returns
+    an empty set — the safe default that doesn't skip any messages."""
     job1 = await db.create_job("@src", "@dst", "batch")
     await db.add_messages(job1, [10, 11, 12])
     await db.mark_message(job1, 10, "success")
     await db.mark_message(job1, 11, "success")
     await db.mark_message(job1, 12, "failed")
+    # No media_db supplied — safe fallback is empty set.
     already_done = await db.get_transferred_message_ids("@src", "@dst")
-    assert already_done == {10, 11}
+    assert already_done == set()
 
 
 @pytest.mark.asyncio
@@ -495,3 +495,89 @@ async def test_clear_all_partials_resets_every_partial(tmp_path):
     assert msg20["partial_path"] is None
     assert msg20["downloaded_bytes"] == 0
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_get_transferred_message_ids_reads_from_media_table(tmp_path):
+    """Completed jobs have job_messages WIPED, so the dedup query MUST
+    read from the persistent media table instead. This is the bug fix:
+    re-running the same batch after completion should see prior msg_ids
+    and skip them entirely (no thumb download)."""
+    from agents.tg_transfer.media_db import MediaDB
+
+    db = TransferDB(str(tmp_path / "t.db"))
+    await db.init()
+    mdb = MediaDB(str(tmp_path / "m.db"))
+    await mdb.init()
+
+    # Simulate a completed job lifecycle: job + job_messages were created,
+    # transfer succeeded, media rows were written, then the job went
+    # terminal and job_messages was wiped.
+    job_id = await db.create_job(
+        source_chat="src", target_chat="tgt", mode="batch", task_id="task-1",
+    )
+    await db.add_messages(job_id, [101, 102, 103])
+    for mid in (101, 102, 103):
+        await db.mark_message(job_id, mid, "success")
+    # Mirror the engine's media-row writes for this job's successes:
+    for mid in (101, 102, 103):
+        media_id = await mdb.insert_media(
+            sha256=f"h{mid}", phash=None, file_type="photo", file_size=10,
+            caption=None, source_chat="src", source_msg_id=mid,
+            target_chat="tgt", job_id=job_id,
+        )
+        await mdb.mark_uploaded(media_id, target_msg_id=mid + 1000)
+    # Job goes terminal — wipes job_messages
+    await db.update_job_status(job_id, "completed")
+
+    # The bug under fix: this used to read from job_messages and return
+    # an empty set. After the fix, it reads from media and returns the
+    # source_msg_ids of every uploaded row for (src, tgt).
+    ids = await db.get_transferred_message_ids("src", "tgt", media_db=mdb)
+    assert ids == {101, 102, 103}
+
+    # Filter scope: a different (src, tgt) pair must not pollute results.
+    other_ids = await db.get_transferred_message_ids("src", "other", media_db=mdb)
+    assert other_ids == set()
+
+    await db.close()
+    await mdb.close()
+
+
+@pytest.mark.asyncio
+async def test_get_transferred_message_ids_excludes_non_uploaded(tmp_path):
+    """A media row with status != 'uploaded' (failed, pending) must NOT
+    count as transferred — re-running the batch should retry those."""
+    from agents.tg_transfer.media_db import MediaDB
+
+    db = TransferDB(str(tmp_path / "t.db"))
+    await db.init()
+    mdb = MediaDB(str(tmp_path / "m.db"))
+    await mdb.init()
+
+    # Pending row
+    pending_id = await mdb.insert_media(
+        sha256="p", phash=None, file_type="photo", file_size=10,
+        caption=None, source_chat="src", source_msg_id=200,
+        target_chat="tgt", job_id="j",
+    )
+    # Uploaded row
+    uploaded_id = await mdb.insert_media(
+        sha256="u", phash=None, file_type="photo", file_size=10,
+        caption=None, source_chat="src", source_msg_id=201,
+        target_chat="tgt", job_id="j",
+    )
+    await mdb.mark_uploaded(uploaded_id, target_msg_id=999)
+    # Failed row
+    failed_id = await mdb.insert_media(
+        sha256="f", phash=None, file_type="photo", file_size=10,
+        caption=None, source_chat="src", source_msg_id=202,
+        target_chat="tgt", job_id="j",
+    )
+    await mdb.mark_failed(failed_id)
+
+    ids = await db.get_transferred_message_ids("src", "tgt", media_db=mdb)
+    assert ids == {201}
+
+    await db.close()
+    await mdb.close()

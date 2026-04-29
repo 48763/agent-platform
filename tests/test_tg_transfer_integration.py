@@ -64,23 +64,19 @@ async def test_single_transfer_text_only_is_skipped(db, mock_tg_client):
 
 @pytest.mark.asyncio
 async def test_batch_with_dedup(db):
-    """Cross-job text dedup via job_messages works WHILE the job is still
-    alive. Once the job reaches a terminal status, job_messages are pruned
-    to keep DB small, so dedup would return empty — media dedup (via the
-    media table) is the long-term guard there."""
+    """Dedup now reads from the media table (via media_db param). Without
+    media_db the call returns an empty set — the safe no-skip fallback used
+    in unit tests that don't wire up MediaDB. Cross-job dedup using the media
+    table is covered in tests/test_db.py (test_get_transferred_message_ids_*)."""
     job1 = await db.create_job("@src", "@dst", "batch")
     await db.add_messages(job1, [1, 2, 3])
     await db.mark_message(job1, 1, "success")
     await db.mark_message(job1, 2, "success")
     await db.mark_message(job1, 3, "success")
-    # Do NOT mark completed here — that would wipe the per-message rows.
 
+    # Without media_db, the function returns empty set (safe default).
     already = await db.get_transferred_message_ids("@src", "@dst")
-    assert already == {1, 2, 3}
-
-    new_msg_ids = [1, 2, 3, 4, 5]
-    to_add = [mid for mid in new_msg_ids if mid not in already]
-    assert to_add == [4, 5]
+    assert already == set()
 
 
 @pytest.mark.asyncio
