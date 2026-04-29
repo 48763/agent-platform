@@ -405,9 +405,9 @@ async def test_get_stale_media(mdb):
         source_msg_id=70, target_chat="@d", job_id="j1",
     )
     await mdb.mark_uploaded(m1, target_msg_id=100)
-    # Force last_checked_at to old value
+    # Force last_updated_at to old value
     await mdb._db.execute(
-        "UPDATE media SET last_checked_at = datetime('now', '-48 hours') WHERE media_id = ?",
+        "UPDATE media SET last_updated_at = datetime('now', '-48 hours') WHERE media_id = ?",
         (m1,),
     )
     await mdb._db.commit()
@@ -426,7 +426,7 @@ async def test_update_last_checked(mdb):
     await mdb.mark_uploaded(m1, target_msg_id=110)
     await mdb.update_last_checked(m1)
     media = await mdb.get_media(m1)
-    assert media["last_checked_at"] is not None
+    assert media["last_updated_at"] is not None
 
 
 class TestStatsByType:
@@ -955,3 +955,85 @@ class TestDeferredDedup:
         )
         await mdb.delete_deferred_dedup(row_id)
         assert await mdb.count_deferred_dedup() == 0
+
+
+@pytest.mark.asyncio
+async def test_migration_adds_last_updated_at_with_value_from_created_at(tmp_path):
+    """A legacy media row with last_checked_at=NULL must end up with
+    last_updated_at = created_at after migration."""
+    import aiosqlite
+    db_path = str(tmp_path / "legacy.db")
+
+    # Hand-build a legacy schema row
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            """
+            CREATE TABLE media (
+                media_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sha256 TEXT, phash TEXT, file_type TEXT NOT NULL,
+                file_size INTEGER, caption TEXT,
+                source_chat TEXT NOT NULL, source_msg_id INTEGER NOT NULL,
+                target_chat TEXT NOT NULL, target_msg_id INTEGER,
+                status TEXT DEFAULT 'pending', job_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_checked_at TIMESTAMP
+            )
+            """
+        )
+        await conn.execute(
+            "INSERT INTO media (sha256, file_type, source_chat, source_msg_id, "
+            "target_chat, status, created_at) VALUES "
+            "('s1', 'photo', 's', 1, 't', 'uploaded', '2024-01-01 00:00:00')"
+        )
+        await conn.commit()
+
+    # Run init → triggers migration
+    mdb = MediaDB(db_path)
+    await mdb.init()
+    try:
+        async with mdb._db.execute("PRAGMA table_info(media)") as cur:
+            cols = {row["name"] for row in await cur.fetchall()}
+        assert "last_updated_at" in cols
+        async with mdb._db.execute(
+            "SELECT last_updated_at, created_at FROM media WHERE source_msg_id=1"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["last_updated_at"] == row["created_at"]
+    finally:
+        await mdb.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_drops_last_checked_at_column_when_supported(tmp_path):
+    """On SQLite >= 3.35, last_checked_at must be physically removed."""
+    import sqlite3
+    sqlite_version = tuple(int(x) for x in sqlite3.sqlite_version.split('.'))
+
+    mdb = MediaDB(str(tmp_path / "x.db"))
+    await mdb.init()
+    try:
+        async with mdb._db.execute("PRAGMA table_info(media)") as cur:
+            cols = {row["name"] for row in await cur.fetchall()}
+        if sqlite_version >= (3, 35, 0):
+            assert "last_checked_at" not in cols
+        # Always present in either case:
+        assert "last_updated_at" in cols
+    finally:
+        await mdb.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_idempotent(tmp_path):
+    """Running init twice must not fail or re-create columns."""
+    db_path = str(tmp_path / "y.db")
+    mdb1 = MediaDB(db_path)
+    await mdb1.init()
+    await mdb1.close()
+    mdb2 = MediaDB(db_path)
+    await mdb2.init()  # must not raise
+    try:
+        async with mdb2._db.execute("PRAGMA table_info(media)") as cur:
+            cols = {row["name"] for row in await cur.fetchall()}
+        assert "last_updated_at" in cols
+    finally:
+        await mdb2.close()

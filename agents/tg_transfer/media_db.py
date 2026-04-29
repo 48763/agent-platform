@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS media (
     status          TEXT DEFAULT 'pending',
     job_id          TEXT,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_checked_at TIMESTAMP
+    last_updated_at TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS tags (
@@ -149,17 +149,18 @@ class MediaDB:
                     status          TEXT DEFAULT 'pending',
                     job_id          TEXT,
                     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_checked_at TIMESTAMP
+                    last_updated_at TIMESTAMP
                 );
                 INSERT INTO media_new (
                     media_id, sha256, phash, file_type, file_size, caption,
                     source_chat, source_msg_id, target_chat, target_msg_id,
-                    status, job_id, created_at, last_checked_at
+                    status, job_id, created_at, last_updated_at
                 )
                 SELECT
                     media_id, sha256, phash, file_type, file_size, caption,
                     source_chat, source_msg_id, target_chat, target_msg_id,
-                    status, job_id, created_at, last_checked_at
+                    status, job_id, created_at,
+                    COALESCE(last_checked_at, created_at) AS last_updated_at
                 FROM media;
                 DROP TABLE media;
                 ALTER TABLE media_new RENAME TO media;
@@ -190,6 +191,34 @@ class MediaDB:
                 "CREATE INDEX IF NOT EXISTS idx_media_thumb_phash "
                 "ON media(thumb_phash)"
             )
+
+        # last_checked_at → last_updated_at migration. Old code bumped
+        # last_checked_at on every scan (whether or not anything changed);
+        # the new model only bumps last_updated_at on real edits. Rename
+        # by adding the new column with COALESCE'd initial value, then
+        # drop the old one (SQLite >= 3.35).
+        async with self._db.execute("PRAGMA table_info(media)") as cur:
+            cols = {row["name"] for row in await cur.fetchall()}
+
+        if "last_updated_at" not in cols:
+            await self._db.execute(
+                "ALTER TABLE media ADD COLUMN last_updated_at TIMESTAMP"
+            )
+            await self._db.execute(
+                "UPDATE media SET last_updated_at = "
+                "COALESCE(last_checked_at, created_at) "
+                "WHERE last_updated_at IS NULL"
+            )
+
+        if "last_checked_at" in cols:
+            import sqlite3
+            sqlite_version = tuple(
+                int(x) for x in sqlite3.sqlite_version.split('.')
+            )
+            if sqlite_version >= (3, 35, 0):
+                await self._db.execute(
+                    "ALTER TABLE media DROP COLUMN last_checked_at"
+                )
 
     async def close(self):
         if self._db:
@@ -223,7 +252,7 @@ class MediaDB:
     async def mark_uploaded(self, media_id: int, target_msg_id: int):
         await self._db.execute(
             "UPDATE media SET status = 'uploaded', target_msg_id = ?, "
-            "last_checked_at = CURRENT_TIMESTAMP WHERE media_id = ?",
+            "last_updated_at = CURRENT_TIMESTAMP WHERE media_id = ?",
             (target_msg_id, media_id),
         )
         await self._db.commit()
@@ -594,7 +623,7 @@ class MediaDB:
     async def get_stale_media(self, max_age_hours: int = 24, limit: int = 50) -> list[dict]:
         async with self._db.execute(
             "SELECT * FROM media WHERE status = 'uploaded' "
-            "AND (last_checked_at IS NULL OR last_checked_at < datetime('now', ? || ' hours')) "
+            "AND (last_updated_at IS NULL OR last_updated_at < datetime('now', ? || ' hours')) "
             "LIMIT ?",
             (f"-{max_age_hours}", limit),
         ) as cur:
@@ -602,7 +631,7 @@ class MediaDB:
 
     async def update_last_checked(self, media_id: int):
         await self._db.execute(
-            "UPDATE media SET last_checked_at = CURRENT_TIMESTAMP WHERE media_id = ?",
+            "UPDATE media SET last_updated_at = CURRENT_TIMESTAMP WHERE media_id = ?",
             (media_id,),
         )
         await self._db.commit()
