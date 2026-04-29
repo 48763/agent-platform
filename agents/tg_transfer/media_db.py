@@ -489,6 +489,16 @@ class MediaDB:
 
     # -- Dedup --
 
+    async def list_all_uploaded_ids(self) -> list[int]:
+        """Every media_id with status='uploaded'. Used by the liveness loop
+        to build a scan plan covering all live target rows. Returned in
+        ascending media_id order so plan files are stable across restarts."""
+        async with self._db.execute(
+            "SELECT media_id FROM media WHERE status = 'uploaded' "
+            "ORDER BY media_id ASC"
+        ) as cur:
+            return [row["media_id"] for row in await cur.fetchall()]
+
     async def find_by_sha256(self, sha256: str, target_chat: str) -> Optional[dict]:
         """Return an uploaded media row for this (sha256, target_chat), if any.
         Only 'uploaded' status blocks re-upload; other statuses mean 待上傳
@@ -546,6 +556,31 @@ class MediaDB:
                 (media_id, tag_id),
             )
         await self._db.commit()
+
+    async def update_caption_and_tags(self, media_id: int, caption: str):
+        """Persist a detected caption edit:
+        1. UPDATE media.caption + bump last_updated_at
+        2. DELETE the row's media_tags entries
+        3. Re-extract tags from the new caption and INSERT them
+
+        Called by the liveness loop when it sees the target message's
+        current caption differs from the stored one."""
+        from agents.tg_transfer.tag_extractor import extract_tags
+
+        await self._db.execute(
+            "UPDATE media SET caption = ?, "
+            "last_updated_at = CURRENT_TIMESTAMP "
+            "WHERE media_id = ?",
+            (caption, media_id),
+        )
+        await self._db.execute(
+            "DELETE FROM media_tags WHERE media_id = ?", (media_id,),
+        )
+        await self._db.commit()
+
+        tags = extract_tags(caption)
+        if tags:
+            await self.add_tags(media_id, tags)
 
     async def get_tags(self, media_id: int) -> list[str]:
         async with self._db.execute(
@@ -618,20 +653,3 @@ class MediaDB:
             "by_type": by_type,
         }
 
-    # -- Liveness --
-
-    async def get_stale_media(self, max_age_hours: int = 24, limit: int = 50) -> list[dict]:
-        async with self._db.execute(
-            "SELECT * FROM media WHERE status = 'uploaded' "
-            "AND (last_updated_at IS NULL OR last_updated_at < datetime('now', ? || ' hours')) "
-            "LIMIT ?",
-            (f"-{max_age_hours}", limit),
-        ) as cur:
-            return [dict(row) for row in await cur.fetchall()]
-
-    async def update_last_checked(self, media_id: int):
-        await self._db.execute(
-            "UPDATE media SET last_updated_at = CURRENT_TIMESTAMP WHERE media_id = ?",
-            (media_id,),
-        )
-        await self._db.commit()

@@ -397,38 +397,6 @@ async def test_get_stats_groups_by_status(mdb):
     assert stats["by_status"]["pending"] == 1
 
 
-@pytest.mark.asyncio
-async def test_get_stale_media(mdb):
-    m1 = await mdb.insert_media(
-        sha256="stale1", phash=None, file_type="photo",
-        file_size=100, caption=None, source_chat="@s",
-        source_msg_id=70, target_chat="@d", job_id="j1",
-    )
-    await mdb.mark_uploaded(m1, target_msg_id=100)
-    # Force last_updated_at to old value
-    await mdb._db.execute(
-        "UPDATE media SET last_updated_at = datetime('now', '-48 hours') WHERE media_id = ?",
-        (m1,),
-    )
-    await mdb._db.commit()
-    stale = await mdb.get_stale_media(max_age_hours=24, limit=50)
-    assert len(stale) == 1
-    assert stale[0]["media_id"] == m1
-
-
-@pytest.mark.asyncio
-async def test_update_last_checked(mdb):
-    m1 = await mdb.insert_media(
-        sha256="chk1", phash=None, file_type="photo",
-        file_size=100, caption=None, source_chat="@s",
-        source_msg_id=80, target_chat="@d", job_id="j1",
-    )
-    await mdb.mark_uploaded(m1, target_msg_id=110)
-    await mdb.update_last_checked(m1)
-    media = await mdb.get_media(m1)
-    assert media["last_updated_at"] is not None
-
-
 class TestStatsByType:
     """get_stats() should break uploaded media down by file_type so the
     dashboard can show photos / videos / documents separately."""
@@ -1037,3 +1005,62 @@ async def test_migration_idempotent(tmp_path):
         assert "last_updated_at" in cols
     finally:
         await mdb2.close()
+
+
+@pytest.mark.asyncio
+async def test_list_all_uploaded_ids_returns_only_uploaded(mdb):
+    pending = await mdb.insert_media(
+        sha256="p1", phash=None, file_type="photo", file_size=10,
+        caption=None, source_chat="s", source_msg_id=1,
+        target_chat="t", job_id="j",
+    )
+    uploaded = await mdb.insert_media(
+        sha256="u1", phash=None, file_type="photo", file_size=10,
+        caption=None, source_chat="s", source_msg_id=2,
+        target_chat="t", job_id="j",
+    )
+    await mdb.mark_uploaded(uploaded, target_msg_id=200)
+    failed = await mdb.insert_media(
+        sha256="f1", phash=None, file_type="photo", file_size=10,
+        caption=None, source_chat="s", source_msg_id=3,
+        target_chat="t", job_id="j",
+    )
+    await mdb.mark_failed(failed)
+
+    ids = await mdb.list_all_uploaded_ids()
+    assert ids == [uploaded]
+
+
+@pytest.mark.asyncio
+async def test_update_caption_and_tags_replaces_caption_and_tags(mdb):
+    media_id = await mdb.insert_media(
+        sha256="a", phash=None, file_type="photo", file_size=1,
+        caption="old #foo #bar", source_chat="s", source_msg_id=1,
+        target_chat="t", job_id="j",
+    )
+    await mdb.mark_uploaded(media_id, target_msg_id=10)
+    await mdb.add_tags(media_id, ["foo", "bar"])
+
+    await mdb.update_caption_and_tags(media_id, "new #baz")
+
+    row = await mdb.get_media(media_id)
+    assert row["caption"] == "new #baz"
+    tags = await mdb.get_tags(media_id)
+    assert tags == ["baz"]
+
+
+@pytest.mark.asyncio
+async def test_update_caption_and_tags_bumps_last_updated_at(mdb):
+    media_id = await mdb.insert_media(
+        sha256="b", phash=None, file_type="photo", file_size=1,
+        caption="old", source_chat="s", source_msg_id=1,
+        target_chat="t", job_id="j",
+    )
+    await mdb.mark_uploaded(media_id, target_msg_id=10)
+    before = (await mdb.get_media(media_id))["last_updated_at"]
+    # Sleep a tick so timestamp comparison is meaningful at second resolution
+    import asyncio
+    await asyncio.sleep(1.05)
+    await mdb.update_caption_and_tags(media_id, "new content")
+    after = (await mdb.get_media(media_id))["last_updated_at"]
+    assert after > before
