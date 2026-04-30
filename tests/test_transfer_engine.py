@@ -2695,3 +2695,73 @@ async def test_transfer_media_hash_calls_run_in_threadpool(tmp_path, monkeypatch
     assert "compute_sha256" in to_thread_calls
     assert "compute_phash" in to_thread_calls
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_transfer_album_video_runs_ffprobe_only_once_per_file(tmp_path, monkeypatch):
+    """Album with N videos must call ffprobe_metadata exactly N times,
+    not 2N — meta is computed once per file in the dedup loop and
+    reused in the upload-prep loop."""
+    db = TransferDB(str(tmp_path / "t.db"))
+    await db.init()
+
+    class FakeClient:
+        async def download_media(self, msg, file):
+            with open(file, "wb") as f:
+                f.write(b"x" * 16)
+            return file
+
+    engine = TransferEngine(
+        client=FakeClient(), db=db, tmp_dir=str(tmp_path / "tmp"),
+    )
+
+    class FakeMsg:
+        def __init__(self, mid):
+            self.id = mid
+            self.text = ""
+            self.media = object()
+            self.file = type("F", (), {"size": 16, "name": None, "ext": ".mp4"})()
+
+    monkeypatch.setattr(engine, "should_skip", lambda _m: False)
+    monkeypatch.setattr(engine, "_detect_file_type", lambda _m: "video")
+
+    ffprobe_calls = []
+    async def fake_ffprobe(path):
+        ffprobe_calls.append(path)
+        return {"duration": 10, "width": 100, "height": 50}
+    monkeypatch.setattr(
+        "agents.tg_transfer.transfer_engine.ffprobe_metadata",
+        fake_ffprobe,
+    )
+
+    async def fake_phash_video(path, tmp_dir):
+        return "abc"
+    monkeypatch.setattr(
+        "agents.tg_transfer.transfer_engine.compute_phash_video",
+        fake_phash_video,
+    )
+
+    # Bypass dedup classification so the dedup loop completes without
+    # short-circuiting and per_file_meta is fully populated.
+    monkeypatch.setattr(
+        "agents.tg_transfer.transfer_engine.classify_phash_dedup",
+        lambda **_kw: ("upload", None, (0, 0)),
+    )
+
+    # Bypass actual upload — we only care about ffprobe count
+    async def _noop_upload(*args, **kwargs):
+        return [type("M", (), {"id": 1})()]
+    monkeypatch.setattr(engine, "_upload_album_manual", _noop_upload)
+
+    msgs = [FakeMsg(101), FakeMsg(102), FakeMsg(103)]
+    ok = await engine.transfer_album(
+        target_entity=None, messages=msgs,
+        target_chat="t", source_chat="s", task_id="task-ALB",
+    )
+    assert ok is True
+
+    # 3 videos × 1 ffprobe each = 3 (not 6)
+    assert len(ffprobe_calls) == 3, (
+        f"expected 3 ffprobe calls (1 per video), got {len(ffprobe_calls)}"
+    )
+    await db.close()
