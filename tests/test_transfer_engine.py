@@ -2589,3 +2589,109 @@ async def test_transfer_media_writes_into_task_subdir(tmp_path, monkeypatch):
             f"{p!r} not under {expected_dir!r}"
         )
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_transfer_media_video_runs_ffprobe_only_once(tmp_path, monkeypatch):
+    """Video transfer must call ffprobe_metadata exactly once: result is
+    reused for both the dedup gate and upload attributes."""
+    db = TransferDB(str(tmp_path / "t.db"))
+    await db.init()
+
+    class FakeClient:
+        async def download_media(self, msg, file):
+            with open(file, "wb") as f:
+                f.write(b"x" * 16)
+            return file
+        async def send_file(self, *a, **k):
+            return type("M", (), {"id": 1})()
+
+    engine = TransferEngine(
+        client=FakeClient(), db=db, tmp_dir=str(tmp_path / "tmp"),
+    )
+
+    class FakeMsg:
+        id = 555
+        text = ""
+        media = object()
+        file = type("F", (), {"size": 16, "name": None, "ext": ".mp4"})()
+
+    monkeypatch.setattr(engine, "should_skip", lambda _m: False)
+    monkeypatch.setattr(engine, "_detect_file_type", lambda _m: "video")
+
+    ffprobe_calls = []
+    async def fake_ffprobe(path):
+        ffprobe_calls.append(path)
+        return {"duration": 12, "width": 100, "height": 50}
+
+    monkeypatch.setattr(
+        "agents.tg_transfer.transfer_engine.ffprobe_metadata",
+        fake_ffprobe,
+    )
+    async def fake_phash_video(path, tmp_dir):
+        return "abc"
+    monkeypatch.setattr(
+        "agents.tg_transfer.transfer_engine.compute_phash_video",
+        fake_phash_video,
+    )
+
+    await engine._transfer_media(
+        target_entity=None, message=FakeMsg(),
+        target_chat="t", source_chat="s",
+        job_id=None, skip_pre_dedup=True,
+        task_id="task-FF",
+    )
+
+    assert len(ffprobe_calls) == 1, f"ffprobe called {len(ffprobe_calls)}× (expected 1)"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_transfer_media_hash_calls_run_in_threadpool(tmp_path, monkeypatch):
+    """compute_sha256 / compute_phash must be wrapped in asyncio.to_thread
+    on the transfer path so the event loop doesn't stall on multi-second
+    hash computation for large files."""
+    import asyncio as _asyncio
+    db = TransferDB(str(tmp_path / "t.db"))
+    await db.init()
+
+    to_thread_calls = []
+    real_to_thread = _asyncio.to_thread
+
+    async def spy_to_thread(func, *args, **kwargs):
+        to_thread_calls.append(getattr(func, "__name__", str(func)))
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(_asyncio, "to_thread", spy_to_thread)
+
+    class FakeClient:
+        async def download_media(self, msg, file):
+            with open(file, "wb") as f:
+                f.write(b"x" * 16)
+            return file
+        async def send_file(self, *a, **k):
+            return type("M", (), {"id": 1})()
+
+    engine = TransferEngine(
+        client=FakeClient(), db=db, tmp_dir=str(tmp_path / "tmp"),
+    )
+
+    class FakeMsg:
+        id = 1
+        text = ""
+        media = object()
+        file = type("F", (), {"size": 16, "name": None, "ext": ".jpg"})()
+
+    monkeypatch.setattr(engine, "should_skip", lambda _m: False)
+    monkeypatch.setattr(engine, "_detect_file_type", lambda _m: "photo")
+
+    await engine._transfer_media(
+        target_entity=None, message=FakeMsg(),
+        target_chat="t", source_chat="s",
+        job_id=None, skip_pre_dedup=True,
+        task_id="task-HASH",
+    )
+
+    assert "compute_sha256" in to_thread_calls
+    assert "compute_phash" in to_thread_calls
+    await db.close()

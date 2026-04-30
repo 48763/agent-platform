@@ -481,18 +481,20 @@ class TransferEngine:
             effective_messages: list = []
             effective_paths: list[str] = []
 
+            per_file_meta: list[dict | None] = []
             if self.media_db:
                 # phash candidates are scoped per-file_type so a video's
                 # 3-frame CSV phash is never compared against a photo's
                 # single-frame phash (and vice versa).
                 phash_cands_by_type: dict[str, list[dict]] = {}
                 for msg, path in zip(messages, file_paths):
-                    sha256 = compute_sha256(path)
+                    sha256 = await asyncio.to_thread(compute_sha256, path)
                     file_type = self._detect_file_type(msg)
                     phash = None
                     duration = None
+                    meta = None
                     if file_type == "photo":
-                        phash = compute_phash(path)
+                        phash = await asyncio.to_thread(compute_phash, path)
                     elif file_type == "video":
                         phash = await compute_phash_video(path, task_dir)
                         meta = await ffprobe_metadata(path)
@@ -551,6 +553,7 @@ class TransferEngine:
                     media_ids.append(media_id)
                     effective_messages.append(msg)
                     effective_paths.append(path)
+                    per_file_meta.append(meta)
             else:
                 effective_messages = list(messages)
                 effective_paths = list(file_paths)
@@ -562,12 +565,17 @@ class TransferEngine:
             # Build per-file attributes + thumbs for videos in album
             per_file_attrs = []
             per_file_thumbs = []
-            for msg, path in zip(effective_messages, effective_paths):
+            for idx, (msg, path) in enumerate(zip(effective_messages, effective_paths)):
                 file_type = self._detect_file_type(msg)
                 attrs = None
                 thumb = None
                 if file_type == "video":
-                    meta = await ffprobe_metadata(path)
+                    # Reuse meta from the dedup loop above (single ffprobe
+                    # per video). Fallback only if dedup-time call failed or
+                    # media_db was not set (per_file_meta empty).
+                    meta = per_file_meta[idx] if idx < len(per_file_meta) else None
+                    if meta is None:
+                        meta = await ffprobe_metadata(path)
                     if not meta:
                         meta = _meta_from_message(msg)
                     if meta:
@@ -802,17 +810,18 @@ class TransferEngine:
                 return {"ok": False, "dedup": False, "similar": None}
 
             # Compute hashes
-            sha256 = compute_sha256(path)
+            sha256 = await asyncio.to_thread(compute_sha256, path)
             file_type = self._detect_file_type(message)
             phash = None
             duration = None
+            meta = None
             if file_type == "video":
                 phash = await compute_phash_video(path, task_dir)
                 meta = await ffprobe_metadata(path)
                 if meta:
                     duration = meta.get("duration")
             elif file_type == "photo":
-                phash = compute_phash(path)
+                phash = await asyncio.to_thread(compute_phash, path)
             file_size = os.path.getsize(path) if os.path.exists(path) else None
 
             # Check dedup if media_db available
@@ -865,7 +874,10 @@ class TransferEngine:
 
             # Add video metadata if applicable
             if file_type == "video":
-                meta = await ffprobe_metadata(path)
+                # Reuse meta from the dedup block above (single ffprobe
+                # per video). Fallback only if the dedup-time call failed.
+                if meta is None:
+                    meta = await ffprobe_metadata(path)
                 if not meta:
                     meta = _meta_from_message(message)
                 if meta:
