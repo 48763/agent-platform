@@ -1096,3 +1096,27 @@ async def test_update_caption_and_tags_bumps_last_updated_at(mdb):
     await mdb.update_caption_and_tags(media_id, "new content")
     after = (await mdb.get_media(media_id))["last_updated_at"]
     assert after > before
+
+
+@pytest.mark.asyncio
+async def test_search_keyword_uses_sql_pagination(mdb):
+    """Inserting > page_size matches: page1 returns page_size, page2
+    returns the remainder, no overlap."""
+    for i in range(15):
+        m = await mdb.insert_media(
+            sha256=f"h{i}", phash=None, file_type="photo", file_size=1,
+            caption=f"hello world {i}", source_chat="s", source_msg_id=i,
+            target_chat="t", job_id="j",
+        )
+        await mdb.mark_uploaded(m, target_msg_id=1000 + i)
+
+    page1, total1 = await mdb.search_keyword("hello", page=1, page_size=10)
+    page2, total2 = await mdb.search_keyword("hello", page=2, page_size=10)
+
+    assert total1 == 15
+    assert total2 == 15
+    assert len(page1) == 10
+    assert len(page2) == 5
+    assert {r["media_id"] for r in page1}.isdisjoint(
+        {r["media_id"] for r in page2}
+    )

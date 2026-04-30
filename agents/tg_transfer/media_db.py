@@ -615,20 +615,34 @@ class MediaDB:
     # -- Search --
 
     async def search_keyword(self, keyword: str, page: int = 1, page_size: int = 10) -> tuple[list[dict], int]:
+        """Two-step paginated search: COUNT for total + LIMIT/OFFSET for page."""
         offset = (page - 1) * page_size
-        query = """
+        like = f"%{keyword}%"
+
+        count_query = """
+            SELECT COUNT(DISTINCT m.media_id) AS cnt
+            FROM media m
+            LEFT JOIN media_tags mt ON m.media_id = mt.media_id
+            LEFT JOIN tags t ON mt.tag_id = t.tag_id
+            WHERE m.status = 'uploaded' AND (m.caption LIKE ? OR t.name LIKE ?)
+        """
+        async with self._db.execute(count_query, (like, like)) as cur:
+            row = await cur.fetchone()
+            total = row["cnt"] if row else 0
+
+        page_query = """
             SELECT DISTINCT m.media_id, m.caption, m.target_chat, m.target_msg_id, m.created_at
             FROM media m
             LEFT JOIN media_tags mt ON m.media_id = mt.media_id
             LEFT JOIN tags t ON mt.tag_id = t.tag_id
             WHERE m.status = 'uploaded' AND (m.caption LIKE ? OR t.name LIKE ?)
             ORDER BY m.created_at DESC
+            LIMIT ? OFFSET ?
         """
-        like = f"%{keyword}%"
-        async with self._db.execute(query, (like, like)) as cur:
-            all_rows = [dict(row) for row in await cur.fetchall()]
-        total = len(all_rows)
-        page_rows = all_rows[offset:offset + page_size]
+        async with self._db.execute(
+            page_query, (like, like, page_size, offset),
+        ) as cur:
+            page_rows = [dict(row) for row in await cur.fetchall()]
         return page_rows, total
 
     # -- Stats --

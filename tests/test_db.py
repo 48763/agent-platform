@@ -612,3 +612,21 @@ async def test_get_transferred_message_ids_excludes_non_uploaded(tmp_path):
 
     await db.close()
     await mdb.close()
+
+
+@pytest.mark.asyncio
+async def test_batch_mark_failed_as_skipped_updates_only_failed(db):
+    """One UPDATE flips every status='failed' row to 'skipped'."""
+    job_id = await db.create_job("@s", "@d", "batch")
+    await db.add_messages(job_id, [1, 2, 3, 4])
+    await db.mark_message(job_id, 1, "failed", error="x")
+    await db.mark_message(job_id, 2, "success")
+    await db.mark_message(job_id, 3, "failed", error="y")
+
+    count = await db.batch_mark_failed_as_skipped(job_id)
+    assert count == 2
+
+    assert (await db.get_message(job_id, 1))["status"] == "skipped"
+    assert (await db.get_message(job_id, 2))["status"] == "success"
+    assert (await db.get_message(job_id, 3))["status"] == "skipped"
+    assert (await db.get_message(job_id, 4))["status"] == "pending"

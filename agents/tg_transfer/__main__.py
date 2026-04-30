@@ -846,14 +846,9 @@ class TGTransferAgent(BaseAgent):
         return AgentResult(status=TaskStatus.NEED_INPUT, message="請選擇：重試 / 跳過 / 一律跳過")
 
     async def _skip_current_failed(self, job_id: str):
-        """Find failed messages in job and mark as skipped."""
-        async with self.db._db.execute(
-            "SELECT message_id FROM job_messages WHERE job_id = ? AND status = 'failed'",
-            (job_id,),
-        ) as cur:
-            rows = await cur.fetchall()
-        for row in rows:
-            await self.db.mark_message(job_id, row["message_id"], "skipped")
+        """Mark every failed job_message as skipped, single UPDATE.
+        No more direct self.db._db.execute access."""
+        await self.db.batch_mark_failed_as_skipped(job_id)
 
     async def _start_batch(self, task_id: str, job_id: str, job: dict) -> AgentResult:
         """Populate job_messages and start batch transfer (non-blocking)."""

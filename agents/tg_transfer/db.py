@@ -249,6 +249,17 @@ class TransferDB:
             row = await cur.fetchone()
             return dict(row) if row else None
 
+    async def batch_mark_failed_as_skipped(self, job_id: str) -> int:
+        """Flip every job_message status='failed' for this job to 'skipped'
+        in one UPDATE. Returns rows touched."""
+        cur = await self._db.execute(
+            "UPDATE job_messages SET status = 'skipped' "
+            "WHERE job_id = ? AND status = 'failed'",
+            (job_id,),
+        )
+        await self._db.commit()
+        return cur.rowcount or 0
+
     async def mark_message(self, job_id: str, message_id: int, status: str, error: str = None):
         await self._db.execute(
             "UPDATE job_messages SET status = ?, error = ? WHERE job_id = ? AND message_id = ?",
