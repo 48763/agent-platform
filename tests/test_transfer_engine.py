@@ -2819,6 +2819,8 @@ async def test_transfer_media_skips_phash_fetch_when_candidates_provided(
             pass
         async def add_tags(self, *a, **k):
             pass
+        async def upsert_pending(self, *a, **k):
+            return 1
 
     class FakeClient:
         async def download_media(self, msg, file):
