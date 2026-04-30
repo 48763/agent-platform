@@ -2765,3 +2765,90 @@ async def test_transfer_album_video_runs_ffprobe_only_once_per_file(tmp_path, mo
         f"expected 3 ffprobe calls (1 per video), got {len(ffprobe_calls)}"
     )
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_size_limit_bytes_uses_ttl_cache(tmp_path, monkeypatch):
+    """5 quick calls should hit the DB once."""
+    db = TransferDB(str(tmp_path / "t.db"))
+    await db.init()
+    await db.set_config("size_limit_mb", "10")
+
+    engine = TransferEngine(
+        client=None, db=db, tmp_dir=str(tmp_path / "tmp"),
+    )
+
+    select_count = 0
+    real_get_config = db.get_config
+    async def spy_get_config(key):
+        nonlocal select_count
+        if key == "size_limit_mb":
+            select_count += 1
+        return await real_get_config(key)
+    monkeypatch.setattr(db, "get_config", spy_get_config)
+
+    for _ in range(5):
+        await engine._size_limit_bytes()
+
+    assert select_count == 1, f"expected 1 DB hit, got {select_count}"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_transfer_media_skips_phash_fetch_when_candidates_provided(
+    tmp_path, monkeypatch,
+):
+    """When phash_candidates kwarg is supplied, _transfer_media must NOT
+    call media_db.get_all_phashes for that (file_type, target_chat)."""
+    db = TransferDB(str(tmp_path / "t.db"))
+    await db.init()
+
+    fetch_calls = []
+
+    class FakeMediaDB:
+        async def get_all_phashes(self, file_type=None, target_chat=None):
+            fetch_calls.append((file_type, target_chat))
+            return []
+        async def find_by_sha256(self, *a, **k):
+            return None
+        async def find_by_thumb_phash(self, *a, **k):
+            return []
+        async def insert_media(self, *a, **k):
+            return 1
+        async def mark_uploaded(self, *a, **k):
+            pass
+        async def add_tags(self, *a, **k):
+            pass
+
+    class FakeClient:
+        async def download_media(self, msg, file):
+            with open(file, "wb") as f:
+                f.write(b"x" * 16)
+            return file
+        async def send_file(self, *a, **k):
+            return type("M", (), {"id": 1})()
+
+    engine = TransferEngine(
+        client=FakeClient(), db=db, media_db=FakeMediaDB(),
+        tmp_dir=str(tmp_path / "tmp"),
+    )
+
+    class FakeMsg:
+        id = 1
+        text = ""
+        media = object()
+        file = type("F", (), {"size": 16, "name": None, "ext": ".jpg"})()
+
+    monkeypatch.setattr(engine, "should_skip", lambda _m: False)
+    monkeypatch.setattr(engine, "_detect_file_type", lambda _m: "photo")
+
+    await engine._transfer_media(
+        target_entity=None, message=FakeMsg(),
+        target_chat="t", source_chat="s",
+        job_id=None, skip_pre_dedup=True,
+        task_id="task-X",
+        phash_candidates=[],
+    )
+
+    assert fetch_calls == [], f"expected no get_all_phashes call, got {fetch_calls}"
+    await db.close()

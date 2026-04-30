@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 import asyncio
 import mimetypes
@@ -167,6 +168,10 @@ class TransferEngine:
         # concurrent downloads can't exceed the configured cap (e.g. 1GB).
         self.byte_budget = byte_budget
         self._cancelled: set[str] = set()
+        # 5-second TTL cache for size_limit_mb. Live edits propagate
+        # within ~5s; saves ~999 SELECTs on a 1000-msg batch.
+        self._size_limit_cache: tuple[float, int] | None = None
+        self._SIZE_LIMIT_TTL = 5.0
 
     def cancel_job(self, job_id: str):
         self._cancelled.add(job_id)
@@ -229,16 +234,24 @@ class TransferEngine:
         return 512 * 1024
 
     async def _size_limit_bytes(self) -> int:
-        """Current per-message byte cap. Read from DB on every call so the
-        user can change it live while a batch is running. 0 = no limit."""
+        """Current per-message byte cap. 0 = no limit. Cached for 5s."""
+        now = time.monotonic()
+        if self._size_limit_cache is not None:
+            cached_at, value = self._size_limit_cache
+            if now - cached_at < self._SIZE_LIMIT_TTL:
+                return value
         raw = await self.db.get_config("size_limit_mb")
         if not raw:
-            return 0
-        try:
-            mb = int(raw)
-        except (TypeError, ValueError):
-            return 0
-        return max(mb, 0) * 1024 * 1024
+            value = 0
+        else:
+            try:
+                mb = int(raw)
+            except (TypeError, ValueError):
+                value = 0
+            else:
+                value = max(mb, 0) * 1024 * 1024
+        self._size_limit_cache = (now, value)
+        return value
 
     @staticmethod
     def _declared_size(message) -> int:
@@ -376,13 +389,17 @@ class TransferEngine:
                                target_chat: str = "", source_chat: str = "",
                                job_id: str = None,
                                skip_pre_dedup: bool = False,
-                               task_id: str = None) -> dict:
+                               task_id: str = None,
+                               phash_candidates: list[dict] | None = None) -> dict:
         """Transfer a single message. Returns {"ok": bool, "dedup": bool, "similar": list | None}.
 
         `skip_pre_dedup`: bypass Phase 4 thumb-phash check. Used by the Phase 5
         dedup resolver when the user explicitly marks an ambiguous source as
         "different" — otherwise we'd just re-park it in pending_dedup forever.
         `task_id`: hub conversation id; downloads go under tmp/{task_id}/.
+        `phash_candidates`: pre-fetched phash rows for this (file_type, target_chat).
+            None = caller didn't supply, so internal fetch fires; non-None list
+            (even empty) = use the supplied list, skipping the DB round-trip.
         """
         if message.media and not self.should_skip(message):
             return await self._transfer_media(
@@ -390,6 +407,7 @@ class TransferEngine:
                 source_chat=source_chat, job_id=job_id,
                 skip_pre_dedup=skip_pre_dedup,
                 task_id=task_id,
+                phash_candidates=phash_candidates,
             )
         # Text-only / sticker / poll / voice all fall here: should_skip is the
         # single source of truth. run_batch marks these 'skipped' before even
@@ -744,7 +762,8 @@ class TransferEngine:
     async def _transfer_media(self, target_entity, message, target_chat: str = "",
                                source_chat: str = "", job_id: str = None,
                                skip_pre_dedup: bool = False,
-                               task_id: str = None) -> dict:
+                               task_id: str = None,
+                               phash_candidates: list[dict] | None = None) -> dict:
         """Download and re-upload a single media message.
         Returns: {"ok": bool, "dedup": bool, "similar": list | None}
 
@@ -837,9 +856,12 @@ class TransferEngine:
                 # both crash on `int(csv, 16)` AND produce false-positive
                 # auto-skips.
                 if phash:
-                    candidates = await self.media_db.get_all_phashes(
-                        file_type=file_type, target_chat=target_chat,
-                    )
+                    if phash_candidates is not None:
+                        candidates = phash_candidates
+                    else:
+                        candidates = await self.media_db.get_all_phashes(
+                            file_type=file_type, target_chat=target_chat,
+                        )
                     decision, matched_row, _ = classify_phash_dedup(
                         phash=phash, file_size=file_size, duration=duration,
                         candidates=candidates,
@@ -1089,6 +1111,20 @@ class TransferEngine:
         job = await self.db.get_job(job_id)
         processed = 0
 
+        # Per-batch phash candidate cache: avoid re-fetching the entire
+        # phash table for every message. Lives only for this batch.
+        phash_cache: dict[str, list[dict]] = {}
+
+        async def _get_candidates(file_type: str) -> list[dict]:
+            if file_type not in phash_cache:
+                if self.media_db is None:
+                    phash_cache[file_type] = []
+                else:
+                    phash_cache[file_type] = await self.media_db.get_all_phashes(
+                        file_type=file_type, target_chat=job["target_chat"],
+                    )
+            return phash_cache[file_type]
+
         while True:
             # Check cancel
             if job_id in self._cancelled:
@@ -1179,12 +1215,20 @@ class TransferEngine:
                             continue
 
                         job = await self.db.get_job(job_id)
+                        # Determine file_type so we can prefetch its phash
+                        # candidates from the per-batch cache.
+                        file_type = self._detect_file_type(msg)
+                        candidates = (
+                            await _get_candidates(file_type)
+                            if file_type in ("photo", "video") else None
+                        )
                         result = await self.transfer_single(
                             source_entity, target_entity, msg,
                             target_chat=job["target_chat"],
                             source_chat=job["source_chat"],
                             job_id=job_id,
                             task_id=job.get("task_id"),
+                            phash_candidates=candidates,
                         )
                         if result["dedup"]:
                             await self.db.mark_message(job_id, message_id, "skipped")
