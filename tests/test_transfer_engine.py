@@ -1417,6 +1417,7 @@ async def test_size_limit_is_read_dynamically_per_message(
 ):
     """Changing the config between messages must take effect on the NEXT
     message. Foundation for slice 3 (live threshold changes)."""
+    engine._SIZE_LIMIT_TTL = 0
     await db.set_config("size_limit_mb", "1000")
     job_id = await db.create_job("@s", "@d", "batch")
     await db.add_messages(job_id, [4000, 4001])
@@ -1431,7 +1432,7 @@ async def test_size_limit_is_read_dynamically_per_message(
 
     mock_client.get_messages = fake_get_messages
 
-    async def fake_transfer_single(src, tgt, msg, target_chat="", source_chat="", job_id=None, task_id=None):
+    async def fake_transfer_single(src, tgt, msg, target_chat="", source_chat="", job_id=None, task_id=None, phash_candidates=None):
         if msg.id == 4000:
             # Lower the limit before msg2 is processed.
             await db.set_config("size_limit_mb", "50")
@@ -1515,6 +1516,7 @@ async def test_run_batch_catches_oversize_mid_stream_and_skips(
 ):
     """When _transfer_media bubbles OverSizeLimit up, run_batch must mark the
     message 'skipped' (not retry it) — retrying would just hit the same wall."""
+    engine._SIZE_LIMIT_TTL = 0
     from agents.tg_transfer.transfer_engine import OverSizeLimit
 
     await db.set_config("size_limit_mb", "1000")
@@ -1526,7 +1528,7 @@ async def test_run_batch_catches_oversize_mid_stream_and_skips(
 
     mock_client.get_messages = AsyncMock(return_value=msg)
 
-    async def boom(source, target, message, target_chat="", source_chat="", job_id=None, task_id=None):
+    async def boom(source, target, message, target_chat="", source_chat="", job_id=None, task_id=None, phash_candidates=None):
         raise OverSizeLimit("downloaded exceeds live limit")
 
     engine.transfer_single = boom
