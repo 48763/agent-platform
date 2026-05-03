@@ -124,6 +124,7 @@ class TestIncrementalTargetSyncBeforeBatch:
         agent.config = {"settings": {}}
         agent._pending_jobs = {}
         agent._bg_tasks = {}
+        agent._batch_message_cache = {}
         agent._current_chat_id = {"tid": 111}
         agent._init_error = ""
         agent.ws_send_progress = AsyncMock()

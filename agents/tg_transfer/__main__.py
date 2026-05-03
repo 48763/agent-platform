@@ -50,6 +50,11 @@ class TGTransferAgent(BaseAgent):
         self._search_state: dict[str, dict] = {}  # task_id → {keyword, page}
         self._current_chat_id: dict[str, int] = {}  # task_id → chat_id
         self._awaiting_target: dict[str, dict] = {}  # task_id → {chat, message_id}
+        # job_id → list[Message] cached between _handle_batch_request
+        # (which iterates the source for the count + dedup preview) and
+        # _start_batch (which would otherwise re-iterate). Evicted on
+        # consume or cancel.
+        self._batch_message_cache: dict[str, list] = {}
 
     async def _init_services(self):
         data_dir = os.environ.get("DATA_DIR", "/data/tg_transfer")
@@ -90,18 +95,45 @@ class TGTransferAgent(BaseAgent):
             byte_budget=byte_budget,
         )
 
+        self._album_window = int(settings.get("album_window", 10))
+
         # Start liveness checker
         liveness_tmp_root = os.path.join(data_dir, "tmp")
         liveness_interval_seconds = int(
             settings.get("liveness_check_interval", 24)
         ) * 3600
-        asyncio.create_task(run_liveness_loop(
+        # Save params for respawn callback
+        self._data_dir = data_dir
+        self._liveness_interval_seconds = liveness_interval_seconds
+        self._liveness_task = asyncio.create_task(run_liveness_loop(
             self.tg_client, self.media_db, liveness_tmp_root,
             interval_seconds=liveness_interval_seconds,
         ))
+        self._liveness_task.add_done_callback(self._on_liveness_done)
 
         # Resume is triggered by on_ws_connected(), not here,
         # because WS must be up before we can send progress/result.
+
+    def _on_liveness_done(self, task: asyncio.Task):
+        """The only legitimate exit is CancelledError on shutdown.
+        Anything else is unexpected — log and respawn."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            logger.warning(
+                "Liveness loop exited without exception — unexpected; respawning"
+            )
+        else:
+            logger.error(
+                "Liveness loop crashed: %s; respawning", exc, exc_info=exc,
+            )
+        liveness_tmp_root = os.path.join(self._data_dir, "tmp")
+        self._liveness_task = asyncio.create_task(run_liveness_loop(
+            self.tg_client, self.media_db, liveness_tmp_root,
+            interval_seconds=self._liveness_interval_seconds,
+        ))
+        self._liveness_task.add_done_callback(self._on_liveness_done)
 
     async def on_ws_connected(self):
         """Resume interrupted jobs on every WS connect.
@@ -474,6 +506,40 @@ class TGTransferAgent(BaseAgent):
         # 'batch' — let the normal batch path handle it.
         return None
 
+    async def _resolve_album_messages(self, source_entity, msg) -> list:
+        """Return all messages in `msg`'s album. Filter by grouped_id
+        within a configurable id window (default 10) — exact match avoids
+        false positives from neighbouring non-album messages."""
+        grouped_id = getattr(msg, "grouped_id", None)
+        if not grouped_id:
+            return [msg]
+        window = self._album_window
+        try:
+            siblings = []
+            async for sib in self.tg_client.iter_messages(
+                source_entity,
+                min_id=max(msg.id - window - 1, 0),
+                max_id=msg.id + window + 1,
+            ):
+                if getattr(sib, "grouped_id", None) == grouped_id:
+                    siblings.append(sib)
+            siblings.sort(key=lambda m: m.id)
+            return siblings or [msg]
+        except Exception as e:
+            logger.warning(
+                "Album detection via grouped_id failed (%s); falling back to ±%d window",
+                e, window,
+            )
+            try:
+                ids = list(range(msg.id - window, msg.id + window + 1))
+                msgs = await self.tg_client.get_messages(source_entity, ids=ids)
+                return [
+                    m for m in (msgs or [])
+                    if m and getattr(m, "grouped_id", None) == grouped_id
+                ] or [msg]
+            except Exception:
+                return [msg]
+
     async def _handle_single(self, task: TaskRequest, chat_id, message_id: int) -> AgentResult:
         target_chat = await self.db.get_config("default_target_chat")
         if not target_chat:
@@ -495,11 +561,7 @@ class TGTransferAgent(BaseAgent):
 
         # Check for album
         if msg.grouped_id:
-            nearby = await self.tg_client.get_messages(
-                source_entity, ids=range(message_id - 10, message_id + 10)
-            )
-            album_msgs = [m for m in nearby if m and m.grouped_id == msg.grouped_id]
-            album_msgs.sort(key=lambda m: m.id)
+            album_msgs = await self._resolve_album_messages(source_entity, msg)
 
             if self.engine.should_skip(album_msgs[0]):
                 return AgentResult(status=TaskStatus.DONE, message="已跳過（不支援的訊息類型）")
@@ -767,8 +829,11 @@ class TGTransferAgent(BaseAgent):
         filter_type = parsed.get("filter_type", "all")
         filter_value = parsed.get("filter_value")
 
-        # Count messages
-        count = await self._count_messages(source_entity, filter_type, filter_value)
+        # Collect once and reuse for both preview and _start_batch.
+        collected_messages = await self._collect_messages(
+            source_entity, filter_type, filter_value,
+        )
+        count = len(collected_messages)
 
         # Defer-scan mode skips the historic-job dedup count — the whole
         # point is to record everything and resolve later via /process_deferred.
@@ -788,6 +853,7 @@ class TGTransferAgent(BaseAgent):
             chat_id=task.chat_id,
         )
         self._pending_jobs[task.task_id] = job_id
+        self._batch_message_cache[job_id] = collected_messages
 
         if defer_mode:
             return AgentResult(
@@ -823,6 +889,7 @@ class TGTransferAgent(BaseAgent):
                 return await self._start_batch(task.task_id, job_id, job)
             else:
                 del self._pending_jobs[task.task_id]
+                self._batch_message_cache.pop(job_id, None)
                 await self.db.update_job_status(job_id, "failed")
                 return AgentResult(status=TaskStatus.DONE, message="已取消")
 
@@ -885,9 +952,17 @@ class TGTransferAgent(BaseAgent):
             # through to the full-file path for anything the index missed.
             logger.warning(f"pre-batch target sync failed: {e}")
 
-        filter_type = job["filter_type"] or "all"
-        filter_value = json.loads(job["filter_value"]) if job["filter_value"] else None
-        messages = await self._collect_messages(source_entity, filter_type, filter_value)
+        # Prefer the cache from _handle_batch_request; fall back to
+        # re-iterate if cache miss (e.g., agent restarted between).
+        messages = self._batch_message_cache.pop(job_id, None)
+        if messages is None:
+            filter_type = job["filter_type"] or "all"
+            filter_value = (
+                json.loads(job["filter_value"]) if job["filter_value"] else None
+            )
+            messages = await self._collect_messages(
+                source_entity, filter_type, filter_value,
+            )
 
         already_done = await self.db.get_transferred_message_ids(job["source_chat"], job["target_chat"], media_db=self.media_db)
         grouped_ids = {}

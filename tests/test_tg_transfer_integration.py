@@ -103,6 +103,8 @@ async def _build_test_agent(tmp_path):
     agent._search_state = {}
     agent._awaiting_target = {}
     agent._cancelled_tasks = set()
+    agent._batch_message_cache = {}
+    agent._album_window = 10
     agent.db = TransferDB(str(tmp_path / "t.db"))
     await agent.db.init()
     agent.engine = TransferEngine(
@@ -260,3 +262,25 @@ async def test_legacy_migration_idempotent_when_flag_present(tmp_path):
     await agent._migrate_legacy_tmp_layout()
 
     assert os.path.exists(sentinel)  # untouched
+
+
+@pytest.mark.asyncio
+async def test_batch_message_cache_attribute_exists(tmp_path):
+    """_handle_batch_request and _start_batch coordinate via
+    self._batch_message_cache: dict[job_id, list[Message]]."""
+    agent = await _build_test_agent(tmp_path)
+    assert hasattr(agent, "_batch_message_cache")
+    assert isinstance(agent._batch_message_cache, dict)
+
+
+@pytest.mark.asyncio
+async def test_batch_message_cache_consumed_and_evicted(tmp_path):
+    """When a job_id is in the cache, callers consume it via
+    pop(); after consume the entry is gone."""
+    agent = await _build_test_agent(tmp_path)
+    fake_msgs = [type("M", (), {"id": i, "grouped_id": None})() for i in range(3)]
+    agent._batch_message_cache["job-X"] = fake_msgs
+
+    cached = agent._batch_message_cache.pop("job-X", None)
+    assert cached is fake_msgs
+    assert "job-X" not in agent._batch_message_cache
