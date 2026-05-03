@@ -105,18 +105,16 @@ class TGTransferAgent(BaseAgent):
         # Save params for respawn callback
         self._data_dir = data_dir
         self._liveness_interval_seconds = liveness_interval_seconds
-        self._liveness_task = asyncio.create_task(run_liveness_loop(
-            self.tg_client, self.media_db, liveness_tmp_root,
-            interval_seconds=liveness_interval_seconds,
-        ))
-        self._liveness_task.add_done_callback(self._on_liveness_done)
+        self._liveness_respawn_attempts = 0
+        self._spawn_liveness_task()
 
         # Resume is triggered by on_ws_connected(), not here,
         # because WS must be up before we can send progress/result.
 
     def _on_liveness_done(self, task: asyncio.Task):
         """The only legitimate exit is CancelledError on shutdown.
-        Anything else is unexpected — log and respawn."""
+        Anything else triggers an exponential-backoff respawn so a
+        deterministic crash doesn't pin the CPU."""
         if task.cancelled():
             return
         exc = task.exception()
@@ -128,6 +126,18 @@ class TGTransferAgent(BaseAgent):
             logger.error(
                 "Liveness loop crashed: %s; respawning", exc, exc_info=exc,
             )
+        # Exponential backoff: 5s, 10s, 20s, 40s, ... capped at 300s.
+        attempts = getattr(self, '_liveness_respawn_attempts', 0) + 1
+        self._liveness_respawn_attempts = attempts
+        delay = min(5 * (2 ** (attempts - 1)), 300)
+        logger.info(
+            "Will respawn liveness loop in %ds (attempt %d)", delay, attempts,
+        )
+        loop = asyncio.get_event_loop()
+        loop.call_later(delay, self._spawn_liveness_task)
+
+    def _spawn_liveness_task(self):
+        """Create the liveness loop task and reattach the done callback."""
         liveness_tmp_root = os.path.join(self._data_dir, "tmp")
         self._liveness_task = asyncio.create_task(run_liveness_loop(
             self.tg_client, self.media_db, liveness_tmp_root,
@@ -278,6 +288,7 @@ class TGTransferAgent(BaseAgent):
     def on_cancel(self, task_id: str):
         if task_id in self._pending_jobs:
             job_id = self._pending_jobs[task_id]
+            self._batch_message_cache.pop(job_id, None)
             self.engine.cancel_job(job_id)
 
     def on_task_deleted(self, task_id: str):
@@ -306,6 +317,7 @@ class TGTransferAgent(BaseAgent):
         # correctly (engine cancels by job_id, not task_id).
         job_id = self._pending_jobs.pop(task_id, None)
         if job_id:
+            self._batch_message_cache.pop(job_id, None)
             self.engine.cancel_job(job_id)
 
         # Drop other in-memory bindings.
@@ -1060,9 +1072,17 @@ class TGTransferAgent(BaseAgent):
         source_entity = await resolve_chat(self.tg_client, job["source_chat"])
         chat_id = self._current_chat_id.get(task_id, 0)
 
-        filter_type = job["filter_type"] or "all"
-        filter_value = json.loads(job["filter_value"]) if job["filter_value"] else None
-        messages = await self._collect_messages(source_entity, filter_type, filter_value)
+        # Prefer the cache from _handle_batch_request; fall back to
+        # re-iterate if cache miss (e.g., agent restarted between).
+        messages = self._batch_message_cache.pop(job_id, None)
+        if messages is None:
+            filter_type = job["filter_type"] or "all"
+            filter_value = (
+                json.loads(job["filter_value"]) if job["filter_value"] else None
+            )
+            messages = await self._collect_messages(
+                source_entity, filter_type, filter_value,
+            )
         msg_ids = [m.id for m in messages]
         grouped_ids = {m.id: m.grouped_id for m in messages if m.grouped_id}
         await self.db.add_messages(job_id, msg_ids, grouped_ids)
