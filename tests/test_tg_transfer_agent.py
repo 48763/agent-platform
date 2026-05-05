@@ -113,6 +113,7 @@ class TestIncrementalTargetSyncBeforeBatch:
     @pytest.mark.asyncio
     async def test_start_batch_triggers_target_scan(self):
         from agents.tg_transfer.__main__ import TGTransferAgent
+        from agents.tg_transfer.batch_controller import BatchController
         agent = TGTransferAgent.__new__(TGTransferAgent)
         agent.db = AsyncMock()
         agent.db.add_messages = AsyncMock()
@@ -123,12 +124,12 @@ class TestIncrementalTargetSyncBeforeBatch:
         agent.engine = AsyncMock()
         agent.config = {"settings": {}}
         agent._pending_jobs = {}
-        agent._bg_tasks = {}
         agent._batch_message_cache = {}
         agent._current_chat_id = {"tid": 111}
         agent._init_error = ""
         agent.ws_send_progress = AsyncMock()
         agent.ws_send_result = AsyncMock()
+        agent.batch_controller = BatchController(agent)
 
         job = {
             "source_chat": "@s", "target_chat": "@t",
@@ -321,11 +322,11 @@ class TestResumeOnReconnect:
     def _build_agent(self):
         import asyncio
         from agents.tg_transfer.__main__ import TGTransferAgent
+        from agents.tg_transfer.batch_controller import BatchController
         agent = TGTransferAgent.__new__(TGTransferAgent)
         agent.db = AsyncMock()
         agent.tg_client = AsyncMock()
         agent._pending_jobs = {}
-        agent._bg_tasks = {}
         agent._current_chat_id = {}
         agent._awaiting_target = {}
         agent._search_state = {}
@@ -335,6 +336,7 @@ class TestResumeOnReconnect:
         # Default: hub unreachable → no pre-filter (preserves legacy behavior
         # for tests that don't exercise the closed-task pre-filter path).
         agent._fetch_hub_task_statuses = AsyncMock(return_value={})
+        agent.batch_controller = BatchController(agent)
         return agent
 
     @pytest.mark.asyncio
@@ -346,7 +348,9 @@ class TestResumeOnReconnect:
             "task_id": "t1", "chat_id": 100,
         }])
         spawned = []
-        agent._spawn_batch_bg = MagicMock(side_effect=lambda *a, **kw: spawned.append(a) or MagicMock())
+        agent.batch_controller.spawn_batch = MagicMock(
+            side_effect=lambda *a, **kw: spawned.append(a) or MagicMock()
+        )
 
         with patch("agents.tg_transfer.__main__.resolve_chat", new_callable=AsyncMock) as mock_resolve:
             mock_resolve.return_value = MagicMock()
@@ -370,12 +374,12 @@ class TestResumeOnReconnect:
         }])
         # Alive placeholder: a never-resolved future counts as not-done.
         alive = asyncio.get_event_loop().create_future()
-        agent._bg_tasks["t1"] = alive
-        agent._spawn_batch_bg = MagicMock()
+        agent.batch_controller._bg_tasks["t1"] = alive
+        agent.batch_controller.spawn_batch = MagicMock()
 
         await agent._resume_interrupted_jobs(first_connect=False)
 
-        agent._spawn_batch_bg.assert_not_called()
+        agent.batch_controller.spawn_batch.assert_not_called()
         agent.ws_send_progress.assert_not_called()
         alive.cancel()
 
@@ -392,9 +396,11 @@ class TestResumeOnReconnect:
         }])
         dead = asyncio.get_event_loop().create_future()
         dead.set_result(None)
-        agent._bg_tasks["t1"] = dead
+        agent.batch_controller._bg_tasks["t1"] = dead
         spawned = []
-        agent._spawn_batch_bg = MagicMock(side_effect=lambda *a, **kw: spawned.append(a) or MagicMock())
+        agent.batch_controller.spawn_batch = MagicMock(
+            side_effect=lambda *a, **kw: spawned.append(a) or MagicMock()
+        )
 
         with patch("agents.tg_transfer.__main__.resolve_chat", new_callable=AsyncMock) as mock_resolve:
             mock_resolve.return_value = MagicMock()
@@ -418,11 +424,11 @@ class TestResumeOnReconnect:
         agent._fetch_hub_task_statuses = AsyncMock(return_value={
             "t-closed": "closed",
         })
-        agent._spawn_batch_bg = MagicMock()
+        agent.batch_controller.spawn_batch = MagicMock()
 
         await agent._resume_interrupted_jobs(first_connect=True)
 
-        agent._spawn_batch_bg.assert_not_called()
+        agent.batch_controller.spawn_batch.assert_not_called()
         agent.ws_send_progress.assert_not_called()
         agent.db.update_job_status.assert_awaited_once_with("j-closed", "cancelled")
 
@@ -440,11 +446,11 @@ class TestResumeOnReconnect:
         agent._fetch_hub_task_statuses = AsyncMock(return_value={
             "t-missing": "missing",
         })
-        agent._spawn_batch_bg = MagicMock()
+        agent.batch_controller.spawn_batch = MagicMock()
 
         await agent._resume_interrupted_jobs(first_connect=True)
 
-        agent._spawn_batch_bg.assert_not_called()
+        agent.batch_controller.spawn_batch.assert_not_called()
         agent.db.update_job_status.assert_awaited_once_with("j-missing", "cancelled")
 
     @pytest.mark.asyncio
@@ -462,7 +468,7 @@ class TestResumeOnReconnect:
         # empty = hub unreachable
         agent._fetch_hub_task_statuses = AsyncMock(return_value={})
         spawned = []
-        agent._spawn_batch_bg = MagicMock(
+        agent.batch_controller.spawn_batch = MagicMock(
             side_effect=lambda *a, **kw: spawned.append(a) or MagicMock()
         )
 
@@ -502,17 +508,18 @@ class TestHandleDedupResponse:
 
     def _build_agent(self):
         from agents.tg_transfer.__main__ import TGTransferAgent
+        from agents.tg_transfer.batch_controller import BatchController
         agent = TGTransferAgent.__new__(TGTransferAgent)
         agent.db = AsyncMock()
         agent.media_db = AsyncMock()
         agent.tg_client = AsyncMock()
         agent.engine = AsyncMock()
         agent._pending_jobs = {}
-        agent._bg_tasks = {}
         agent._current_chat_id = {}
         agent._awaiting_target = {}
         agent._search_state = {}
         agent.hub_url = "http://hub.test"
+        agent.batch_controller = BatchController(agent)
         return agent
 
     @pytest.mark.asyncio
@@ -631,6 +638,7 @@ class TestProcessDeferred:
 
     def _build_agent(self):
         from agents.tg_transfer.__main__ import TGTransferAgent
+        from agents.tg_transfer.batch_controller import BatchController
         agent = TGTransferAgent.__new__(TGTransferAgent)
         agent.db = AsyncMock()
         agent.db.create_job = AsyncMock(return_value="job-deferred")
@@ -642,10 +650,11 @@ class TestProcessDeferred:
         agent.engine = AsyncMock()
         agent.engine._cancelled = set()
         agent._pending_jobs = {}
-        agent._bg_tasks = {}
         agent._current_chat_id = {}
+        agent._batch_message_cache = {}
         agent.ws_send_progress = AsyncMock()
         agent.ws_send_result = AsyncMock()
+        agent.batch_controller = BatchController(agent)
         return agent
 
     @pytest.mark.asyncio
@@ -686,7 +695,7 @@ class TestProcessDeferred:
                                chat_id=99)
             await agent._handle_process_deferred(task)
             # Wait for the bg task to finish
-            await agent._bg_tasks["td"]
+            await agent.batch_controller._bg_tasks["td"]
 
         agent.engine.transfer_single.assert_awaited_once()
         kwargs = agent.engine.transfer_single.await_args.kwargs
@@ -718,7 +727,7 @@ class TestProcessDeferred:
             task = TaskRequest(task_id="td", content="/process_deferred",
                                chat_id=99)
             await agent._handle_process_deferred(task)
-            await agent._bg_tasks["td"]
+            await agent.batch_controller._bg_tasks["td"]
 
         agent.engine.transfer_single.assert_not_called()
         agent.media_db.upgrade_thumb_to_full.assert_awaited_once_with(
@@ -755,7 +764,7 @@ class TestProcessDeferred:
             task = TaskRequest(task_id="td", content="/process_deferred",
                                chat_id=99)
             await agent._handle_process_deferred(task)
-            await agent._bg_tasks["td"]
+            await agent.batch_controller._bg_tasks["td"]
 
         agent.media_db.insert_pending_dedup.assert_awaited_once()
         # Job marked awaiting_dedup, not completed.

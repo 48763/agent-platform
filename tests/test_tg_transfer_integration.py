@@ -93,12 +93,12 @@ async def _build_test_agent(tmp_path):
     """Bare-minimum TGTransferAgent for unit tests: real DB + engine,
     fake TG client, no WS, no Hub."""
     from agents.tg_transfer.__main__ import TGTransferAgent
+    from agents.tg_transfer.batch_controller import BatchController
     from agents.tg_transfer.db import TransferDB
     from agents.tg_transfer.transfer_engine import TransferEngine
 
     agent = TGTransferAgent.__new__(TGTransferAgent)
     agent._pending_jobs = {}
-    agent._bg_tasks = {}
     agent._current_chat_id = {}
     agent._search_state = {}
     agent._awaiting_target = {}
@@ -110,6 +110,7 @@ async def _build_test_agent(tmp_path):
     agent.engine = TransferEngine(
         client=None, db=agent.db, tmp_dir=str(tmp_path / "tmp"),
     )
+    agent.batch_controller = BatchController(agent)
     return agent
 
 
