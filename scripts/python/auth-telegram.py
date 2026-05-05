@@ -1,5 +1,5 @@
-# scripts/python/auth-tg-transfer.py
-# 認證 tg-transfer 的獨立 Telethon session
+# scripts/python/auth-telegram.py
+# Telethon session 認證（通用 — 透過 SESSION_DIR / TELETHON_SESSION 控制輸出）
 import os
 import sys
 from telethon.sync import TelegramClient

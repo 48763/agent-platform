@@ -56,13 +56,30 @@ TG_API_HASH=YOUR_API_HASH
 DATA_DIR=/data/tg_transfer
 ```
 
-## 首次認證
+## 首次認證 / 重新登入
+
+session 失效或第一次安裝時，用 `scripts/auth-telegram.sh` 在 docker image 裡跑 Telethon login。**Host 不需要 python / venv**：
 
 ```bash
-docker compose build tg-transfer-agent
-docker compose up tg-transfer-agent -d
-docker exec -it agent-tg-transfer-agent-1 sh
-# 容器啟動後提示輸入手機號碼 → 驗證碼 → session 持久化
+docker compose build tg-transfer-agent      # 只在第一次或 image 改動時
+./scripts/auth-telegram.sh tg-transfer
+# Telethon 送驗證碼到 TG → 互動輸入 → session 寫入 data/session/.../tg_transfer/
+docker compose up -d tg-transfer-agent
+```
+
+非互動（CI 或重複認證可帶參數）：
+
+```bash
+./scripts/auth-telegram.sh tg-transfer --code 12345 --password your_2fa
+```
+
+Gateway userbot 模式同樣套路：
+
+```bash
+docker compose stop gateway
+rm -f data/session/telegram_user_908/gateway/bot_session.session
+./scripts/auth-telegram.sh gateway
+docker compose up -d gateway
 ```
 
 ## 使用方式
