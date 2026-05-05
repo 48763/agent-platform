@@ -11,7 +11,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-case "${1:-}" in
+MODE="${1:-}"
+case "$MODE" in
   tg-transfer)
     ENV_FILE=".env/tg-transfer-agent.env"
     SESSION_HOST_DIR="data/session/telegram_user_908/tg_transfer"
@@ -49,7 +50,7 @@ if [ -z "${TELEGRAM_API_ID:-}" ] || [ -z "${TELEGRAM_API_HASH:-}" ] || [ -z "${T
   exit 1
 fi
 
-echo "=== Telegram 認證: $1 ==="
+echo "=== Telegram 認證: $MODE ==="
 echo "Env file:    $ENV_FILE"
 echo "Phone:       $TELEGRAM_PHONE"
 echo "Session dir: $SESSION_HOST_DIR"
