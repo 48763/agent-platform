@@ -158,16 +158,18 @@ pip install pytest pytest-asyncio pytest-aiohttp
 
 ### 3. 首次認證
 
-各服務需要在容器內完成認證，認證資料會保存在 `data/` 目錄下，container 重啟不需重新登入。
+各服務需要完成認證，認證資料會保存在 `data/` 目錄下，container 重啟不需重新登入。
 
-**Gateway（Telegram Userbot）：**
+**Telegram Userbot（gateway 與 tg-transfer 兩個 service 都用同一個 script）：**
 
 ```bash
-source .venv/bin/activate
-export $(grep -v '^#' .env/gateway.env | grep -v '^$' | xargs)
-DATA_DIR=data/gateway python -m gateway
-# 輸入手機號碼 → 輸入 Telegram 驗證碼 → 看到 connected 後 Ctrl+C
+./scripts/auth-telegram.sh gateway
+./scripts/auth-telegram.sh tg-transfer
+# 兩個都會送驗證碼到 TG → 互動輸入 → session 寫入 data/session/.../
+# 非互動：./scripts/auth-telegram.sh gateway --code 12345 --password 2FA
 ```
+
+Script 在 `tg-transfer-agent` docker image 內跑 Telethon login，**host 不需要 python / venv**，任何有 docker compose 的機器直接可用。
 
 **Hub（Gemini CLI）：**
 
